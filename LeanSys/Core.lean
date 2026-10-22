@@ -247,6 +247,7 @@ def main (args : List String) : IO UInt32 := do
   match args with
   | ["self-test"] | ["--self-test"] | [] => LeanSys.Core.runSelfTest
   | ["bench"] | ["--bench"] => LeanSys.Core.runBench 4000
+  | ["bench", nStr] | ["--bench", nStr] => LeanSys.Core.runBench (nStr.toNat?.getD 4000)
   | ["--c-abi"] =>
     IO.println "{\"ok\":true,\"exports\":[\"leansys_verify_slice_bounds\",\"leansys_verify_wal_frame\",\"leansys_verify_cas_digest\",\"leansys_check_http_bounds\",\"leansys_verify_jsonl_tape\",\"leansys_verify_ring_cursor\",\"leansys_verify_sst_block\",\"leansys_verify_poll_interest\",\"leansys_verify_rlimit_budget\",\"leansys_mix64_word\"]}"
     return 0

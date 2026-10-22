@@ -19,9 +19,11 @@ open LeanSys.Posix
 open LeanSys.Hash
 open LeanSys.Store
 
-/-- Indexed entry inside an immutable SST image. -/
+/-- Indexed entry inside an immutable SST image (`keyOff`/`keyLen` locate the key bytes in `rawBuf`). -/
 structure SstIndexEntry where
   key    : String
+  keyOff : Nat
+  keyLen : Nat
   valOff : Nat
   valLen : Nat
   deriving Repr, DecidableEq, Inhabited
@@ -33,49 +35,68 @@ structure SstTable where
   bloomMask : UInt64
   entries   : Array SstIndexEntry
 
+/-- Unsigned byte-wise compare of `buf[off, off+len)` against `q` (memcmp order, then length). -/
+@[inline]
+def compareKeyAt (buf : ByteArray) (off len : Nat) (q : ByteArray) : Ordering := Id.run do
+  let n := Nat.min len q.size
+  let mut i := 0
+  while i < n do
+    let a := buf.get! (off + i)
+    let b := q.get! i
+    if a != b then return (if a < b then .lt else .gt)
+    i := i + 1
+  return compare len q.size
+
+/-- Byte-order (memcmp) less-than on UTF-8 keys; equals `String` code-point order. -/
+@[inline]
+def keyBytesLt (a b : ByteArray) : Bool :=
+  compareKeyAt a 0 a.size b == .lt
+
 namespace SstTable
 
-/-- Flush all live `(key, value)` pairs from `Store.Handle` into an immutable sorted SST file at `sstPath`. -/
-def flushFromStore (st : Store.Handle) (sstPath : String) : IO (SysResult SstTable) := do
-  let pairs := st.kv.toList.toArray.qsort (fun a b => a.1 < b.1)
-  let mut dataBuf := ByteArray.empty
-  let mut idxEntries : Array SstIndexEntry := Array.mkEmpty pairs.size
+/-- Flush all live `(key, value)` pairs from `Store.Handle` into an immutable sorted SST file at `sstPath`.
+    Single pre-sized buffer, byte-order sort, footer gated by `verifySstBlock`. -/
+def flushStore (st : Store.Handle) (sstPath : String) : IO (SysResult SstTable) := do
+  let pairs := (st.kv.fold (fun acc k v => acc.push (k, k.toUTF8, v)) (Array.mkEmpty st.kv.size)).qsort
+    (fun a b => keyBytesLt a.2.1 b.2.1)
+  let mut cap := 24
+  for (_, kb, v) in pairs do
+    cap := cap + 12 + kb.size + v.size
+  let mut buf := ByteArray.emptyWithCapacity cap
   let mut bloom : UInt64 := 0
-  for (k, v) in pairs do
-    let kh := xxh64String k
-    bloom := bloomInsert bloom kh
-    let valOff := dataBuf.size
-    let valLen := v.size
-    dataBuf := dataBuf ++ v
-    idxEntries := idxEntries.push { key := k, valOff := valOff, valLen := valLen }
-  let indexOff := dataBuf.size.toUInt64
-  for e in idxEntries do
-    let kb := e.key.toUTF8
-    dataBuf := pushUInt32LE dataBuf kb.size.toUInt32
-    dataBuf := pushUInt32LE dataBuf e.valOff.toUInt32
-    dataBuf := pushUInt32LE dataBuf e.valLen.toUInt32
-    dataBuf := dataBuf ++ kb
-  let footerOff := dataBuf.size.toUInt64
-  dataBuf := pushUInt32LE dataBuf sstMagic
-  dataBuf := pushUInt32LE dataBuf idxEntries.size.toUInt32
-  dataBuf := pushUInt64LE dataBuf indexOff
-  dataBuf := pushUInt64LE dataBuf bloom
-  let fileSize := dataBuf.size.toUInt64
-  if verifySstBlock sstMagic idxEntries.size.toUInt32 indexOff footerOff fileSize bloom != 1 then
+  for (k, _, v) in pairs do
+    bloom := bloomInsert bloom (xxh64String k)
+    buf := v.copySlice 0 buf buf.size v.size false
+  let indexOff := buf.size
+  let mut entries : Array SstIndexEntry := Array.mkEmpty pairs.size
+  let mut vOff := 0
+  for (k, kb, v) in pairs do
+    buf := pushUInt32LE buf kb.size.toUInt32
+    buf := pushUInt32LE buf vOff.toUInt32
+    buf := pushUInt32LE buf v.size.toUInt32
+    let kOff := buf.size
+    buf := kb.copySlice 0 buf buf.size kb.size false
+    entries := entries.push { key := k, keyOff := kOff, keyLen := kb.size, valOff := vOff, valLen := v.size }
+    vOff := vOff + v.size
+  let footerOff := buf.size.toUInt64
+  buf := pushUInt32LE buf sstMagic
+  buf := pushUInt32LE buf entries.size.toUInt32
+  buf := pushUInt64LE buf indexOff.toUInt64
+  buf := pushUInt64LE buf bloom
+  if verifySstBlock sstMagic entries.size.toUInt32 indexOff.toUInt64 footerOff buf.size.toUInt64 bloom != 1 then
     return .error .einval
   let tmpPath := sstPath ++ ".tmp"
-  match ← withFd tmpPath 4 (fun fd => writeAll fd dataBuf true) with
+  match ← withFd tmpPath 4 (fun fd => writeAll fd buf true) with
   | .error e => pure (.error e)
   | .ok _ =>
     match ← atomicRename tmpPath sstPath with
     | .error e => pure (.error e)
-    | .ok () =>
-      pure (.ok {
-        path := sstPath
-        rawBuf := dataBuf
-        bloomMask := bloom
-        entries := idxEntries
-      })
+    | .ok () => pure (.ok { path := sstPath, rawBuf := buf, bloomMask := bloom, entries := entries })
+
+/-- Backwards-compatible name for `flushStore`. -/
+@[inline]
+def flushFromStore (st : Store.Handle) (sstPath : String) : IO (SysResult SstTable) :=
+  flushStore st sstPath
 
 /-- Open and verify an SST file from disk, gated by `leansys_verify_sst_block`. -/
 def openSst (sstPath : String) : IO (SysResult SstTable) := do
@@ -103,40 +124,45 @@ def openSst (sstPath : String) : IO (SysResult SstTable) := do
       let vLen := (readUInt32LE buf (p + 8)).toNat
       if p + 12 + kLen > footerOff || vOff + vLen > indexOff.toNat then
         return .error .eio
-      let kStr := String.fromUTF8! (buf.extract (p + 12) (p + 12 + kLen))
-      entries := entries.push { key := kStr, valOff := vOff, valLen := vLen }
+      match String.fromUTF8? (buf.extract (p + 12) (p + 12 + kLen)) with
+      | none => return .error .eio
+      | some kStr =>
+        if h : entries.size > 0 then
+          let prev := entries[entries.size - 1]
+          if compareKeyAt buf prev.keyOff prev.keyLen kStr.toUTF8 != .lt then
+            return .error .eio
+        entries := entries.push { key := kStr, keyOff := p + 12, keyLen := kLen, valOff := vOff, valLen := vLen }
       p := p + 12 + kLen
-    return .ok {
-      path := sstPath
-      rawBuf := buf
-      bloomMask := bloom
-      entries := entries
-    }
+    return .ok { path := sstPath, rawBuf := buf, bloomMask := bloom, entries := entries }
 
-/-- Query a key in `SstTable`: checks the 64-bit Bloom filter in O(1), then binary-searches `entries` in O(log N). -/
-def getSlice? (tbl : SstTable) (key : String) : Option ByteSlice := Id.run do
-  let kh := xxh64String key
-  if !bloomContains tbl.bloomMask kh then
+/-- Query a key: 64-bit Bloom filter in O(1), then O(log N) binary search.
+    Comparisons use the native `String` equality / order (`lean_string_dec_eq` / `lean_string_dec_lt`,
+    UTF-8 byte order), which `openSst` has checked agrees with the on-disk `compareKeyAt` order. -/
+def get? (tbl : SstTable) (key : String) : Option ByteSlice := Id.run do
+  if !bloomContains tbl.bloomMask (xxh64String key) then
     return none
-  let n := tbl.entries.size
-  if n == 0 then return none
+  let es := tbl.entries
   let mut lo : Nat := 0
-  let mut hi : Nat := n
+  let mut hi : Nat := es.size
   while lo < hi do
-    let mid := (lo + hi) / 2
-    let e := tbl.entries[mid]!
+    let mid := (lo + hi) >>> 1
+    let e := es[mid]!
     if e.key == key then
-      return ByteSlice.subSlice? (ByteSlice.ofByteArray tbl.rawBuf) e.valOff e.valLen
-    else if e.key < key then
-      lo := mid + 1
-    else
-      hi := mid
+      return if e.valOff + e.valLen ≤ tbl.rawBuf.size then
+        some { ba := tbl.rawBuf, off := e.valOff, len := e.valLen } else none
+    else if e.key < key then lo := mid + 1
+    else hi := mid
   return none
+
+/-- Compatibility alias for `get?`. -/
+@[inline]
+def getSlice? (tbl : SstTable) (key : String) : Option ByteSlice :=
+  get? tbl key
 
 /-- Lookup a UTF-8 string value by `key` in `SstTable`. -/
 @[inline]
 def getString? (tbl : SstTable) (key : String) : Option String :=
-  (getSlice? tbl key).map ByteSlice.toStringLossy
+  (get? tbl key).map ByteSlice.toStringLossy
 
 end SstTable
 

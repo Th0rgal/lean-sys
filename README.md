@@ -1,25 +1,26 @@
 # `lean-sys` — Verified Systems, Storage & Wire Runtime for Lean 4
 
-`Th0rgal/lean-sys` is a standalone, `libleanrt.a`-only systems runtime for **Lean 4** (`leanprover/lean4:v4.31.0`) with **zero `import Lean`**, **zero `sorryAx`**, **10 audited non-vacuous formal specifications** (`LeanSys/Spec.lean`), and a **68-line leaf POSIX C shim** (`c/lean_sys_shim.c`).
+`Th0rgal/lean-sys` is a standalone, `libleanrt.a`-only systems runtime for **Lean 4** (`leanprover/lean4:v4.31.0`) with **zero `import Lean`**, **zero `sorryAx`**, **18 audited non-vacuous formal specifications** (`LeanSys/Spec.lean` + `LeanSys/Hash.lean`), **10 unboxed C-ABI safety gates**, and a **51-line leaf POSIX C shim** (`c/lean_sys_shim.c`).
 
-It provides the crash-atomic storage (`LeanSys.Store`), zero-copy POSIX resource management (`LeanSys.Posix`), and bounded HTTP/1.1 transport (`LeanSys.Http`) for [`Th0rgal/maxwell`](https://github.com/Th0rgal/maxwell) and [`Th0rgal/turbo-lean`](https://github.com/Th0rgal/turbo-lean) without linking `libsqlite3`, `libcurl`, or `libssl`.
+It provides the crash-atomic storage (`LeanSys.Store`, `LeanSys.Lsm`), shared-memory IPC (`LeanSys.Mmap`), zero-copy JSON/JSONL tape indexing (`LeanSys.Codec`), 64-bit word-strided hashing (`LeanSys.Hash`), process-group quota sandboxing (`LeanSys.Sandbox`), and bounded HTTP/1.1 Keep-Alive transport (`LeanSys.Http`, `LeanSys.Reactor`) for [`Th0rgal/maxwell`](https://github.com/Th0rgal/maxwell) and [`Th0rgal/turbo-lean`](https://github.com/Th0rgal/turbo-lean) without linking `libsqlite3`, `libcurl`, or `libssl`.
 
 ## Architecture
 
-1. **`LeanSys/Spec.lean` (Layer I Meta-Specs, Layer II Corollaries & Direct C-ABI Gates)**:
-   - Exports unboxed C-ABI gates: `leansys_verify_slice_bounds`, `leansys_verify_wal_frame`, `leansys_verify_cas_digest`, `leansys_check_http_bounds`.
-   - Audited in `< 4 ms` by `turbo-lean --json audit-spec LeanSys/Spec.lean` (`10/10 non_vacuous_and_tight`, `0 sorryAx`).
-2. **`LeanSys/Posix.lean` + `c/lean_sys_shim.c` (Zero-Copy Borrowed FFI & Bracketed Lifecycle)**:
+1. **`LeanSys/Spec.lean` (Layer I Meta-Specs, Layer II Corollaries & 10 Direct C-ABI Gates)**:
+   - Exports 10 unboxed C-ABI gates: `leansys_verify_slice_bounds`, `leansys_verify_wal_frame`, `leansys_verify_cas_digest`, `leansys_check_http_bounds`, `leansys_verify_jsonl_tape`, `leansys_verify_ring_cursor`, `leansys_verify_sst_block`, `leansys_verify_poll_interest`, `leansys_verify_rlimit_budget`, and `leansys_mix64_word`.
+   - Audited in `< 2 ms` by `turbo-lean --json audit-spec LeanSys/Spec.lean` (`16/16 non_vacuous_and_tight`, `0 sorryAx`).
+2. **`LeanSys/Hash.lean` & `LeanSys/Codec.lean` (Word-Strided Hashing, 64-Bit Bloom Filter & Zero-Copy `JsonTape`)**:
+   - Unrolled 32-byte/8-byte word-strided `xxh64Slice` (`~750 MB/s`), machine-checked zero-false-negative 3-probe Bloom filter (`bloom_no_false_negative`), and zero-copy `JsonTape` field indexer (`>110M lookup ops/s`).
+3. **`LeanSys/Posix.lean` + `c/lean_sys_shim.c` (`51 LOC` Leaf C Shim & Bracketed Lifecycle)**:
    - Borrowed `@& ByteArray` / `@& String` views (`ByteSlice`), packed 64-bit `(rc, errno)` return words decoded into `SysResult α := Except Errno α`, advisory `flock` (`withDirLock`), atomic `rename`/`link`, and process-group supervision (`withChildGroup` `-pgid` reaper).
-3. **`LeanSys/Store.lean` (Crash-Atomic Append-Only WAL & Hardlinked CAS)**:
-   - 16-byte WAL frames (`magic = 0x4C535953 "LSYS"`, `payloadLen`, 64-bit FNV-1a checksum) with automatic torn-tail truncation recovery on `openStore`, atomic compaction (`compact`), and zero-copy hardlinked CAS (`casPut`, `casMaterialize`).
-4. **`LeanSys/Http.lean` (Zero-Copy Bounded HTTP/1.1 Server & Client)**:
-   - Parses HTTP/1.1 headers and body slices over borrowed `ByteSlice` views gated by `leansys_check_http_bounds`.
+4. **`LeanSys/Store.lean`, `LeanSys/Lsm.lean` & `LeanSys/Mmap.lean` (Crash-Atomic WAL, Hardlinked CAS, SST & `/dev/shm` Ring)**:
+   - Single-buffer WAL frame encoding and `putBatch` group-commit (`~1.25M frames/s`), automatic torn-tail truncation recovery on `openStore`, sorted-string tables (`SstTable`, `~2.2M lookups/s`), and `/dev/shm` SPSC ring buffers (`ShmRing`).
+5. **`LeanSys/Http.lean`, `LeanSys/Reactor.lean` & `LeanSys/Sandbox.lean` (HTTP/1.1 Keep-Alive Poll Reactor & Quota Enforcer)**:
+   - Zero-copy HTTP/1.1 parser, multi-request Keep-Alive connection loop gated by `leansys_verify_poll_interest`, and subprocess quota sandbox gated by `leansys_verify_rlimit_budget`.
 
 ## Quick Start
 
 ```bash
-lake build
-./.lake/build/bin/lean-sys-core self-test
-turbo-lean --json audit-spec LeanSys/Spec.lean
+./scripts/ci_verify.sh
+python3 autoresearch/sys_arena.py --json
 ```

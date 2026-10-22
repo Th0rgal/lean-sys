@@ -91,47 +91,51 @@ def hexToUInt64 (s : String) : UInt64 := Id.run do
 
 /-! ## WAL Frame Encoding & Verified Decoding (`leansys_verify_wal_frame`) -/
 
-/-- Encode a `(key, value)` pair into a 16-byte header + payload WAL frame. -/
-def encodeWalKVFrame (key : String) (val : ByteSlice) : ByteArray := Id.run do
-  let keyBytes := key.toUTF8
+/-- Append one `(key, value)` WAL frame directly into `out` (single buffer, no intermediate payload copy).
+    Layout: `magic : UInt32`, `payloadLen : UInt32`, `xxh64(payload) : UInt64`, `keyLen : UInt32`, `key`, `val`. -/
+@[inline]
+def encodeFrame (out : ByteArray) (keyBytes : ByteArray) (val : ByteSlice) : ByteArray := Id.run do
   let keyLen := keyBytes.size
   let payloadLen := 4 + keyLen + val.len
-  let mut payload := ByteArray.emptyWithCapacity payloadLen
-  payload := pushUInt32LE payload keyLen.toUInt32
-  payload := payload ++ keyBytes
-  payload := payload ++ val.toByteArray
-  let csum := xxh64Slice (ByteSlice.ofByteArray payload)
-  let mut frame := ByteArray.emptyWithCapacity (16 + payloadLen)
-  frame := pushUInt32LE frame walMagic
-  frame := pushUInt32LE frame payloadLen.toUInt32
-  frame := pushUInt64LE frame csum
-  frame := frame ++ payload
-  return frame
+  let base := out.size
+  let mut f := pushUInt32LE out walMagic
+  f := pushUInt32LE f payloadLen.toUInt32
+  f := pushUInt64LE f 0
+  f := pushUInt32LE f keyLen.toUInt32
+  f := keyBytes.copySlice 0 f f.size keyLen false
+  f := val.ba.copySlice val.off f f.size val.len false
+  let csum := xxh64Slice { ba := f, off := base + 16, len := payloadLen }
+  for i in [0:8] do
+    f := f.set! (base + 8 + i) ((csum >>> (8 * i).toUInt64) &&& 0xFF).toUInt8
+  return f
+
+/-- Encode a `(key, value)` pair into a 16-byte header + payload WAL frame. -/
+@[inline]
+def encodeWalKVFrame (key : String) (val : ByteSlice) : ByteArray :=
+  let kb := key.toUTF8
+  encodeFrame (ByteArray.emptyWithCapacity (20 + kb.size + val.len)) kb val
+
+/-- Verify the WAL frame at `offset` via `Spec.verifyWalFrame`, hashing the payload in place.
+    Returns `(payloadOff, payloadLen, keyLen)` on success. -/
+@[inline]
+def verifyFrameAt (buf : ByteArray) (offset : Nat) : Option (Nat × Nat × Nat) :=
+  if offset + 20 > buf.size then none else
+  let magic := readUInt32LE buf offset
+  let payloadLen := readUInt32LE buf (offset + 4)
+  let expectedHash := readUInt64LE buf (offset + 8)
+  let pOff := offset + 16
+  let avail := Nat.min payloadLen.toNat (buf.size - pOff)
+  let computed := xxh64Slice { ba := buf, off := pOff, len := avail }
+  if verifyWalFrame magic payloadLen avail.toUInt64 expectedHash computed != 1 || avail < 4 then none else
+  let keyLen := (readUInt32LE buf pOff).toNat
+  if 4 + keyLen > avail then none else some (pOff, avail, keyLen)
 
 /-- Decode a single WAL frame at `offset` in `buf`, gated by `Spec.verifyWalFrame`.
     Returns `some (key, valSlice, nextOffset)` on valid frame, or `none` on EOF / torn tail / checksum mismatch. -/
 def decodeWalFrameAt (buf : ByteArray) (offset : Nat) : Option (String × ByteSlice × Nat) := do
-  if offset + 16 > buf.size then
-    none
-  else
-    let magic := readUInt32LE buf offset
-    let payloadLen := readUInt32LE buf (offset + 4)
-    let expectedHash := readUInt64LE buf (offset + 8)
-    let availPayload := Nat.min payloadLen.toNat (buf.size - (offset + 16))
-    let payloadSlice ← ByteSlice.subSlice? (ByteSlice.ofByteArray buf) (offset + 16) availPayload
-    let computedHash := xxh64Slice payloadSlice
-    if verifyWalFrame magic payloadLen availPayload.toUInt64 expectedHash computedHash != 1 then
-      none
-    else if availPayload < 4 then
-      none
-    else
-      let keyLen := (readUInt32LE buf (offset + 16)).toNat
-      if 4 + keyLen > availPayload then
-        none
-      else
-        let keySlice ← ByteSlice.subSlice? payloadSlice 4 keyLen
-        let valSlice ← ByteSlice.subSlice? payloadSlice (4 + keyLen) (availPayload - 4 - keyLen)
-        some (keySlice.toStringLossy, valSlice, offset + 16 + availPayload)
+  let (pOff, avail, keyLen) ← verifyFrameAt buf offset
+  let key ← String.fromUTF8? (buf.extract (pOff + 4) (pOff + 4 + keyLen))
+  some (key, { ba := buf, off := pOff + 4 + keyLen, len := avail - 4 - keyLen }, pOff + avail)
 
 /-- Replay all valid prefix frames from a raw WAL buffer, stopping cleanly at any torn tail. -/
 def replayWalBuffer (buf : ByteArray) : Std.HashMap String ByteArray × Nat × Bool := Id.run do
@@ -193,7 +197,6 @@ def openStore (rootDir : String) : IO (SysResult Handle) := do
         tornCleaned := hadTornTail
       }
       if hadTornTail then
-        -- Rewrite clean prefix atomically so torn tail bytes are physically removed
         let tmpPath := walPath ++ ".recover.tmp"
         let mut cleanBytes := ByteArray.empty
         for (k, v) in kv.toList do
@@ -228,10 +231,13 @@ def putString (h : Handle) (key : String) (val : String) (doSync : Bool := true)
 /-- Group-commit a batch of `(key, val)` pairs to the WAL in a single `writeAll` + `fsync` syscall under `flock(LOCK_EX)`. -/
 def putBatch (h : Handle) (entries : Array (String × ByteSlice)) (doSync : Bool := true) : IO (SysResult Handle) := do
   if entries.isEmpty then return .ok h
-  let mut batchBuf := ByteArray.emptyWithCapacity (entries.size * 64)
+  let mut cap := 0
+  for (k, v) in entries do
+    cap := cap + 20 + k.utf8ByteSize + v.len
+  let mut batchBuf := ByteArray.emptyWithCapacity cap
   let mut nextKv := h.kv
   for (k, v) in entries do
-    batchBuf := batchBuf ++ encodeWalKVFrame k v
+    batchBuf := encodeFrame batchBuf k.toUTF8 v
     nextKv := nextKv.insert k v.toByteArray
   withDirLock h.lockPath false fun _ => do
     match ← withFd h.walPath 2 (fun fd => writeAll fd batchBuf doSync) with

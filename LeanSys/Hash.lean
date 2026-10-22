@@ -13,52 +13,73 @@ namespace LeanSys.Hash
 open LeanSys.Spec
 open LeanSys.Posix
 
-/-- Read an 8-byte little-endian `UInt64` word from `ba` at `off` (assumes `off + 8 ≤ ba.size`). -/
+/-- Total byte read: `ba[i]` when in bounds, else `0` (no panic path). -/
+@[inline]
+def byteAt (ba : ByteArray) (i : Nat) : UInt8 :=
+  if h : i < ba.size then ba[i] else 0
+
+/-- 8-byte little-endian `UInt64` load at `off`, fully unrolled; out-of-range bytes read as `0`. -/
 @[inline]
 def readWord64LE (ba : ByteArray) (off : Nat) : UInt64 :=
-  let b0 := (ba.get! off).toUInt64
-  let b1 := (ba.get! (off + 1)).toUInt64 <<< 8
-  let b2 := (ba.get! (off + 2)).toUInt64 <<< 16
-  let b3 := (ba.get! (off + 3)).toUInt64 <<< 24
-  let b4 := (ba.get! (off + 4)).toUInt64 <<< 32
-  let b5 := (ba.get! (off + 5)).toUInt64 <<< 40
-  let b6 := (ba.get! (off + 6)).toUInt64 <<< 48
-  let b7 := (ba.get! (off + 7)).toUInt64 <<< 56
-  b0 ||| b1 ||| b2 ||| b3 ||| b4 ||| b5 ||| b6 ||| b7
+  if h : off + 8 ≤ ba.size then
+    (ba[off]).toUInt64 |||
+    ((ba[off + 1]).toUInt64 <<< 8) |||
+    ((ba[off + 2]).toUInt64 <<< 16) |||
+    ((ba[off + 3]).toUInt64 <<< 24) |||
+    ((ba[off + 4]).toUInt64 <<< 32) |||
+    ((ba[off + 5]).toUInt64 <<< 40) |||
+    ((ba[off + 6]).toUInt64 <<< 48) |||
+    ((ba[off + 7]).toUInt64 <<< 56)
+  else
+    (byteAt ba off).toUInt64 |||
+    ((byteAt ba (off + 1)).toUInt64 <<< 8) |||
+    ((byteAt ba (off + 2)).toUInt64 <<< 16) |||
+    ((byteAt ba (off + 3)).toUInt64 <<< 24) |||
+    ((byteAt ba (off + 4)).toUInt64 <<< 32) |||
+    ((byteAt ba (off + 5)).toUInt64 <<< 40) |||
+    ((byteAt ba (off + 6)).toUInt64 <<< 48) |||
+    ((byteAt ba (off + 7)).toUInt64 <<< 56)
 
-/-- Read a 4-byte little-endian `UInt32` word from `ba` at `off` (assumes `off + 4 ≤ ba.size`). -/
+/-- 4-byte little-endian `UInt32` load at `off`; out-of-range bytes read as `0`. -/
 @[inline]
 def readWord32LE (ba : ByteArray) (off : Nat) : UInt32 :=
-  let b0 := (ba.get! off).toUInt32
-  let b1 := (ba.get! (off + 1)).toUInt32 <<< 8
-  let b2 := (ba.get! (off + 2)).toUInt32 <<< 16
-  let b3 := (ba.get! (off + 3)).toUInt32 <<< 24
-  b0 ||| b1 ||| b2 ||| b3
+  (byteAt ba off).toUInt32 |||
+  ((byteAt ba (off + 1)).toUInt32 <<< 8) |||
+  ((byteAt ba (off + 2)).toUInt32 <<< 16) |||
+  ((byteAt ba (off + 3)).toUInt32 <<< 24)
+
+/-- Strided core: mixes 32-byte blocks (4 unrolled words), then single words. -/
+@[specialize]
+def mixWords (ba : ByteArray) (endOff : Nat) (i : Nat) (acc : UInt64) : UInt64 × Nat :=
+  if h : i + 32 ≤ endOff ∧ endOff ≤ ba.size then
+    let a1 := mix64Word acc (readWord64LE ba i)
+    let a2 := mix64Word a1 (readWord64LE ba (i + 8))
+    let a3 := mix64Word a2 (readWord64LE ba (i + 16))
+    let a4 := mix64Word a3 (readWord64LE ba (i + 24))
+    mixWords ba endOff (i + 32) a4
+  else if i + 8 ≤ endOff then
+    mixWords ba endOff (i + 8) (mix64Word acc (readWord64LE ba i))
+  else (acc, i)
+termination_by endOff - i
+decreasing_by all_goals omega
 
 /--
   High-throughput 64-bit word-strided hash over a zero-copy `ByteSlice` (`xxh64Slice`),
   processing 8 bytes per step via `LeanSys.Spec.mix64Word` (`leansys_mix64_word`).
   Guaranteed non-zero output (`if acc == 0 then 1 else acc`) for CAS digest compatibility.
 -/
-def xxh64Slice (s : ByteSlice) (seed : UInt64 := 0x9E3779B97F4A7C15) : UInt64 := Id.run do
-  let endOff := Nat.min (s.off + s.len) s.ba.size
-  let mut acc : UInt64 := seed ^^^ (s.len.toUInt64 * 0xBF58476D1CE4E5B9)
-  let mut i := s.off
-  while i + 8 ≤ endOff do
-    let w := readWord64LE s.ba i
-    acc := mix64Word acc w
-    i := i + 8
-  let mut tailWord : UInt64 := 0
-  let mut shift : UInt64 := 0
-  while i < endOff do
-    let b := (s.ba.get! i).toUInt64
-    tailWord := tailWord ||| (b <<< shift)
-    shift := shift + 8
-    i := i + 1
-  if shift > 0 then
-    acc := mix64Word acc tailWord
+def xxh64Slice (s : ByteSlice) (seed : UInt64 := 0x9E3779B97F4A7C15) : UInt64 :=
+  let ba := s.ba
+  let endOff := Nat.min (s.off + s.len) ba.size
+  let (acc, i) := mixWords ba endOff s.off (seed ^^^ (s.len.toUInt64 * 0xBF58476D1CE4E5B9))
+  let rem := endOff - i
+  let acc :=
+    if rem == 0 then acc
+    else
+      let w := readWord64LE ba i
+      mix64Word acc (w &&& ((1 <<< (rem.toUInt64 * 8)) - 1))
   let fin := mix64Word acc (s.len.toUInt64 ^^^ 0x94D049BB133111EB)
-  return if fin == 0 then 1 else fin
+  if fin == 0 then 1 else fin
 
 /-- Convenience wrapper for hashing a UTF-8 `String` via `xxh64Slice`. -/
 @[inline]

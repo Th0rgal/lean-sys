@@ -14,6 +14,7 @@ namespace LeanSys.Codec
 
 open LeanSys.Spec
 open LeanSys.Posix
+open LeanSys.Hash (byteAt readWord64LE)
 
 /-- Zero-copy JSON key-value tape entry pointing into a backing `ByteArray`. -/
 structure JsonTapeEntry where
@@ -36,7 +37,7 @@ namespace JsonTape
 def skipWs (ba : ByteArray) (i limit : Nat) : Nat := Id.run do
   let mut p := i
   while p < limit do
-    let c := ba.get! p
+    let c := byteAt ba p
     if c == 32 || c == 9 || c == 10 || c == 13 then
       p := p + 1
     else
@@ -49,7 +50,7 @@ def skipWs (ba : ByteArray) (i limit : Nat) : Nat := Id.run do
 def scanQuotedString (ba : ByteArray) (start limit : Nat) : Option Nat := Id.run do
   let mut p := start
   while p < limit do
-    let c := ba.get! p
+    let c := byteAt ba p
     if c == 92 then -- '\\'
       p := p + 2
     else if c == 34 then -- '"'
@@ -66,7 +67,7 @@ def scanRawValue (ba : ByteArray) (start limit : Nat) : Nat × UInt32 := Id.run 
   let mut maxDepth : UInt32 := 1
   let mut inStr := false
   while p < limit do
-    let c := ba.get! p
+    let c := byteAt ba p
     if inStr then
       if c == 92 then p := p + 2
       else if c == 34 then inStr := false; p := p + 1
@@ -99,16 +100,16 @@ def indexJsonObject (s : ByteSlice) : JsonTape := Id.run do
   let limit := Nat.min (s.off + s.len) cap
   let mut entries : Array JsonTapeEntry := Array.mkEmpty 16
   let mut p := skipWs ba s.off limit
-  if p < limit && ba.get! p == 123 then -- '{'
+  if p < limit && byteAt ba p == 123 then -- '{'
     p := p + 1
   while p < limit do
     p := skipWs ba p limit
     if p ≥ limit then break
-    let c := ba.get! p
+    let c := byteAt ba p
     if c == 125 then break -- '}'
     if c == 44 then -- ','
       p := skipWs ba (p + 1) limit
-    if p ≥ limit || ba.get! p != 34 then
+    if p ≥ limit || byteAt ba p != 34 then
       p := p + 1
     else
       let keyStart := p + 1
@@ -117,11 +118,11 @@ def indexJsonObject (s : ByteSlice) : JsonTape := Id.run do
       | some keyEnd =>
         let keyLen := keyEnd - keyStart
         p := skipWs ba (keyEnd + 1) limit
-        if p ≥ limit || ba.get! p != 58 then -- ':'
+        if p ≥ limit || byteAt ba p != 58 then -- ':'
           break
         p := skipWs ba (p + 1) limit
         if p ≥ limit then break
-        if ba.get! p == 34 then -- string value
+        if byteAt ba p == 34 then -- string value
           let valStart := p + 1
           match scanQuotedString ba valStart limit with
           | none => break
@@ -145,13 +146,26 @@ def indexJsonObject (s : ByteSlice) : JsonTape := Id.run do
           p := valEnd
   return { root := s, entries := entries }
 
+/-- Word-strided byte equality: 8 bytes per compare, then a byte tail. -/
+def eqBytesFrom (ba : ByteArray) (off : Nat) (t : ByteArray) (i : Nat) : Bool :=
+  if i + 8 ≤ t.size then
+    readWord64LE ba (off + i) == readWord64LE t i && eqBytesFrom ba off t (i + 8)
+  else if i < t.size then
+    byteAt ba (off + i) == byteAt t i && eqBytesFrom ba off t (i + 1)
+  else true
+termination_by t.size - i
+
 /-- Check if `[off, off + len)` in `ba` matches `targetBytes` byte-for-byte without allocation. -/
 @[inline]
-def sliceEqBytes (ba : ByteArray) (off len : Nat) (targetBytes : ByteArray) : Bool := Id.run do
-  if len != targetBytes.size || off + len > ba.size then return false
-  for i in [0:len] do
-    if ba.get! (off + i) != targetBytes.get! i then return false
-  return true
+def sliceEqBytes (ba : ByteArray) (off len : Nat) (targetBytes : ByteArray) : Bool :=
+  len == targetBytes.size && off + len ≤ ba.size && eqBytesFrom ba off targetBytes 0
+
+/-- Find the tape entry for `key` (no allocation: `String.toUTF8` is a field projection). -/
+@[inline]
+def findEntry? (tape : JsonTape) (key : String) : Option JsonTapeEntry :=
+  let kb := key.toUTF8
+  let ba := tape.root.ba
+  tape.entries.find? fun e => sliceEqBytes ba e.keyOff e.keyLen kb
 
 /-- Lookup a field's raw `ByteSlice` value in `tape` by `key` without copying the backing buffer. -/
 def lookupSlice? (tape : JsonTape) (key : String) : Option (ByteSlice × Bool) := Id.run do
@@ -164,31 +178,36 @@ def lookupSlice? (tape : JsonTape) (key : String) : Option (ByteSlice × Bool) :
 
 /-- Lookup a string field in `tape` by `key`. -/
 def lookupString? (tape : JsonTape) (key : String) : Option String := do
-  let (sl, _) ← lookupSlice? tape key
-  some sl.toStringLossy
+  let e ← findEntry? tape key
+  let ba := tape.root.ba
+  let stop := Nat.min (e.valOff + e.valLen) ba.size
+  some (String.fromUTF8! (ba.extract e.valOff stop))
+
+/-- Parse leading ASCII digits of `[i, stop)` into `acc`. -/
+def parseDigits (ba : ByteArray) (i stop acc : Nat) (found : Bool) : Option Nat :=
+  if i < stop then
+    let b := byteAt ba i
+    if 48 ≤ b && b ≤ 57 then parseDigits ba (i + 1) stop (acc * 10 + (b - 48).toNat) true
+    else if found then some acc else none
+  else if found then some acc else none
+termination_by stop - i
 
 /-- Lookup an unsigned `Nat` field in `tape` by `key` directly from ASCII digits in the slice. -/
-def lookupNat? (tape : JsonTape) (key : String) : Option Nat := Id.run do
-  let some (sl, _) := lookupSlice? tape key | return none
-  if sl.len == 0 then return none
-  let mut acc : Nat := 0
-  let mut foundDigit := false
-  let endOff := Nat.min (sl.off + sl.len) sl.ba.size
-  for i in [sl.off:endOff] do
-    let b := sl.ba.get! i
-    if 48 ≤ b && b ≤ 57 then
-      acc := acc * 10 + (b - 48).toNat
-      foundDigit := true
-    else
-      break
-  return if foundDigit then some acc else none
+def lookupNat? (tape : JsonTape) (key : String) : Option Nat := do
+  let e ← findEntry? tape key
+  if e.valLen == 0 then none
+  let ba := tape.root.ba
+  parseDigits ba e.valOff (Nat.min (e.valOff + e.valLen) ba.size) 0 false
 
 /-- Lookup a boolean field (`true` / `false`) in `tape` by `key` without allocation. -/
 def lookupBool? (tape : JsonTape) (key : String) : Option Bool := do
-  let (sl, _) ← lookupSlice? tape key
-  if sl.len == 4 && sl.getByteD 0 == 116 && sl.getByteD 1 == 114 then -- "tr..."
+  let e ← findEntry? tape key
+  let ba := tape.root.ba
+  let b0 := byteAt ba e.valOff
+  let b1 := byteAt ba (e.valOff + 1)
+  if e.valLen == 4 && b0 == 116 && b1 == 114 then -- "tr..."
     some true
-  else if sl.len == 5 && sl.getByteD 0 == 102 && sl.getByteD 1 == 97 then -- "fa..."
+  else if e.valLen == 5 && b0 == 102 && b1 == 97 then -- "fa..."
     some false
   else
     none
@@ -201,9 +220,9 @@ def splitJsonlLines (s : ByteSlice) : Array ByteSlice := Id.run do
   let mut lineStart := s.off
   let mut i := s.off
   while i < limit do
-    if ba.get! i == 10 then -- '\n'
+    if byteAt ba i == 10 then -- '\n'
       let rawLen := i - lineStart
-      let effLen := if rawLen > 0 && ba.get! (lineStart + rawLen - 1) == 13 then rawLen - 1 else rawLen
+      let effLen := if rawLen > 0 && byteAt ba (lineStart + rawLen - 1) == 13 then rawLen - 1 else rawLen
       if effLen > 0 then
         if let some sub := ByteSlice.subSlice? (ByteSlice.ofByteArray ba) lineStart effLen then
           out := out.push sub

@@ -49,11 +49,17 @@ Wire / Disk I/O ──► Stage 0: Unboxed C-ABI Bounds & Auth Gate (`LeanSys/Sp
 
 ## 3. Repository Layout & Verification Entrypoints
 
-- **Formal Systems Specifications & C-ABI Gates**: [`LeanSys/Spec.lean`](LeanSys/Spec.lean)
-- **Leaf POSIX C Shim (`≤ 70 LOC`) & Typed FFI**: [`c/lean_sys_shim.c`](c/lean_sys_shim.c), [`LeanSys/Posix.lean`](LeanSys/Posix.lean)
-- **Crash-Atomic WAL & Hardlinked CAS**: [`LeanSys/Store.lean`](LeanSys/Store.lean)
-- **Zero-Copy Bounded HTTP/1.1 Engine**: [`LeanSys/Http.lean`](LeanSys/Http.lean)
-- **Standalone Native Self-Test Binary**: [`LeanSys/Core.lean`](LeanSys/Core.lean) (`./.lake/build/bin/lean-sys-core self-test`)
+- **Formal Systems Specifications & 10 C-ABI Gates**: [`LeanSys/Spec.lean`](LeanSys/Spec.lean) (`16/16 non_vacuous_and_tight`)
+- **64-Bit Word-Strided Hash (`xxh64Slice`) & 3-Probe Bloom Filter**: [`LeanSys/Hash.lean`](LeanSys/Hash.lean) (`or_and_self`, `bloom_no_false_negative`)
+- **Zero-Copy JSON/JSONL Tape Indexer (`JsonTape`)**: [`LeanSys/Codec.lean`](LeanSys/Codec.lean)
+- **Leaf POSIX C Shim (`51 LOC`) & Typed FFI**: [`c/lean_sys_shim.c`](c/lean_sys_shim.c), [`LeanSys/Posix.lean`](LeanSys/Posix.lean)
+- **Crash-Atomic WAL (`putBatch` Group-Commit) & Hardlinked CAS**: [`LeanSys/Store.lean`](LeanSys/Store.lean)
+- **Sorted-String Table (`SstTable`) & 64-Bit Bloom Engine**: [`LeanSys/Lsm.lean`](LeanSys/Lsm.lean)
+- **Shared-Memory `/dev/shm` SPSC Ring Buffer (`ShmRing`)**: [`LeanSys/Mmap.lean`](LeanSys/Mmap.lean)
+- **Zero-Copy Bounded HTTP/1.1 Engine & Keep-Alive Poll Reactor**: [`LeanSys/Http.lean`](LeanSys/Http.lean), [`LeanSys/Reactor.lean`](LeanSys/Reactor.lean)
+- **Process-Group Quota Sandbox (`-pgid` Reaper & `rlimit` Gate)**: [`LeanSys/Sandbox.lean`](LeanSys/Sandbox.lean)
+- **Standalone Native Self-Test & Benchmark Binary**: [`LeanSys/Core.lean`](LeanSys/Core.lean) (`./.lake/build/bin/lean-sys-core [self-test|bench]`)
+- **Closed-Loop Autoresearch Arena & CI Gate**: [`autoresearch/sys_arena.py`](autoresearch/sys_arena.py), [`scripts/ci_verify.sh`](scripts/ci_verify.sh)
 
 ### Mandatory 3-Gate Pre-Commit Verification
 
