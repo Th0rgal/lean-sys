@@ -9,12 +9,14 @@
 -/
 import LeanSys.Spec
 import LeanSys.Posix
+import LeanSys.Hash
 import Std.Data.HashMap
 
 namespace LeanSys.Store
 
 open LeanSys.Spec
 open LeanSys.Posix
+open LeanSys.Hash
 
 /-! ## Binary Little-Endian Packing Helpers (`UInt32` / `UInt64`) -/
 
@@ -98,7 +100,7 @@ def encodeWalKVFrame (key : String) (val : ByteSlice) : ByteArray := Id.run do
   payload := pushUInt32LE payload keyLen.toUInt32
   payload := payload ++ keyBytes
   payload := payload ++ val.toByteArray
-  let csum := ByteSlice.fnv1a64 (ByteSlice.ofByteArray payload)
+  let csum := xxh64Slice (ByteSlice.ofByteArray payload)
   let mut frame := ByteArray.emptyWithCapacity (16 + payloadLen)
   frame := pushUInt32LE frame walMagic
   frame := pushUInt32LE frame payloadLen.toUInt32
@@ -117,7 +119,7 @@ def decodeWalFrameAt (buf : ByteArray) (offset : Nat) : Option (String × ByteSl
     let expectedHash := readUInt64LE buf (offset + 8)
     let availPayload := Nat.min payloadLen.toNat (buf.size - (offset + 16))
     let payloadSlice ← ByteSlice.subSlice? (ByteSlice.ofByteArray buf) (offset + 16) availPayload
-    let computedHash := ByteSlice.fnv1a64 payloadSlice
+    let computedHash := xxh64Slice payloadSlice
     if verifyWalFrame magic payloadLen availPayload.toUInt64 expectedHash computedHash != 1 then
       none
     else if availPayload < 4 then
@@ -223,6 +225,24 @@ def put (h : Handle) (key : String) (val : ByteSlice) (doSync : Bool := true) : 
 def putString (h : Handle) (key : String) (val : String) (doSync : Bool := true) : IO (SysResult Handle) :=
   put h key (ByteSlice.ofString val) doSync
 
+/-- Group-commit a batch of `(key, val)` pairs to the WAL in a single `writeAll` + `fsync` syscall under `flock(LOCK_EX)`. -/
+def putBatch (h : Handle) (entries : Array (String × ByteSlice)) (doSync : Bool := true) : IO (SysResult Handle) := do
+  if entries.isEmpty then return .ok h
+  let mut batchBuf := ByteArray.emptyWithCapacity (entries.size * 64)
+  let mut nextKv := h.kv
+  for (k, v) in entries do
+    batchBuf := batchBuf ++ encodeWalKVFrame k v
+    nextKv := nextKv.insert k v.toByteArray
+  withDirLock h.lockPath false fun _ => do
+    match ← withFd h.walPath 2 (fun fd => writeAll fd batchBuf doSync) with
+    | .error e => pure (.error e)
+    | .ok _ =>
+      pure (.ok {
+        h with
+        kv := nextKv
+        framesCount := h.framesCount + entries.size
+      })
+
 /-- Lookup a value by `key` in the in-memory `Std.HashMap` index in O(1). -/
 @[inline]
 def get? (h : Handle) (key : String) : Option ByteArray :=
@@ -265,7 +285,7 @@ def hasPathTraversal (s : String) : UInt8 := Id.run do
 /-- Write a `ByteSlice` into the content-addressable store, gated by `leansys_verify_cas_digest`.
     Returns the 16-char hex digest key. -/
 def casPut (h : Handle) (payload : ByteSlice) : IO (SysResult String) := do
-  let digest := ByteSlice.fnv1a64 payload
+  let digest := xxh64Slice payload
   let hexKey := uint64ToHex16 digest
   if verifyCasDigest digest digest (hasPathTraversal hexKey) != 1 then
     return .error .einval
@@ -294,7 +314,7 @@ def casMaterialize (h : Handle) (hexKey : String) (targetPath : String) : IO (Sy
     pure (.ok bytes)) with
   | .error e => pure (.error e)
   | .ok bytes =>
-    let computedDigest := ByteSlice.fnv1a64 (ByteSlice.ofByteArray bytes)
+    let computedDigest := xxh64Slice (ByteSlice.ofByteArray bytes)
     if verifyCasDigest expectedDigest computedDigest pathSep != 1 then
       pure (.error .einval)
     else
