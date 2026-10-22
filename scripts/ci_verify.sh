@@ -6,6 +6,9 @@ cd "$ROOT_DIR"
 
 export PATH="/var/lib/sandboxed-node/caches/elan/toolchains/leanprover--lean4---v4.31.0/bin:$PATH"
 
+grep -q "22 audited non-vacuous formal specifications" README.md
+grep -q "22/22" AGENTS.md
+
 echo "[1/5] Building lean-sys (supportInterpreter := false, libleanrt.a only)..."
 lake build
 

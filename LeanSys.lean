@@ -1,6 +1,8 @@
 /-
   LeanSys: Zero-Wrapper Verified Systems Layer for Lean 4 (`0 import Lean`, `0 sorryAx`)
 -/
+import LeanSys.Contracts.MetaGate
+import LeanSys.Contracts.SpeculativeGate
 import LeanSys.Spec
 import LeanSys.Posix
 import LeanSys.Hash

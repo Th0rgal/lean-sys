@@ -24,13 +24,13 @@ Wire / Disk I/O ──► Stage 0: Unboxed C-ABI Bounds & Auth Gate (`LeanSys/Sp
 
 ---
 
-## 2. Six Non-Negotiable Engineering Rules
+## 2. Seven Non-Negotiable Engineering Rules
 
 1. **Zero Model-Code Gap via Direct Unboxed C-ABI (`@[inline, export]`)**:
    Every buffer boundary check, WAL frame integrity check, CAS path-traversal check, composite-key order check, token auth check, sliding-window log bound check, JSON-RPC 2.0 envelope check, and orchestration state transition must live in `LeanSys/Spec.lean` or `Orb/Spec.lean` (zero `import Lean`, zero `sorryAx`) and export an unboxed C-ABI symbol (`leansys_verify_*`, `orb_verify_*`) called directly by both Lean and Rust host runtimes (`turbo-lean` `c_abi.rs`, `orb` `src/orb_spec.rs`).
 
 2. **Two-Layer Specification Compression (`Layer I` Meta-Specs vs. `Layer II` Corollaries ≤ 3 Lines)**:
-   - **Layer I (Universal Systems Meta-Specifications)**: Structural systems reasoning lives in reusable combinators (`MetaGateSpec`, `TotalSliceParserSpec`, `FramedCodecSpec`, `CrashAtomicLogSpec`, `ProtocolRefinementSpec`, `LinearLeaseSpec`, `IdempotentOutboxSpec`, `DagScheduleSpec`, `QuotaCircuitSpec`).
+   - **Layer I (Universal Systems Meta-Specifications)**: Structural systems reasoning lives in reusable combinators (`MetaGateSpec`, `TotalSliceParserSpec`, `FramedCodecSpec`, `CrashAtomicLogSpec`, `ProtocolRefinementSpec`, `LinearLeaseSpec`, `IdempotentOutboxSpec`, `DagScheduleSpec`, `QuotaCircuitSpec`) plus shared Layer-0 contracts in `LeanSys/Contracts/MetaGate.lean` and `LeanSys/Contracts/SpeculativeGate.lean`.
    - **Layer II (Declarative Corollaries)**: Concrete subsystem invariants (slice bounds, WAL torn-tail truncation recovery, CAS digest/path safety, HTTP bounds, composite-key lexicographic order, token rotation/revocation/expiry, sliding-window log truncation, JSON-RPC 2.0 framing, linear FD lifecycle) are instantiated as `MetaGateSpec` / `CrashAtomicLogSpec` bundles and **≤ 3-line corollaries**.
 
 3. **Zero-Allocation Borrowed FFI & Packed 64-Bit Syscall Return Words**:
@@ -47,11 +47,14 @@ Wire / Disk I/O ──► Stage 0: Unboxed C-ABI Bounds & Auth Gate (`LeanSys/Sp
 6. **LOC & Trust-Surface Ratchet ($\Delta\text{LOC}_{\text{C}} \le 0$)**:
    Every feature addition or optimization must preserve or shrink the C shim footprint (`51 LOC ≤ 65 LOC`) and generalize Layer I combinators in `LeanSys/Spec.lean` rather than accreting ad-hoc parsers or unsafe FFI glue.
 
+7. **Doc & Context Ratchet (`--sync-docs`)**:
+   Any commit that changes theorems, tight specs, or C-ABI exports must keep `README.md` and `AGENTS.md` aligned with the verified inventory (`22/22` tight specs, `14` C-ABI exports, `0 sorryAx`). `./scripts/ci_verify.sh --sync-docs` enforces that check.
+
 ---
 
 ## 3. Repository Layout & Verification Entrypoints
 
-- **Formal Systems Specifications & 14 C-ABI Gates**: [`LeanSys/Spec.lean`](LeanSys/Spec.lean) (`20/20 non_vacuous_and_tight` in `Spec.lean`, `22/22` total with `Hash.lean`)
+- **Formal Systems Specifications & 14 C-ABI Gates**: [`LeanSys/Spec.lean`](LeanSys/Spec.lean), [`LeanSys/Contracts/MetaGate.lean`](LeanSys/Contracts/MetaGate.lean), [`LeanSys/Contracts/SpeculativeGate.lean`](LeanSys/Contracts/SpeculativeGate.lean) (`22/22 non_vacuous_and_tight`, `14` C-ABI exports)
 - **64-Bit Word-Strided Hash (`xxh64Slice`) & 3-Probe Bloom Filter**: [`LeanSys/Hash.lean`](LeanSys/Hash.lean) (`or_and_self`, `bloom_no_false_negative`)
 - **Zero-Copy JSON/JSONL Tape Indexer (`JsonTape`)**: [`LeanSys/Codec.lean`](LeanSys/Codec.lean)
 - **Leaf POSIX C Shim (`51 LOC`) & Typed FFI**: [`c/lean_sys_shim.c`](c/lean_sys_shim.c), [`LeanSys/Posix.lean`](LeanSys/Posix.lean)
