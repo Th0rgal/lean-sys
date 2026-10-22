@@ -1,6 +1,6 @@
 # `lean-sys` — Verified Systems, Storage & Wire Runtime for Lean 4
 
-`Th0rgal/lean-sys` is a standalone, `libleanrt.a`-only systems runtime for **Lean 4** (`leanprover/lean4:v4.31.0`) with **zero `import Lean`**, **zero `sorryAx`**, **22 audited non-vacuous formal specifications** (`LeanSys/Spec.lean` + `LeanSys/Hash.lean` + `LeanSys/Contracts/MetaGate.lean` + `LeanSys/Contracts/SpeculativeGate.lean`), **14 unboxed C-ABI safety gates**, and a **51-line leaf POSIX C shim** (`c/lean_sys_shim.c`).
+`Th0rgal/lean-sys` is a standalone, `libleanrt.a`-only systems runtime for **Lean 4** (`leanprover/lean4:v4.35.0`) with **zero `import Lean`**, **zero `sorryAx`**, **22 audited non-vacuous formal specifications** (`LeanSys/Spec.lean` + `LeanSys/Hash.lean` + `LeanSys/Contracts/MetaGate.lean` + `LeanSys/Contracts/SpeculativeGate.lean`), **14 unboxed C-ABI safety gates**, and a **51-line leaf POSIX C shim** (`c/lean_sys_shim.c`).
 
 It provides the crash-atomic storage (`LeanSys.Store`, `LeanSys.Lsm`), shared-memory IPC (`LeanSys.Mmap`), zero-copy JSON/JSONL tape indexing (`LeanSys.Codec`), 64-bit word-strided hashing (`LeanSys.Hash`), process-group quota sandboxing (`LeanSys.Sandbox`), and bounded HTTP/1.1 Keep-Alive transport (`LeanSys.Http`, `LeanSys.Reactor`) for [`Th0rgal/maxwell`](https://github.com/Th0rgal/maxwell) and [`Th0rgal/turbo-lean`](https://github.com/Th0rgal/turbo-lean) without linking `libsqlite3`, `libcurl`, or `libssl`.
 

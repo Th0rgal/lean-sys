@@ -55,7 +55,7 @@ def find_maxwell_bin() -> Path | None:
 
 def run_cmd(cmd: List[str], cwd: Path = ROOT_DIR) -> subprocess.CompletedProcess[str]:
     env = os.environ.copy()
-    lean_bin = "/var/lib/sandboxed-node/caches/elan/toolchains/leanprover--lean4---v4.31.0/bin"
+    lean_bin = "/var/lib/sandboxed-node/caches/elan/toolchains/leanprover--lean4---v4.35.0/bin:/var/lib/sandboxed-node/.elan/toolchains/leanprover--lean4---v4.35.0/bin"
     env["PATH"] = f"{lean_bin}:{env.get('PATH', '')}"
     return subprocess.run(cmd, cwd=str(cwd), env=env, text=True, capture_output=True, check=False)
 

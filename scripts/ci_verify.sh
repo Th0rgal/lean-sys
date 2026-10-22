@@ -4,7 +4,7 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
 
-export PATH="/var/lib/sandboxed-node/caches/elan/toolchains/leanprover--lean4---v4.31.0/bin:$PATH"
+export PATH="/var/lib/sandboxed-node/caches/elan/toolchains/leanprover--lean4---v4.35.0/bin:/var/lib/sandboxed-node/.elan/toolchains/leanprover--lean4---v4.35.0/bin:$HOME/.elan/bin:$PATH"
 
 grep -q "22 audited non-vacuous formal specifications" README.md
 grep -q "22/22" AGENTS.md
