@@ -10,6 +10,10 @@ import LeanSys.Codec
 import LeanSys.Store
 import LeanSys.Mmap
 import LeanSys.Lsm
+import LeanSys.Table
+import LeanSys.Auth
+import LeanSys.ProcLog
+import LeanSys.JsonRpc
 import LeanSys.Http
 import LeanSys.Reactor
 import LeanSys.Sandbox
@@ -23,6 +27,10 @@ open LeanSys.Codec
 open LeanSys.Store
 open LeanSys.Mmap
 open LeanSys.Lsm
+open LeanSys.Table
+open LeanSys.Auth
+open LeanSys.ProcLog
+open LeanSys.JsonRpc
 open LeanSys.Http
 open LeanSys.Reactor
 open LeanSys.Sandbox
@@ -57,7 +65,18 @@ def runSelfTest : IO UInt32 := do
                     verifyRlimitBudget 8192 4096 50 1000 512 4096 == 0 &&
                     verifyRlimitBudget 1024 4096 2000 1000 512 4096 == 0
   let mixGateOk := mix64Word 0 0 != mix64Word 0 1
-  if !(sbOk && wfOk && casGateOk && httpGateOk && tapeGateOk && ringGateOk && sstGateOk && pollGateOk && rlimGateOk && mixGateOk) then
+  let ckGateOk := verifyCompositeKeyOrder 1 2 3 1 2 4 == 1 &&
+                  verifyCompositeKeyOrder 1 2 5 1 2 4 == 0
+  let tokGateOk := verifyTokenAuth 0 1 1 1 100 200 == 1 &&
+                   verifyTokenAuth 0 0 1 1 100 200 == 0 &&
+                   verifyTokenAuth 1 0 0 1 200 200 == 0
+  let logGateOk := verifyLogWindow 0 1024 4096 65536 == 1 &&
+                   verifyLogWindow 1024 512 4096 65536 == 0 &&
+                   verifyLogWindow 0 1024 4096 524288 == 0
+  let rpcGateOk := verifyJsonRpcFrame 1 1 10 256 == 1 &&
+                   verifyJsonRpcFrame 0 1 10 256 == 0 &&
+                   verifyJsonRpcFrame 1 1 0 256 == 0
+  if !(sbOk && wfOk && casGateOk && httpGateOk && tapeGateOk && ringGateOk && sstGateOk && pollGateOk && rlimGateOk && mixGateOk && ckGateOk && tokGateOk && logGateOk && rpcGateOk) then
     IO.eprintln "[lean-sys-core] FAIL: C-ABI Spec gates check failed"
     return 1
 
@@ -130,6 +149,50 @@ def runSelfTest : IO UInt32 := do
     IO.eprintln "[lean-sys-core] FAIL: SstTable Bloom/binary-search lookup mismatch"
     return 1
 
+  -- 4b. CompositeKey Table Range Scan (`LeanSys.Table`), Token Rotation (`LeanSys.Auth`), ProcLog (`LeanSys.ProcLog`), and JSON-RPC 2.0 (`LeanSys.JsonRpc`)
+  let ck1 : CompositeKey := { hi := 10, lo := 20, seq := 1 }
+  let ck2 : CompositeKey := { hi := 10, lo := 20, seq := 2 }
+  let ck3 : CompositeKey := { hi := 10, lo := 20, seq := 3 }
+  let .ok stTbl1 ← putComposite stCompacted ck1 (ByteSlice.ofString "ev-1") false
+    | do IO.eprintln "[lean-sys-core] FAIL: putComposite 1"; return 1
+  let .ok stTbl2 ← putComposite stTbl1 ck2 (ByteSlice.ofString "ev-2") false
+    | do IO.eprintln "[lean-sys-core] FAIL: putComposite 2"; return 1
+  let .ok stTbl3 ← putComposite stTbl2 ck3 (ByteSlice.ofString "ev-3") true
+    | do IO.eprintln "[lean-sys-core] FAIL: putComposite 3"; return 1
+  let sstTblPath := s!"{testDir}/table.sst"
+  let .ok sstTbl ← SstTable.flushStore stTbl3 sstTblPath
+    | do IO.eprintln "[lean-sys-core] FAIL: SstTable.flushStore table"; return 1
+  let scanRows := rangeScan sstTbl ck1 ck2 10
+  if scanRows.size != 2 || scanRows[0]!.2.toStringLossy != "ev-1" || scanRows[1]!.2.toStringLossy != "ev-2" then
+    IO.eprintln "[lean-sys-core] FAIL: Table.rangeScan mismatch"
+    return 1
+
+  let lease := mintLease "cur-secret" "babylon" "job:submit" 2000
+  if !verifyRotatedBearer "old-tok" "new-tok" (some "old-tok") ||
+     verifyRotatedBearer "bad-tok" "new-tok" (some "old-tok") ||
+     !validateLease lease "new-secret" (some "cur-secret") "babylon" "job:submit" 1500 ||
+     validateLease lease "new-secret" (some "cur-secret") "babylon" "job:submit" 2500 then
+    IO.eprintln "[lean-sys-core] FAIL: Auth token rotation / lease validation mismatch"
+    return 1
+
+  let logPath := s!"{testDir}/job.log"
+  IO.FS.writeFile logPath "line-one\nline-two\npartial-tail"
+  let .ok chunk1 ← readLogChunk logPath 0 14 false
+    | do IO.eprintln "[lean-sys-core] FAIL: ProcLog.readLogChunk"; return 1
+  if chunk1.data != "line-one\n" || chunk1.nextOff != 9 then
+    IO.eprintln s!"[lean-sys-core] FAIL: ProcLog newline cut mismatch: {repr chunk1}"
+    return 1
+
+  let rpcSample := ByteSlice.ofString "{\"jsonrpc\":\"2.0\",\"id\":7,\"method\":\"tools/list\",\"params\":{\"cursor\":null}}"
+  match parseRequest? rpcSample with
+  | none =>
+    IO.eprintln "[lean-sys-core] FAIL: JsonRpc.parseRequest? failed"
+    return 1
+  | some rpcReq =>
+    if rpcReq.method != "tools/list" || rpcReq.idRaw? != some "7" then
+      IO.eprintln "[lean-sys-core] FAIL: JsonRpc field mismatch"
+      return 1
+
   -- 5. Shared-Memory SPSC Ring Buffer (`ShmRing`)
   let ringPath := s!"{testDir}/ipc.ring"
   let .ok ring ← ShmRing.init ringPath 1024
@@ -182,7 +245,7 @@ def runSelfTest : IO UInt32 := do
       IO.eprintln s!"[lean-sys-core] FAIL: unexpected HTTP response: {respBody}"
       return 1
 
-  IO.println s!"\{ \"ok\": true, \"binary\": \"lean-sys-core\", \"c_abi_gates\": 10, \"wal_torn_recovery\": true, \"cas_hardlink\": true, \"sst_bloom\": true, \"shm_ring\": true, \"jsonl_tape\": true, \"reactor_keepalive\": true, \"sandbox_rlimit\": true, \"pgid_reaper\": true, \"http_loopback_port\": {boundPort} }"
+  IO.println s!"\{ \"ok\": true, \"binary\": \"lean-sys-core\", \"c_abi_gates\": 14, \"wal_torn_recovery\": true, \"cas_hardlink\": true, \"sst_bloom\": true, \"table_range_scan\": true, \"auth_rotation\": true, \"proc_log\": true, \"jsonrpc_2_0\": true, \"shm_ring\": true, \"jsonl_tape\": true, \"reactor_keepalive\": true, \"sandbox_rlimit\": true, \"pgid_reaper\": true, \"http_loopback_port\": {boundPort} }"
   return 0
 
 /-- Run deterministic micro-benchmarks for `autoresearch/sys_arena.py` and emit JSON metrics. -/
@@ -249,7 +312,7 @@ def main (args : List String) : IO UInt32 := do
   | ["bench"] | ["--bench"] => LeanSys.Core.runBench 4000
   | ["bench", nStr] | ["--bench", nStr] => LeanSys.Core.runBench (nStr.toNat?.getD 4000)
   | ["--c-abi"] =>
-    IO.println "{\"ok\":true,\"exports\":[\"leansys_verify_slice_bounds\",\"leansys_verify_wal_frame\",\"leansys_verify_cas_digest\",\"leansys_check_http_bounds\",\"leansys_verify_jsonl_tape\",\"leansys_verify_ring_cursor\",\"leansys_verify_sst_block\",\"leansys_verify_poll_interest\",\"leansys_verify_rlimit_budget\",\"leansys_mix64_word\"]}"
+    IO.println "{\"ok\":true,\"exports\":[\"leansys_verify_slice_bounds\",\"leansys_verify_wal_frame\",\"leansys_verify_cas_digest\",\"leansys_check_http_bounds\",\"leansys_verify_jsonl_tape\",\"leansys_verify_ring_cursor\",\"leansys_verify_sst_block\",\"leansys_verify_poll_interest\",\"leansys_verify_rlimit_budget\",\"leansys_mix64_word\",\"leansys_verify_composite_key_order\",\"leansys_verify_token_auth\",\"leansys_verify_log_window\",\"leansys_verify_jsonrpc_frame\"]}"
     return 0
   | _ =>
     IO.println "usage: lean-sys-core [self-test | bench | --c-abi]"

@@ -120,6 +120,7 @@ structure ByteSlice where
   ba  : ByteArray
   off : Nat
   len : Nat
+  deriving Inhabited
 
 namespace ByteSlice
 

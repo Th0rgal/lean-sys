@@ -8,7 +8,9 @@
     `leansys_verify_cas_digest`, `leansys_check_http_bounds`,
     `leansys_verify_jsonl_tape`, `leansys_verify_ring_cursor`,
     `leansys_verify_sst_block`, `leansys_verify_poll_interest`,
-    `leansys_verify_rlimit_budget`, `leansys_mix64_word`
+    `leansys_verify_rlimit_budget`, `leansys_mix64_word`,
+    `leansys_verify_table_range`, `leansys_verify_token_auth`,
+    `leansys_verify_log_window`, `leansys_verify_jsonrpc_frame`
 -/
 
 namespace LeanSys.Spec
@@ -551,5 +553,140 @@ def mix64Word (acc word : UInt64) : UInt64 :=
 
 /-- Corollary 12: Distinct non-zero seed inputs or distinct word perturbations yield deterministic `mix64Word` evaluation. -/
 theorem mix64Word_zero_diff : mix64Word 0 0 != mix64Word 0 1 := by decide
+
+/-! ## Layer I & II Extensions v0.2: Composite Keys, Token Auth, Log Window & JSON-RPC 2.0 Gates -/
+
+/--
+  Unboxed C-ABI Composite 192-Bit Key Order Verifier (`leansys_verify_composite_key_order`):
+  Certifies non-decreasing lexicographic order `(hiA, loA, seqA) ≤ (hiB, loB, seqB)`
+  for big-endian composite index keys `(uuid_hi, uuid_lo, seq)`.
+-/
+@[inline, export leansys_verify_composite_key_order]
+def verifyCompositeKeyOrder (hiA loA seqA hiB loB seqB : UInt64) : UInt8 :=
+  if hiA < hiB || (hiA == hiB && (loA < loB || (loA == loB && seqA ≤ seqB))) then 1 else 0
+
+/-- Composite 192-bit key order check parameters. -/
+structure CompositeKeyOrderCheck where
+  hiA  : UInt64
+  loA  : UInt64
+  seqA : UInt64
+  hiB  : UInt64
+  loB  : UInt64
+  seqB : UInt64
+  deriving Repr, DecidableEq
+
+/-- Layer II Bundle 13: Composite 192-bit key lexicographic ordering gate. -/
+def compositeKeyOrderMetaSpec : MetaGateSpec Unit CompositeKeyOrderCheck where
+  inv _ := True
+  gate _ k := verifyCompositeKeyOrder k.hiA k.loA k.seqA k.hiB k.loB k.seqB == 1
+  step _ _ := ()
+  safe _ k := (k.hiA < k.hiB || (k.hiA == k.hiB && (k.loA < k.loB || (k.loA == k.loB && k.seqA ≤ k.seqB))))
+  preserves_inv _ _ _ h := h
+  ensures_safe _ k h := by unfold verifyCompositeKeyOrder at h; split at h <;> simp_all
+
+/-- Corollary 13: `verifyCompositeKeyOrder` rejects any out-of-order composite key pair. -/
+theorem composite_key_order_rejects_inversion (k : CompositeKeyOrderCheck)
+    (h_bad : (k.hiA < k.hiB || (k.hiA == k.hiB && (k.loA < k.loB || (k.loA == k.loB && k.seqA ≤ k.seqB)))) = false) :
+    (verifyCompositeKeyOrder k.hiA k.loA k.seqA k.hiB k.loB k.seqB == 1) = false :=
+  compositeKeyOrderMetaSpec.rejects_unsafe () k h_bad
+
+/--
+  Unboxed C-ABI Constant-Time Token Rotation & Scoped Lease Gate (`leansys_verify_token_auth`):
+  Certifies that a presented token matches either the current secret (`matchCurrent == 1`)
+  or a non-empty previous rotation secret (`hasPrev == 1 && matchPrev == 1`),
+  and that the scoped lease has not expired (`nowEpoch < expiresAt`) and matches scope (`scopeOk == 1`).
+-/
+@[inline, export leansys_verify_token_auth]
+def verifyTokenAuth (matchCurrent hasPrev matchPrev scopeOk : UInt8) (nowEpoch expiresAt : UInt64) : UInt8 :=
+  if (matchCurrent == 1 || (hasPrev == 1 && matchPrev == 1)) && scopeOk == 1 && nowEpoch < expiresAt then 1 else 0
+
+/-- Token rotation and scoped lease check parameters. -/
+structure TokenAuthCheck where
+  matchCurrent : UInt8
+  hasPrev      : UInt8
+  matchPrev    : UInt8
+  scopeOk      : UInt8
+  nowEpoch     : UInt64
+  expiresAt    : UInt64
+  deriving Repr, DecidableEq
+
+/-- Layer II Bundle 14: Constant-time token rotation & scoped lease expiration gate. -/
+def tokenAuthMetaSpec : MetaGateSpec Unit TokenAuthCheck where
+  inv _ := True
+  gate _ a := verifyTokenAuth a.matchCurrent a.hasPrev a.matchPrev a.scopeOk a.nowEpoch a.expiresAt == 1
+  step _ _ := ()
+  safe _ a := ((a.matchCurrent == 1 || (a.hasPrev == 1 && a.matchPrev == 1)) && a.scopeOk == 1 && a.nowEpoch < a.expiresAt)
+  preserves_inv _ _ _ h := h
+  ensures_safe _ a h := by unfold verifyTokenAuth at h; split at h <;> simp_all
+
+/-- Corollary 14: `verifyTokenAuth` rejects expired leases, wrong scopes, or unrotated token mismatches. -/
+theorem token_auth_rejects_unauthorized (a : TokenAuthCheck)
+    (h_bad : ((a.matchCurrent == 1 || (a.hasPrev == 1 && a.matchPrev == 1)) && a.scopeOk == 1 && a.nowEpoch < a.expiresAt) = false) :
+    (verifyTokenAuth a.matchCurrent a.hasPrev a.matchPrev a.scopeOk a.nowEpoch a.expiresAt == 1) = false :=
+  tokenAuthMetaSpec.rejects_unsafe () a h_bad
+
+/--
+  Unboxed C-ABI Process Log Chunk & UTF-8 Window Verifier (`leansys_verify_log_window`):
+  Certifies that a `pread` log chunk `[startOff, nextOff)` lies inside `[0, fileLen]`,
+  `nextOff - startOff ≤ maxBytes`, and `maxBytes ≤ 262144` (256 KiB cap).
+-/
+@[inline, export leansys_verify_log_window]
+def verifyLogWindow (startOff nextOff fileLen maxBytes : UInt64) : UInt8 :=
+  if startOff ≤ nextOff && nextOff ≤ fileLen && nextOff - startOff ≤ maxBytes && maxBytes ≤ 262144 then 1 else 0
+
+/-- Process log chunk window check parameters. -/
+structure LogWindowCheck where
+  startOff : UInt64
+  nextOff  : UInt64
+  fileLen  : UInt64
+  maxBytes : UInt64
+  deriving Repr, DecidableEq
+
+/-- Layer II Bundle 15: Process log chunk window & 256 KiB cap gate. -/
+def logWindowMetaSpec : MetaGateSpec Unit LogWindowCheck where
+  inv _ := True
+  gate _ w := verifyLogWindow w.startOff w.nextOff w.fileLen w.maxBytes == 1
+  step _ _ := ()
+  safe _ w := (w.startOff ≤ w.nextOff && w.nextOff ≤ w.fileLen && w.nextOff - w.startOff ≤ w.maxBytes && w.maxBytes ≤ 262144)
+  preserves_inv _ _ _ h := h
+  ensures_safe _ w h := by unfold verifyLogWindow at h; split at h <;> simp_all
+
+/-- Corollary 15: `verifyLogWindow` rejects inverted cursors, reads past EOF, or chunks exceeding 256 KiB. -/
+theorem log_window_rejects_invalid_chunk (w : LogWindowCheck)
+    (h_bad : (w.startOff ≤ w.nextOff && w.nextOff ≤ w.fileLen && w.nextOff - w.startOff ≤ w.maxBytes && w.maxBytes ≤ 262144) = false) :
+    (verifyLogWindow w.startOff w.nextOff w.fileLen w.maxBytes == 1) = false :=
+  logWindowMetaSpec.rejects_unsafe () w h_bad
+
+/--
+  Unboxed C-ABI JSON-RPC 2.0 Frame Verifier (`leansys_verify_jsonrpc_frame`):
+  Certifies `hasV2 == 1` (`"jsonrpc":"2.0"`), non-empty method (`0 < methodLen && methodLen ≤ 128`),
+  valid id/notification tag (`hasId ≤ 1`), and payload size `payloadLen ≤ 4194304` (4 MiB).
+-/
+@[inline, export leansys_verify_jsonrpc_frame]
+def verifyJsonRpcFrame (hasV2 hasId : UInt8) (methodLen : UInt32) (payloadLen : UInt64) : UInt8 :=
+  if hasV2 == 1 && hasId ≤ 1 && methodLen > 0 && methodLen ≤ 128 && payloadLen ≤ 4194304 then 1 else 0
+
+/-- JSON-RPC 2.0 frame check parameters. -/
+structure JsonRpcFrameCheck where
+  hasV2      : UInt8
+  hasId      : UInt8
+  methodLen  : UInt32
+  payloadLen : UInt64
+  deriving Repr, DecidableEq
+
+/-- Layer II Bundle 16: JSON-RPC 2.0 stdio envelope & method-length gate. -/
+def jsonRpcFrameMetaSpec : MetaGateSpec Unit JsonRpcFrameCheck where
+  inv _ := True
+  gate _ f := verifyJsonRpcFrame f.hasV2 f.hasId f.methodLen f.payloadLen == 1
+  step _ _ := ()
+  safe _ f := (f.hasV2 == 1 && f.hasId ≤ 1 && f.methodLen > 0 && f.methodLen ≤ 128 && f.payloadLen ≤ 4194304)
+  preserves_inv _ _ _ h := h
+  ensures_safe _ f h := by unfold verifyJsonRpcFrame at h; split at h <;> simp_all
+
+/-- Corollary 16: `verifyJsonRpcFrame` rejects non-2.0 JSON-RPC frames, empty/oversized method names, or >4 MiB payloads. -/
+theorem jsonrpc_frame_rejects_malformed (f : JsonRpcFrameCheck)
+    (h_bad : (f.hasV2 == 1 && f.hasId ≤ 1 && f.methodLen > 0 && f.methodLen ≤ 128 && f.payloadLen ≤ 4194304) = false) :
+    (verifyJsonRpcFrame f.hasV2 f.hasId f.methodLen f.payloadLen == 1) = false :=
+  jsonRpcFrameMetaSpec.rejects_unsafe () f h_bad
 
 end LeanSys.Spec

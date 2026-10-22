@@ -8,6 +8,10 @@ import LeanSys.Codec
 import LeanSys.Store
 import LeanSys.Mmap
 import LeanSys.Lsm
+import LeanSys.Table
+import LeanSys.Auth
+import LeanSys.ProcLog
+import LeanSys.JsonRpc
 import LeanSys.Http
 import LeanSys.Reactor
 import LeanSys.Sandbox

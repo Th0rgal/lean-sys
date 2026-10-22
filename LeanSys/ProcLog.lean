@@ -1,0 +1,111 @@
+/-
+  LeanSys.ProcLog: Bounded `pread` Process Log Chunk & Tail Reader
+  (`0 import Lean`, `0 sorryAx`)
+  - Reads bounded `[offset, offset + maxBytes)` chunks of live subprocess logs via `preadByteArray`
+  - Cuts non-EOF chunks back to the last newline (`'\n'`) and strips incomplete trailing UTF-8 codepoint sequences
+  - Every returned `(startOff, nextOff, fileLen)` window is gated by
+    `LeanSys.Spec.verifyLogWindow` (`leansys_verify_log_window`)
+-/
+import LeanSys.Spec
+import LeanSys.Posix
+import LeanSys.Hash
+
+namespace LeanSys.ProcLog
+
+open LeanSys.Spec
+open LeanSys.Posix
+open LeanSys.Hash
+
+/-- Maximum bytes returned by a single `readLogChunk` call (256 KiB). -/
+@[inline] def maxLogChunkBytes : Nat := 262144
+
+/-- Default tail size for `readLogTail` (64 KiB). -/
+@[inline] def defaultLogTailBytes : Nat := 65536
+
+/-- Result of a bounded positional log chunk read. -/
+structure LogChunk where
+  data       : String
+  startOff   : UInt64
+  nextOff    : UInt64
+  reachedEof : Bool
+  deriving Repr, DecidableEq
+
+/-- Find the length of a prefix ending at the last newline `'\n'` (`10`), or `len` if none exists. -/
+def cutAtLastNewline (ba : ByteArray) (len : Nat) : Nat := Id.run do
+  let mut i := len
+  while i > 0 do
+    i := i - 1
+    if byteAt ba i == 10 then
+      return i + 1
+  return len
+
+/--
+  Trim any incomplete trailing multi-byte UTF-8 sequence at the end of `ba[0..len)`
+  when the log file is still growing (`!reachedEof || !terminal`).
+-/
+def trimIncompleteUtf8Suffix (ba : ByteArray) (len : Nat) : Nat := Id.run do
+  if len == 0 then return 0
+  -- Inspect up to the last 3 bytes for a leading UTF-8 multi-byte marker whose continuation bytes are incomplete
+  let mut back : Nat := 1
+  while back ≤ 3 && back ≤ len do
+    let idx := len - back
+    let b := byteAt ba idx
+    if (b &&& 0x80) == 0 then
+      -- ASCII byte: complete
+      return len
+    else if (b &&& 0xC0) == 0x80 then
+      -- Continuation byte `10xxxxxx`: keep scanning backwards
+      back := back + 1
+    else
+      -- Leading byte of a 2-, 3-, or 4-byte sequence
+      let needed : Nat :=
+        if (b &&& 0xE0) == 0xC0 then 2
+        else if (b &&& 0xF0) == 0xE0 then 3
+        else 4
+      if back < needed then
+        return idx
+      else
+        return len
+  return len
+
+/--
+  Read a bounded log chunk from `logPath` starting at `offset` (up to `maxBytes ≤ 256 KiB`).
+  Cuts back to the last newline if more bytes remain in the file, trims incomplete UTF-8 tails,
+  and verifies the window via `leansys_verify_log_window`.
+-/
+def readLogChunk (logPath : String) (offset : UInt64) (maxBytes : Nat := 65536) (terminal : Bool := false)
+    : IO (SysResult LogChunk) := do
+  let cappedMax := Nat.min (Nat.max maxBytes 4) maxLogChunkBytes
+  withFd logPath 0 fun fd => do
+    -- Read up to `cappedMax + 1` bytes so we know whether we reached EOF without an extra `fstat` syscall
+    let raw ← preadByteArray fd offset (cappedMax + 1)
+    let reachedEof := raw.size ≤ cappedMax
+    let rawLen := Nat.min raw.size cappedMax
+    let lineCut := if !reachedEof then cutAtLastNewline raw rawLen else rawLen
+    let validLen := if !terminal || !reachedEof then trimIncompleteUtf8Suffix raw lineCut else lineCut
+    let startOff := offset
+    let nextOff := startOff + validLen.toUInt64
+    let fileFloor := startOff + raw.size.toUInt64
+    if verifyLogWindow startOff nextOff fileFloor cappedMax.toUInt64 != 1 then
+      return .error .einval
+    let slice : ByteSlice := { ba := raw, off := 0, len := validLen }
+    return .ok {
+      data := slice.toStringLossy
+      startOff := startOff
+      nextOff := nextOff
+      reachedEof := reachedEof && validLen == raw.size
+    }
+
+/-- Read up to the last `maxTailBytes` of `logPath` when the total size is bounded by `maxFileBytes`. -/
+def readLogTail (logPath : String) (maxTailBytes : Nat := defaultLogTailBytes) : IO (SysResult String) := do
+  let cap := Nat.min maxTailBytes maxLogChunkBytes
+  withFd logPath 0 fun fd => do
+    let raw ← preadByteArray fd 0 (cap * 4)
+    let start := if raw.size > cap then raw.size - cap else 0
+    let len := raw.size - start
+    if verifyLogWindow start.toUInt64 raw.size.toUInt64 raw.size.toUInt64 cap.toUInt64 != 1 then
+      return .error .einval
+    let slice : ByteSlice := { ba := raw, off := start, len := len }
+    return .ok slice.toStringLossy
+
+end LeanSys.ProcLog
