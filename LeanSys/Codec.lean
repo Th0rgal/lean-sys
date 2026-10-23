@@ -245,7 +245,7 @@ structure SseFieldSpan where
   deriving Repr, DecidableEq
 
 /-- Incremental zero-copy SSE frame scanner (`leansys_sse_frame_scan`) over a borrowed `ByteSlice`:
-    splits `event:` / `data:` / `id:` / `retry:` lines without cutting multi-byte UTF-8 continuation bytes (`[0x80, 0xBF]`). -/
+    splits `event:` / `data:` / `id:` / `retry:` lines without cutting multi-byte UTF-8 sequences. -/
 def scanSseFrames (s : ByteSlice) : Array SseFieldSpan × Nat := Id.run do
   let ba := s.ba
   let cap := ba.size
@@ -273,7 +273,8 @@ def scanSseFrames (s : ByteSlice) : Array SseFieldSpan × Nat := Id.run do
           let valStart := if colon + 1 < lineEnd && byteAt ba (colon + 1) == 32 then colon + 2 else colon + 1
           let valLen := if lineEnd ≥ valStart then lineEnd - valStart else 0
           let nextB := if i + 1 < limit then byteAt ba (i + 1) else 0
-          if valLen > 0 && verifySseFrameScan valStart.toUInt64 valLen.toUInt64 cap.toUInt64 kind nextB == 1 then
+          let lastB := if valLen > 0 then byteAt ba (valStart + valLen - 1) else 0
+          if valLen > 0 && verifySseFrameScan valStart.toUInt64 valLen.toUInt64 cap.toUInt64 kind nextB lastB == 1 then
             spans := spans.push { fieldKind := kind, valOff := valStart, valLen := valLen }
       lineStart := i + 1
     i := i + 1

@@ -125,6 +125,7 @@ extern "C" {
         chunk_len: u64,
         field_kind: u8,
         next_byte: u8,
+        last_byte: u8,
     ) -> u8;
 
     pub fn leansys_gfm_pipe_scan(
@@ -396,8 +397,11 @@ pub fn sse_frame_scan(
     chunk_len: u64,
     field_kind: u8,
     next_byte: u8,
+    last_byte: u8,
 ) -> bool {
-    unsafe { leansys_sse_frame_scan(frame_off, frame_len, chunk_len, field_kind, next_byte) == 1 }
+    unsafe {
+        leansys_sse_frame_scan(frame_off, frame_len, chunk_len, field_kind, next_byte, last_byte) == 1
+    }
 }
 
 #[inline]
@@ -520,8 +524,10 @@ mod tests {
         assert!(verify_proc_stat_fields(5, 18, 120, 20, 35));
         assert!(!verify_proc_stat_fields(18, 5, 120, 20, 35));
 
-        assert!(sse_frame_scan(4, 12, 64, 2, 0x41));
-        assert!(!sse_frame_scan(4, 12, 64, 2, 0x85));
+        assert!(sse_frame_scan(4, 12, 64, 2, 0x41, 0x7D));
+        assert!(!sse_frame_scan(4, 12, 64, 2, 0x85, 0x7D));
+        assert!(!sse_frame_scan(4, 12, 64, 2, 0x41, 0xE2));
+        assert!(!sse_frame_scan(u64::MAX - 7, 16, 64, 2, 0x41, 0x7D));
 
         assert!(gfm_pipe_scan(0, 24, 64, 3, 3, false));
         assert!(!gfm_pipe_scan(0, 24, 64, 3, 2, false));
@@ -529,6 +535,7 @@ mod tests {
 
         assert!(tag_scan(0, 20, 6, 12, 64, 1));
         assert!(!tag_scan(0, 20, 6, 18, 64, 1));
+        assert!(!tag_scan(0, 20, 6, u64::MAX - 3, 64, 1));
 
         assert_ne!(transcript_index(0, 32, 64, 0x1111, 0x2222), 0);
         assert_eq!(transcript_index(48, 32, 64, 0x1111, 0x2222), 0);

@@ -87,15 +87,18 @@ def runSelfTest : IO UInt32 := do
   let procStatGateOk := verifyProcStatFields 5 18 64 5 12 == 1 &&
                         verifyProcStatFields 18 5 64 5 12 == 0 &&
                         verifyProcStatFields 5 18 64 15 12 == 0
-  let sseGateOk := verifySseFrameScan 4 12 64 2 0x41 == 1 &&
-                   verifySseFrameScan 4 12 64 2 0x85 == 0 &&
-                   verifySseFrameScan 60 12 64 2 0x41 == 0
+  let sseGateOk := verifySseFrameScan 4 12 64 2 0x41 0x7D == 1 &&
+                   verifySseFrameScan 4 12 64 2 0x85 0x7D == 0 &&
+                   verifySseFrameScan 4 12 64 2 0x41 0xE2 == 0 &&
+                   verifySseFrameScan 60 12 64 2 0x41 0x7D == 0 &&
+                   verifySseFrameScan 0xFFFFFFFFFFFFFFF8 16 64 2 0x41 0x7D == 0
   let gfmGateOk := verifyGfmPipeScan 0 24 64 3 3 0 == 1 &&
                    verifyGfmPipeScan 0 24 64 3 2 0 == 0 &&
                    verifyGfmPipeScan 0 24 64 3 3 1 == 0
   let tagGateOk := verifyTagScan 0 20 6 12 64 1 == 1 &&
                    verifyTagScan 0 20 6 18 64 1 == 0 &&
-                   verifyTagScan 0 20 6 12 64 9 == 0
+                   verifyTagScan 0 20 6 12 64 9 == 0 &&
+                   verifyTagScan 0 20 6 0xFFFFFFFFFFFFFFFC 64 1 == 0
   let trIdxGateOk := verifyTranscriptIndex 0 32 64 0x1111 0x2222 != 0 &&
                      verifyTranscriptIndex 48 32 64 0x1111 0x2222 == 0
   if !(sbOk && wfOk && casGateOk && httpGateOk && tapeGateOk && ringGateOk && sstGateOk && pollGateOk && rlimGateOk && mixGateOk && ckGateOk && tokGateOk && logGateOk && rpcGateOk && admitGateOk && seqlockGateOk && procStatGateOk && sseGateOk && gfmGateOk && tagGateOk && trIdxGateOk) then

@@ -48,13 +48,13 @@ Wire / Disk I/O ──► Stage 0: Unboxed C-ABI Bounds & Auth Gate (`LeanSys/Sp
    Every feature addition or optimization must preserve or shrink the C shim footprint (`51 LOC ≤ 65 LOC`) and generalize Layer I combinators in `LeanSys/Spec.lean` rather than accreting ad-hoc parsers or unsafe FFI glue.
 
 7. **Doc & Context Ratchet (`--sync-docs`)**:
-   Any commit that changes theorems, tight specs, or C-ABI exports must keep `README.md` and `AGENTS.md` aligned with the verified inventory (<!-- inventory:leansys_summary -->30/30 tight specs (28 in Spec.lean + 2 in Hash.lean + 1 in Gate.lean, 21 C-ABI exports, c/lean_sys_shim.c=51 LOC, 0 sorryAx)<!-- /inventory:leansys_summary -->). `./scripts/ci_verify.sh --sync-docs` enforces that check.
+   Any commit that changes theorems, tight specs, or C-ABI exports must keep `README.md` and `AGENTS.md` aligned with the verified inventory (<!-- inventory:leansys_summary -->31/31 tight specs (29 in Spec.lean + 2 in Hash.lean + 1 in Gate.lean, 21 C-ABI exports, c/lean_sys_shim.c=51 LOC, 0 sorryAx)<!-- /inventory:leansys_summary -->). `./scripts/ci_verify.sh --sync-docs` enforces that check.
 
 ---
 
 ## 3. Repository Layout & Verification Entrypoints
 
-- **Formal Systems Specifications & <!-- inventory:leansys_cabi -->21<!-- /inventory:leansys_cabi --> C-ABI Gates**: [`LeanSys/Spec.lean`](LeanSys/Spec.lean), [`LeanSys/Gate.lean`](LeanSys/Gate.lean), [`LeanSys/Contracts/MetaGate.lean`](LeanSys/Contracts/MetaGate.lean), [`LeanSys/Contracts/SpeculativeGate.lean`](LeanSys/Contracts/SpeculativeGate.lean) (`<!-- inventory:leansys_total_tight -->30<!-- /inventory:leansys_total_tight -->/<!-- inventory:leansys_total_tight -->30<!-- /inventory:leansys_total_tight --> non_vacuous_and_tight`, `<!-- inventory:leansys_cabi -->21<!-- /inventory:leansys_cabi -->` C-ABI exports)
+- **Formal Systems Specifications & <!-- inventory:leansys_cabi -->21<!-- /inventory:leansys_cabi --> C-ABI Gates**: [`LeanSys/Spec.lean`](LeanSys/Spec.lean), [`LeanSys/Gate.lean`](LeanSys/Gate.lean), [`LeanSys/Contracts/MetaGate.lean`](LeanSys/Contracts/MetaGate.lean), [`LeanSys/Contracts/SpeculativeGate.lean`](LeanSys/Contracts/SpeculativeGate.lean) (`<!-- inventory:leansys_total_tight -->31<!-- /inventory:leansys_total_tight -->/<!-- inventory:leansys_total_tight -->31<!-- /inventory:leansys_total_tight --> non_vacuous_and_tight`, `<!-- inventory:leansys_cabi -->21<!-- /inventory:leansys_cabi -->` C-ABI exports)
 - **64-Bit Word-Strided Hash (`xxh64Slice`) & 3-Probe Bloom Filter**: [`LeanSys/Hash.lean`](LeanSys/Hash.lean) (`or_and_self`, `bloom_no_false_negative`)
 - **Zero-Copy JSON/JSONL Tape Indexer (`JsonTape`)**: [`LeanSys/Codec.lean`](LeanSys/Codec.lean)
 - **Leaf POSIX C Shim (`51 LOC`) & Typed FFI**: [`c/lean_sys_shim.c`](c/lean_sys_shim.c), [`LeanSys/Posix.lean`](LeanSys/Posix.lean)
