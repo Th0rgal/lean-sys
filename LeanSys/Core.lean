@@ -202,10 +202,13 @@ def runSelfTest : IO UInt32 := do
      !ShmRing.validateSeqlockSnapshot 1 1 8 8 3 2 64 1024 ||
      ShmRing.validateSeqlockSnapshot 1 1 7 7 3 2 64 1024 then
     IO.eprintln "[lean-sys-core] FAIL: ShmRing FIFO order or seqlock snapshot mismatch"; return 1
-  let statSample := ByteSlice.ofString "4242 (my (tricky) worker) S 1 4242 4242 0 -1 4194304"
+  let statSample := ByteSlice.ofString "4242 (my (tricky) worker) S 1 4242 4242 0 -1 4194304 10 0 0 0 5 2 0 0 20 0 1 0 987654321 123456"
   let some (commSl, fCount) := scanProcStatFields? statSample 5 | do IO.eprintln "[lean-sys-core] FAIL: scanProcStatFields?"; return 1
-  if commSl.toStringLossy != "my (tricky) worker" || fCount != 7 then
+  if commSl.toStringLossy != "my (tricky) worker" || fCount != 21 then
     IO.eprintln "[lean-sys-core] FAIL: scanProcStatFields? mismatch"; return 1
+  let some statRec := parseProcStatRecord? statSample | do IO.eprintln "[lean-sys-core] FAIL: parseProcStatRecord?"; return 1
+  if statRec.commSlice.toStringLossy != "my (tricky) worker" || statRec.stateByte != 83 || statRec.startTicks != 987654321 || statRec.fieldsAfterComm != 21 then
+    IO.eprintln "[lean-sys-core] FAIL: parseProcStatRecord? mismatch"; return 1
 
   -- 6. Process-Group Sandbox & Quota Enforcer (`LeanSys.Sandbox`)
   let quota : SandboxQuota := { maxRssBytes := 536870912, timeoutMs := 3000, maxPipeBytes := 4194304 }

@@ -22,7 +22,7 @@ echo "[3/5] Running lean-sys-core bench..."
 
 echo "[4/5] Auditing LeanSys/Spec.lean and LeanSys/Hash.lean via turbo-lean (0 vacuous, 0 trivial, 0 sorryAx)..."
 if command -v turbo-lean >/dev/null 2>&1; then
-  turbo-lean --json audit-spec LeanSys/Spec.lean | python3 -c "import json,sys; d=json.load(sys.stdin); assert d['ok'] and d['vacuous_specs']==0 and d['trivial_specs']==0 and d['tight_specs']>=23 and not d.get('horizontal_packing_warnings'), d; print(f'Spec.lean: {d[\"tight_specs\"]}/{d[\"total_specs_audited\"]} non_vacuous_and_tight')"
+  turbo-lean --json audit-spec LeanSys/Spec.lean | python3 -c "import json,sys; d=json.load(sys.stdin); assert d['ok'] and d['vacuous_specs']==0 and d['trivial_specs']==0 and d['tight_specs']>=24 and not d.get('horizontal_packing_warnings'), d; print(f'Spec.lean: {d[\"tight_specs\"]}/{d[\"total_specs_audited\"]} non_vacuous_and_tight')"
   turbo-lean --json audit-spec LeanSys/Hash.lean | python3 -c "import json,sys; d=json.load(sys.stdin); assert d['ok'] and d['vacuous_specs']==0 and d['trivial_specs']==0 and d['tight_specs']>=2, d; print(f'Hash.lean: {d[\"tight_specs\"]}/{d[\"total_specs_audited\"]} non_vacuous_and_tight')"
 fi
 
@@ -44,4 +44,4 @@ if grep -rn '^\s*sorry\b' LeanSys/ LeanSys.lean; then
   echo "ERROR: Forbidden 'sorry' found in LeanSys!" >&2
   exit 1
 fi
-echo "[lean-sys] ALL 5 CI GATES PASSED (25/25 tight specs, 17 C-ABI exports, c/lean_sys_shim.c=${SHIM_LOC} LOC, TCB_CLEAN)"
+echo "[lean-sys] ALL 5 CI GATES PASSED (26/26 tight specs, 17 C-ABI exports, c/lean_sys_shim.c=${SHIM_LOC} LOC, TCB_CLEAN)"

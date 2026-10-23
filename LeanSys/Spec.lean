@@ -714,4 +714,40 @@ theorem proc_stat_fields_rejects_malformed (p : ProcStatFieldsCheck)
       p.tailBounds.1 p.tailBounds.2.1 p.tailBounds.2.2 == 1) = false :=
   procStatFieldsMetaSpec.rejects_unsafe () p h_bad
 
+/-- Concrete `TotalSliceParserSpec` step extracting the post-`comm` tail slice `[closeOffset + 1, off + len)`
+    after the last `)` delimiter at relative offset `closeOffset`. -/
+def procStatTailStep (closeOffset : Nat) (b : SliceBounds) : Option (Nat × SliceBounds) :=
+  match advanceSlice b (closeOffset + 1) with
+  | some b' => some (closeOffset, b')
+  | none    => none
+
+/-- Layer II Bundle 20: `/proc/<pid>/stat` post-`comm` tail parser instantiating `TotalSliceParserSpec`. -/
+def procStatTailParserSpec (closeOffset : Nat) : TotalSliceParserSpec Nat where
+  parse := procStatTailStep closeOffset
+  bounds_preserved b _ b' h _ := by
+    unfold procStatTailStep at h
+    split at h <;> try contradiction
+    next b'' h_adv =>
+      cases h
+      exact advanceSlice_bounds_preserved b b' (closeOffset + 1) h_adv
+  strict_progress b _ b' h _ := by
+    unfold procStatTailStep at h
+    split at h <;> try contradiction
+    next b'' h_adv =>
+      cases h
+      unfold advanceSlice checkSliceBounds at h_adv
+      split at h_adv <;> try contradiction
+      next h_c =>
+        cases h_adv
+        simp only [Bool.and_eq_true, decide_eq_true_eq] at h_c ⊢
+        omega
+
+/-- Corollary 20: `procStatTailStep` strictly decreases remaining slice length while preserving `checkSliceBounds`. -/
+theorem proc_stat_tail_step_strict_progress (closeOffset : Nat) (b b' : SliceBounds)
+    (h_step : procStatTailStep closeOffset b = some (closeOffset, b'))
+    (h_bounds : checkSliceBounds b = true) (h_prog : b'.off > b.off) :
+    checkSliceBounds b' = true ∧ b'.len < b.len :=
+  ⟨((procStatTailParserSpec closeOffset).bounds_preserved b closeOffset b' h_step h_bounds).1,
+   (procStatTailParserSpec closeOffset).strict_progress b closeOffset b' h_step h_prog⟩
+
 end LeanSys.Spec

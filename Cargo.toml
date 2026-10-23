@@ -1,0 +1,10 @@
+[package]
+name = "lean-sys-cabi"
+version = "0.2.0"
+edition = "2021"
+rust-version = "1.80"
+description = "Zero-dependency typed Rust bindings and C-ABI archive builder for LeanSys/Spec.lean"
+authors = ["Thomas Marchand <thomas@thomas.md>"]
+license = "Apache-2.0"
+
+[dependencies]

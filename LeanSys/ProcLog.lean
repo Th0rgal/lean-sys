@@ -115,4 +115,84 @@ def scanProcStatFields? (line : ByteSlice) (minFieldsAfterComm : Nat := 3) : Opt
   let commSlice : ByteSlice := { ba := ba, off := oIdx + 1, len := cIdx - (oIdx + 1) }
   return some (commSlice, fields)
 
+/-- Zero-copy parsed `/proc/<pid>/stat` record extracted via `procStatTailStep` and gated by `verifyProcStatFields`. -/
+structure ProcStatRecord where
+  commSlice       : ByteSlice
+  stateByte       : UInt8
+  startTicks      : UInt64
+  fieldsAfterComm : Nat
+
+/-- Parse an unsigned `UInt64` from ASCII digits in `s : ByteSlice`. -/
+def parseSliceUInt64? (s : ByteSlice) : Option UInt64 := Id.run do
+  let ba := s.ba
+  let stop := Nat.min (s.off + s.len) ba.size
+  if s.off ≥ stop then return none
+  let mut acc : UInt64 := 0
+  for i in [s.off : stop] do
+    let b := byteAt ba i
+    if b < 48 || b > 57 then return none
+    acc := acc * 10 + (b - 48).toUInt64
+  return some acc
+
+/-- Verified Slice-IO parser for `/proc/<pid>/stat` lines:
+    1. Locates the first `'('` and the last `')'` of `(comm)` (handling spaces and nested parentheses).
+    2. Advances into the post-`comm` tail via `procStatTailStep` (`TotalSliceParserSpec`).
+    3. Tokenizes whitespace-separated fields past `')'` and extracts `state` (field 3, index 0 after `comm`)
+       and `starttime` (field 22, index 19 after `comm`).
+    4. Gates the extraction via `leansys_verify_proc_stat_fields` (`minFieldsAfterComm >= 20`). -/
+def parseProcStatRecord? (line : ByteSlice) : Option ProcStatRecord := Id.run do
+  let ba := line.ba
+  let start := line.off
+  let stop := Nat.min (line.off + line.len) ba.size
+  let totalNat := stop - start
+  let mut openIdx : Option Nat := none
+  let mut closeIdx : Option Nat := none
+  for i in [start:stop] do
+    let b := byteAt ba i
+    if b == 40 && openIdx.isNone then openIdx := some i
+    if b == 41 then closeIdx := some i
+  let some oIdx := openIdx | return none
+  let some cIdx := closeIdx | return none
+  let relOpen := oIdx - start
+  let relClose := cIdx - start
+  let initBounds : SliceBounds := { off := start, len := totalNat, cap := ba.size }
+  let some (_, tailBounds) := procStatTailStep relClose initBounds | return none
+  let mut fields : Nat := 0
+  let mut inTok := false
+  let mut tokStart : Nat := tailBounds.off
+  let mut stateByte? : Option UInt8 := none
+  let mut startTicksSlice? : Option ByteSlice := none
+  let tailStop := tailBounds.off + tailBounds.len
+  for j in [tailBounds.off : tailStop] do
+    let b := byteAt ba j
+    let isWs := b == 32 || b == 9 || b == 10 || b == 13
+    if isWs then
+      if inTok then
+        if fields == 1 then
+          stateByte? := some (byteAt ba tokStart)
+        else if fields == 20 then
+          startTicksSlice? := some { ba := ba, off := tokStart, len := j - tokStart }
+        inTok := false
+    else if !inTok then
+      inTok := true
+      tokStart := j
+      fields := fields + 1
+  if inTok then
+    if fields == 1 then
+      stateByte? := some (byteAt ba tokStart)
+    else if fields == 20 then
+      startTicksSlice? := some { ba := ba, off := tokStart, len := tailStop - tokStart }
+  if verifyProcStatFields relOpen.toUInt64 relClose.toUInt64 totalNat.toUInt64 20 fields.toUInt64 != 1 then
+    return none
+  let some stByte := stateByte? | return none
+  let some ticksSlice := startTicksSlice? | return none
+  let some ticks := parseSliceUInt64? ticksSlice | return none
+  let commSlice : ByteSlice := { ba := ba, off := oIdx + 1, len := cIdx - (oIdx + 1) }
+  return some {
+    commSlice := commSlice,
+    stateByte := stByte,
+    startTicks := ticks,
+    fieldsAfterComm := fields
+  }
+
 end LeanSys.ProcLog
