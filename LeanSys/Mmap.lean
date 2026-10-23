@@ -94,31 +94,32 @@ def pop? (r : ShmRing) : IO (SysResult (Option ByteArray)) := do
     match ← readImage r with
     | .error e => pure (.error e)
     | .ok (_, cap, head, tail, buf) =>
-      if head == tail then
-        pure (.ok none)
-      else if verifyRingCursor head tail cap.toUInt64 0 != 1 then
-        pure (.error .einval)
+      if head == tail then pure (.ok none)
+      else if verifyRingCursor head tail cap.toUInt64 0 != 1 then pure (.error .einval)
       else
         let unreadLen := (head - tail).toNat
-        if unreadLen < 4 || 24 + unreadLen > buf.size then
-          pure (.error .eio)
+        if unreadLen < 4 || 24 + unreadLen > buf.size then pure (.error .eio)
         else
           let msgLen := (readUInt32LE buf 24).toNat
           let frameLen := 4 + msgLen
-          if frameLen > unreadLen then
-            pure (.error .eio)
+          if frameLen > unreadLen then pure (.error .eio)
           else
             let newTail := tail + frameLen.toUInt64
-            if verifyRingCursor head newTail cap.toUInt64 frameLen.toUInt64 != 1 then
-              pure (.error .einval)
+            if verifyRingCursor head newTail cap.toUInt64 frameLen.toUInt64 != 1 then pure (.error .einval)
             else
               let payload := buf.extract 28 (28 + msgLen)
               let remSlice := buf.extract (24 + frameLen) (24 + unreadLen)
-              let mut out := encodeHeader cap head newTail
-              out := out ++ remSlice
+              let out := encodeHeader cap head newTail ++ remSlice
               match ← withFd r.path 4 (fun fd => writeAll fd out false) with
               | .error e => pure (.error e)
               | .ok _ => pure (.ok (some payload))
+
+/-- Validate a shared-memory seqlock snapshot read across process restarts via `leansys_verify_mmap_seqlock`. -/
+@[inline]
+def validateSeqlockSnapshot (schemaVersion expectedVersion : UInt32)
+    (seqBefore seqAfter writerEpoch minEpoch payloadLen ringCap : UInt64) : Bool :=
+  verifyMmapSeqlock mmapSeqlockMagic schemaVersion expectedVersion
+    seqBefore seqAfter writerEpoch minEpoch payloadLen ringCap == 1
 
 end ShmRing
 

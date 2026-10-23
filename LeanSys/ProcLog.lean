@@ -39,45 +39,26 @@ def cutAtLastNewline (ba : ByteArray) (len : Nat) : Nat := Id.run do
       return i + 1
   return len
 
-/--
-  Trim any incomplete trailing multi-byte UTF-8 sequence at the end of `ba[0..len)`
-  when the log file is still growing (`!reachedEof || !terminal`).
--/
+/-- Trim any incomplete trailing multi-byte UTF-8 sequence at the end of `ba[0..len)`. -/
 def trimIncompleteUtf8Suffix (ba : ByteArray) (len : Nat) : Nat := Id.run do
   if len == 0 then return 0
-  -- Inspect up to the last 3 bytes for a leading UTF-8 multi-byte marker whose continuation bytes are incomplete
   let mut back : Nat := 1
   while back ≤ 3 && back ≤ len do
     let idx := len - back
     let b := byteAt ba idx
-    if (b &&& 0x80) == 0 then
-      -- ASCII byte: complete
-      return len
-    else if (b &&& 0xC0) == 0x80 then
-      -- Continuation byte `10xxxxxx`: keep scanning backwards
-      back := back + 1
+    if (b &&& 0x80) == 0 then return len
+    else if (b &&& 0xC0) == 0x80 then back := back + 1
     else
-      -- Leading byte of a 2-, 3-, or 4-byte sequence
-      let needed : Nat :=
-        if (b &&& 0xE0) == 0xC0 then 2
-        else if (b &&& 0xF0) == 0xE0 then 3
-        else 4
-      if back < needed then
-        return idx
-      else
-        return len
+      let needed : Nat := if (b &&& 0xE0) == 0xC0 then 2 else if (b &&& 0xF0) == 0xE0 then 3 else 4
+      return if back < needed then idx else len
   return len
 
-/--
-  Read a bounded log chunk from `logPath` starting at `offset` (up to `maxBytes ≤ 256 KiB`).
-  Cuts back to the last newline if more bytes remain in the file, trims incomplete UTF-8 tails,
-  and verifies the window via `leansys_verify_log_window`.
--/
+/-- Read a bounded log chunk from `logPath` starting at `offset` (up to `maxBytes ≤ 256 KiB`),
+    gated by `leansys_verify_log_window`. -/
 def readLogChunk (logPath : String) (offset : UInt64) (maxBytes : Nat := 65536) (terminal : Bool := false)
     : IO (SysResult LogChunk) := do
   let cappedMax := Nat.min (Nat.max maxBytes 4) maxLogChunkBytes
   withFd logPath 0 fun fd => do
-    -- Read up to `cappedMax + 1` bytes so we know whether we reached EOF without an extra `fstat` syscall
     let raw ← preadByteArray fd offset (cappedMax + 1)
     let reachedEof := raw.size ≤ cappedMax
     let rawLen := Nat.min raw.size cappedMax
@@ -90,9 +71,7 @@ def readLogChunk (logPath : String) (offset : UInt64) (maxBytes : Nat := 65536) 
       return .error .einval
     let slice : ByteSlice := { ba := raw, off := 0, len := validLen }
     return .ok {
-      data := slice.toStringLossy
-      startOff := startOff
-      nextOff := nextOff
+      data := slice.toStringLossy, startOff := startOff, nextOff := nextOff,
       reachedEof := reachedEof && validLen == raw.size
     }
 
@@ -107,5 +86,33 @@ def readLogTail (logPath : String) (maxTailBytes : Nat := defaultLogTailBytes) :
       return .error .einval
     let slice : ByteSlice := { ba := raw, off := start, len := len }
     return .ok slice.toStringLossy
+
+/-- Stateless Sans-IO scanner for `/proc/<pid>/stat` lines past the last `')'` of `(comm)`,
+    gated by `leansys_verify_proc_stat_fields`. Returns `(commSlice, fieldsAfterComm)`. -/
+def scanProcStatFields? (line : ByteSlice) (minFieldsAfterComm : Nat := 3) : Option (ByteSlice × Nat) := Id.run do
+  let ba := line.ba
+  let start := line.off
+  let stop := Nat.min (line.off + line.len) ba.size
+  let mut openIdx : Option Nat := none
+  let mut closeIdx : Option Nat := none
+  for i in [start:stop] do
+    let b := byteAt ba i
+    if b == 40 && openIdx.isNone then openIdx := some i
+    if b == 41 then closeIdx := some i
+  let some oIdx := openIdx | return none
+  let some cIdx := closeIdx | return none
+  let mut fields : Nat := 0
+  let mut inTok := false
+  for j in [cIdx + 1 : stop] do
+    let b := byteAt ba j
+    if b == 32 || b == 9 || b == 10 || b == 13 then inTok := false
+    else if !inTok then inTok := true; fields := fields + 1
+  let relOpen := (oIdx - start).toUInt64
+  let relClose := (cIdx - start).toUInt64
+  let totalLen := (stop - start).toUInt64
+  if verifyProcStatFields relOpen relClose totalLen minFieldsAfterComm.toUInt64 fields.toUInt64 != 1 then
+    return none
+  let commSlice : ByteSlice := { ba := ba, off := oIdx + 1, len := cIdx - (oIdx + 1) }
+  return some (commSlice, fields)
 
 end LeanSys.ProcLog

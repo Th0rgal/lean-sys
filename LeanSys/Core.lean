@@ -80,7 +80,14 @@ def runSelfTest : IO UInt32 := do
                      verifyGateAdmit 0 1 1 == 0 &&
                      verifyGateAdmit 1 0 1 == 0 &&
                      verifyGateAdmit 1 1 0 == 0
-  if !(sbOk && wfOk && casGateOk && httpGateOk && tapeGateOk && ringGateOk && sstGateOk && pollGateOk && rlimGateOk && mixGateOk && ckGateOk && tokGateOk && logGateOk && rpcGateOk && admitGateOk) then
+  let seqlockGateOk := verifyMmapSeqlock mmapSeqlockMagic 1 1 4 4 10 10 128 1024 == 1 &&
+                       verifyMmapSeqlock mmapSeqlockMagic 1 1 4 6 10 10 128 1024 == 0 &&
+                       verifyMmapSeqlock mmapSeqlockMagic 1 1 5 5 10 10 128 1024 == 0 &&
+                       verifyMmapSeqlock mmapSeqlockMagic 1 1 4 4 8 10 128 1024 == 0
+  let procStatGateOk := verifyProcStatFields 5 18 64 5 12 == 1 &&
+                        verifyProcStatFields 18 5 64 5 12 == 0 &&
+                        verifyProcStatFields 5 18 64 15 12 == 0
+  if !(sbOk && wfOk && casGateOk && httpGateOk && tapeGateOk && ringGateOk && sstGateOk && pollGateOk && rlimGateOk && mixGateOk && ckGateOk && tokGateOk && logGateOk && rpcGateOk && admitGateOk && seqlockGateOk && procStatGateOk) then
     IO.eprintln "[lean-sys-core] FAIL: C-ABI Spec gates check failed"
     return 1
 
@@ -102,10 +109,8 @@ def runSelfTest : IO UInt32 := do
     IO.FS.removeDirAll pTest
   IO.FS.createDirAll pTest
 
-  let .ok st0 ← openStore testDir
-    | do IO.eprintln "[lean-sys-core] FAIL: openStore initial"; return 1
-  let .ok st1 ← putString st0 "alpha" "value-alpha-1" true
-    | do IO.eprintln "[lean-sys-core] FAIL: put alpha"; return 1
+  let .ok st0 ← openStore testDir | do IO.eprintln "[lean-sys-core] FAIL: openStore initial"; return 1
+  let .ok st1 ← putString st0 "alpha" "value-alpha-1" true | do IO.eprintln "[lean-sys-core] FAIL: put alpha"; return 1
   let .ok st2 ← putBatch st1 #[("beta", ByteSlice.ofString "value-beta-2"), ("gamma", ByteSlice.ofString "value-gamma-3")] true
     | do IO.eprintln "[lean-sys-core] FAIL: putBatch"; return 1
 
@@ -114,32 +119,25 @@ def runSelfTest : IO UInt32 := do
   let _ ← withFd st2.walPath 2 (fun fd => writeAll fd tornBytes true)
 
   -- Re-open Store and verify torn frame was truncated and committed keys are intact
-  let .ok stRecovered ← openStore testDir
-    | do IO.eprintln "[lean-sys-core] FAIL: openStore recovery"; return 1
+  let .ok stRecovered ← openStore testDir | do IO.eprintln "[lean-sys-core] FAIL: openStore recovery"; return 1
   if !stRecovered.tornCleaned ||
      getString? stRecovered "alpha" != some "value-alpha-1" ||
      getString? stRecovered "beta" != some "value-beta-2" ||
      getString? stRecovered "gamma" != some "value-gamma-3" then
-    IO.eprintln "[lean-sys-core] FAIL: WAL torn-tail recovery mismatch"
-    return 1
+    IO.eprintln "[lean-sys-core] FAIL: WAL torn-tail recovery mismatch"; return 1
 
-  let .ok stCompacted ← compact stRecovered
-    | do IO.eprintln "[lean-sys-core] FAIL: Store.compact"; return 1
+  let .ok stCompacted ← compact stRecovered | do IO.eprintln "[lean-sys-core] FAIL: Store.compact"; return 1
   if getString? stCompacted "gamma" != some "value-gamma-3" || stCompacted.framesCount != 3 then
-    IO.eprintln "[lean-sys-core] FAIL: Store.compact state mismatch"
-    return 1
+    IO.eprintln "[lean-sys-core] FAIL: Store.compact state mismatch"; return 1
 
   -- CAS put & hardlink materialize
   let blobPayload := ByteSlice.ofString "(lnir_module verified_cas_object_v1)"
-  let .ok casKey ← casPut stCompacted blobPayload
-    | do IO.eprintln "[lean-sys-core] FAIL: Store.casPut"; return 1
+  let .ok casKey ← casPut stCompacted blobPayload | do IO.eprintln "[lean-sys-core] FAIL: Store.casPut"; return 1
   let matPath := s!"{testDir}/materialized_blob.lnir"
-  let .ok () ← casMaterialize stCompacted casKey matPath
-    | do IO.eprintln "[lean-sys-core] FAIL: Store.casMaterialize"; return 1
+  let .ok () ← casMaterialize stCompacted casKey matPath | do IO.eprintln "[lean-sys-core] FAIL: Store.casMaterialize"; return 1
   let matRead ← IO.FS.readFile matPath
   if matRead != "(lnir_module verified_cas_object_v1)" then
-    IO.eprintln "[lean-sys-core] FAIL: CAS materialized content mismatch"
-    return 1
+    IO.eprintln "[lean-sys-core] FAIL: CAS materialized content mismatch"; return 1
 
   -- 4. LSM Sorted-String Table (`SstTable`) & 64-Bit Bloom Filter
   let sstPath := s!"{testDir}/state.sst"
@@ -188,32 +186,26 @@ def runSelfTest : IO UInt32 := do
     return 1
 
   let rpcSample := ByteSlice.ofString "{\"jsonrpc\":\"2.0\",\"id\":7,\"method\":\"tools/list\",\"params\":{\"cursor\":null}}"
-  match parseRequest? rpcSample with
-  | none =>
-    IO.eprintln "[lean-sys-core] FAIL: JsonRpc.parseRequest? failed"
-    return 1
-  | some rpcReq =>
-    if rpcReq.method != "tools/list" || rpcReq.idRaw? != some "7" then
-      IO.eprintln "[lean-sys-core] FAIL: JsonRpc field mismatch"
-      return 1
+  let some rpcReq := parseRequest? rpcSample | do IO.eprintln "[lean-sys-core] FAIL: JsonRpc.parseRequest? failed"; return 1
+  if rpcReq.method != "tools/list" || rpcReq.idRaw? != some "7" then
+    IO.eprintln "[lean-sys-core] FAIL: JsonRpc field mismatch"; return 1
 
-  -- 5. Shared-Memory SPSC Ring Buffer (`ShmRing`)
+  -- 5. Shared-Memory SPSC Ring Buffer (`ShmRing`) & Seqlock / `/proc/<pid>/stat`
   let ringPath := s!"{testDir}/ipc.ring"
-  let .ok ring ← ShmRing.init ringPath 1024
-    | do IO.eprintln "[lean-sys-core] FAIL: ShmRing.init"; return 1
-  let .ok () ← ShmRing.push ring (ByteSlice.ofString "ring-msg-1")
-    | do IO.eprintln "[lean-sys-core] FAIL: ShmRing.push 1"; return 1
-  let .ok () ← ShmRing.push ring (ByteSlice.ofString "ring-msg-2")
-    | do IO.eprintln "[lean-sys-core] FAIL: ShmRing.push 2"; return 1
-  let .ok (some pop1) ← ShmRing.pop? ring
-    | do IO.eprintln "[lean-sys-core] FAIL: ShmRing.pop 1"; return 1
-  let .ok (some pop2) ← ShmRing.pop? ring
-    | do IO.eprintln "[lean-sys-core] FAIL: ShmRing.pop 2"; return 1
-  let .ok none ← ShmRing.pop? ring
-    | do IO.eprintln "[lean-sys-core] FAIL: ShmRing.pop empty"; return 1
-  if String.fromUTF8! pop1 != "ring-msg-1" || String.fromUTF8! pop2 != "ring-msg-2" then
-    IO.eprintln "[lean-sys-core] FAIL: ShmRing FIFO order mismatch"
-    return 1
+  let .ok ring ← ShmRing.init ringPath 1024 | do IO.eprintln "[lean-sys-core] FAIL: ShmRing.init"; return 1
+  let .ok () ← ShmRing.push ring (ByteSlice.ofString "ring-msg-1") | do IO.eprintln "[lean-sys-core] FAIL: ShmRing.push 1"; return 1
+  let .ok () ← ShmRing.push ring (ByteSlice.ofString "ring-msg-2") | do IO.eprintln "[lean-sys-core] FAIL: ShmRing.push 2"; return 1
+  let .ok (some pop1) ← ShmRing.pop? ring | do IO.eprintln "[lean-sys-core] FAIL: ShmRing.pop 1"; return 1
+  let .ok (some pop2) ← ShmRing.pop? ring | do IO.eprintln "[lean-sys-core] FAIL: ShmRing.pop 2"; return 1
+  let .ok none ← ShmRing.pop? ring | do IO.eprintln "[lean-sys-core] FAIL: ShmRing.pop empty"; return 1
+  if String.fromUTF8! pop1 != "ring-msg-1" || String.fromUTF8! pop2 != "ring-msg-2" ||
+     !ShmRing.validateSeqlockSnapshot 1 1 8 8 3 2 64 1024 ||
+     ShmRing.validateSeqlockSnapshot 1 1 7 7 3 2 64 1024 then
+    IO.eprintln "[lean-sys-core] FAIL: ShmRing FIFO order or seqlock snapshot mismatch"; return 1
+  let statSample := ByteSlice.ofString "4242 (my (tricky) worker) S 1 4242 4242 0 -1 4194304"
+  let some (commSl, fCount) := scanProcStatFields? statSample 5 | do IO.eprintln "[lean-sys-core] FAIL: scanProcStatFields?"; return 1
+  if commSl.toStringLossy != "my (tricky) worker" || fCount != 7 then
+    IO.eprintln "[lean-sys-core] FAIL: scanProcStatFields? mismatch"; return 1
 
   -- 6. Process-Group Sandbox & Quota Enforcer (`LeanSys.Sandbox`)
   let quota : SandboxQuota := { maxRssBytes := 536870912, timeoutMs := 3000, maxPipeBytes := 4194304 }
@@ -249,7 +241,7 @@ def runSelfTest : IO UInt32 := do
       IO.eprintln s!"[lean-sys-core] FAIL: unexpected HTTP response: {respBody}"
       return 1
 
-  IO.println s!"\{ \"ok\": true, \"binary\": \"lean-sys-core\", \"c_abi_gates\": 15, \"wal_torn_recovery\": true, \"cas_hardlink\": true, \"sst_bloom\": true, \"table_range_scan\": true, \"auth_rotation\": true, \"proc_log\": true, \"jsonrpc_2_0\": true, \"shm_ring\": true, \"jsonl_tape\": true, \"reactor_keepalive\": true, \"sandbox_rlimit\": true, \"pgid_reaper\": true, \"http_loopback_port\": {boundPort} }"
+  IO.println s!"\{ \"ok\": true, \"binary\": \"lean-sys-core\", \"c_abi_gates\": 17, \"wal_torn_recovery\": true, \"cas_hardlink\": true, \"sst_bloom\": true, \"table_range_scan\": true, \"auth_rotation\": true, \"proc_log\": true, \"proc_stat_scanner\": true, \"jsonrpc_2_0\": true, \"shm_ring\": true, \"mmap_seqlock\": true, \"jsonl_tape\": true, \"reactor_keepalive\": true, \"sandbox_rlimit\": true, \"pgid_reaper\": true, \"http_loopback_port\": {boundPort} }"
   return 0
 
 /-- Run deterministic micro-benchmarks for `autoresearch/sys_arena.py` and emit JSON metrics. -/
@@ -316,7 +308,7 @@ def main (args : List String) : IO UInt32 := do
   | ["bench"] | ["--bench"] => LeanSys.Core.runBench 4000
   | ["bench", nStr] | ["--bench", nStr] => LeanSys.Core.runBench (nStr.toNat?.getD 4000)
   | ["--c-abi"] =>
-    IO.println "{\"ok\":true,\"exports\":[\"leansys_verify_slice_bounds\",\"leansys_verify_wal_frame\",\"leansys_verify_cas_digest\",\"leansys_check_http_bounds\",\"leansys_verify_jsonl_tape\",\"leansys_verify_ring_cursor\",\"leansys_verify_sst_block\",\"leansys_verify_poll_interest\",\"leansys_verify_rlimit_budget\",\"leansys_mix64_word\",\"leansys_verify_composite_key_order\",\"leansys_verify_token_auth\",\"leansys_verify_log_window\",\"leansys_verify_jsonrpc_frame\",\"leansys_gate_admit\"]}"
+    IO.println "{\"ok\":true,\"exports\":[\"leansys_verify_slice_bounds\",\"leansys_verify_wal_frame\",\"leansys_verify_cas_digest\",\"leansys_check_http_bounds\",\"leansys_verify_jsonl_tape\",\"leansys_verify_ring_cursor\",\"leansys_verify_sst_block\",\"leansys_verify_poll_interest\",\"leansys_verify_rlimit_budget\",\"leansys_mix64_word\",\"leansys_verify_composite_key_order\",\"leansys_verify_token_auth\",\"leansys_verify_log_window\",\"leansys_verify_jsonrpc_frame\",\"leansys_gate_admit\",\"leansys_verify_mmap_seqlock\",\"leansys_verify_proc_stat_fields\"]}"
     return 0
   | _ =>
     IO.println "usage: lean-sys-core [self-test | bench | --c-abi]"

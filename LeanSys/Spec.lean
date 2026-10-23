@@ -2,28 +2,14 @@
   LeanSys.Spec: Verified Systems Specification & Unboxed C-ABI Kernel (`0 import Lean`, `0 sorryAx`)
   - Layer I: Universal Systems Meta-Specifications (`MetaGateSpec`, `TotalSliceParserSpec`,
     `FramedCodecSpec`, `CrashAtomicLogSpec`, `ProtocolRefinementSpec`)
-  - Layer II: Declarative Systems Corollaries (≤ 3 lines each)
-  - Direct Unboxed C-ABI (`@[inline, export]`):
-    `leansys_verify_wal_frame`, `leansys_verify_slice_bounds`,
-    `leansys_verify_cas_digest`, `leansys_check_http_bounds`,
-    `leansys_verify_jsonl_tape`, `leansys_verify_ring_cursor`,
-    `leansys_verify_sst_block`, `leansys_verify_poll_interest`,
-    `leansys_verify_rlimit_budget`, `leansys_mix64_word`,
-    `leansys_verify_table_range`, `leansys_verify_token_auth`,
-    `leansys_verify_log_window`, `leansys_verify_jsonrpc_frame`,
-    `leansys_gate_admit`
+  - Layer II: Declarative Systems Corollaries (≤ 3 lines each) & 17 Unboxed C-ABI Gates (`@[inline, export]`)
 -/
 
 namespace LeanSys.Spec
 
 /-! ## Layer I: Universal Systems Meta-Specifications & Combinators -/
 
-/--
-  Universal stateful & stateless decision gate specification (`MetaGateSpec`):
-  Certifies that when `gate s x = true`:
-  1. `inv s → inv (step s x)` (State invariant preservation across trace steps)
-  2. `safe s x = true` (Output / syscall safety guarantee)
--/
+/-- Universal stateful & stateless decision gate specification (`MetaGateSpec`). -/
 structure MetaGateSpec (σ α : Type) where
   inv : σ → Prop
   gate : σ → α → Bool
@@ -79,11 +65,7 @@ def verifySliceBounds (off len cap : UInt64) : UInt8 :=
 def checkSliceBounds (b : SliceBounds) : Bool :=
   decide (b.off + b.len ≤ b.cap)
 
-/--
-  Universal `TotalSliceParserSpec`:
-  Any parser over a borrowed `ByteArray` slice must be total, terminate with `rest.len ≤ input.len`,
-  and strictly decrease remaining length on productive steps (`consumed > 0`).
--/
+/-- Universal `TotalSliceParserSpec`: total parser over a borrowed `ByteArray` slice. -/
 structure TotalSliceParserSpec (α : Type) where
   parse : SliceBounds → Option (α × SliceBounds)
   bounds_preserved : ∀ b v b', parse b = some (v, b') →
@@ -113,11 +95,7 @@ theorem advanceSlice_bounds_preserved (b b' : SliceBounds) (k : Nat)
     omega
   · contradiction
 
-/--
-  Universal `FramedCodecSpec`:
-  Length + 64-bit FNV-1a / CRC64 frame codec with deterministic roundtrip
-  and torn-write / bit-flip rejection.
--/
+/-- Universal `FramedCodecSpec`: length + 64-bit checksum frame codec with deterministic roundtrip. -/
 structure FramedCodecSpec (Frame Payload : Type) where
   encode : Payload → Frame
   decode : Frame → Option Payload
@@ -125,10 +103,7 @@ structure FramedCodecSpec (Frame Payload : Type) where
   roundtrip : ∀ p, decode (encode p) = some p
   sound_valid : ∀ f p, decode f = some p → validFrame f = true
 
-/--
-  16-byte WAL Frame Header (`magic : UInt32`, `payloadLen : UInt32`, `expectedHash : UInt64`)
-  paired with actual `actualBytes : UInt64` and `computedHash : UInt64`.
--/
+/-- 16-byte WAL Frame Header paired with `actualBytes` and `computedHash`. -/
 structure WalFrameCheck where
   magic : UInt32
   payloadLen : UInt32
@@ -143,11 +118,7 @@ structure WalFrameCheck where
 /-- Maximum single WAL frame payload size (16 MiB). -/
 @[inline] def walMaxPayload : UInt32 := 16777216
 
-/--
-  Unboxed C-ABI WAL frame verifier (`leansys_verify_wal_frame`):
-  Verifies magic == `0x4C535953`, bounded non-empty payload length, exact byte count match
-  (rejecting torn writes), and 64-bit FNV-1a checksum equality.
--/
+/-- Unboxed C-ABI WAL frame verifier (`leansys_verify_wal_frame`). -/
 @[inline, export leansys_verify_wal_frame]
 def verifyWalFrame (magic : UInt32) (payloadLen : UInt32) (actualBytes : UInt64)
     (expectedHash : UInt64) (computedHash : UInt64) : UInt8 :=
@@ -159,13 +130,7 @@ def verifyWalFrame (magic : UInt32) (payloadLen : UInt32) (actualBytes : UInt64)
 def isWalFrameValid (f : WalFrameCheck) : Bool :=
   verifyWalFrame f.magic f.payloadLen f.actualBytes f.expectedHash f.computedHash == 1
 
-/--
-  Universal `CrashAtomicLogSpec`:
-  Models an append-only WAL where any torn tail frame (whose `actualBytes ≠ payloadLen` or
-  checksum mismatches) is deterministically truncated during recovery, yielding the exact
-  prefix of committed records; atomic compaction (`write tmp` + `fsync` + `rename`) preserves
-  the KV state map.
--/
+/-- Universal `CrashAtomicLogSpec`: append-only WAL with torn-tail truncation recovery. -/
 structure CrashAtomicLogSpec (Entry State : Type) where
   validEntry : Entry → Bool
   applyEntry : State → Entry → State
@@ -198,30 +163,18 @@ theorem replayWalEntries_torn_tail (valid : α → Bool) (step : σ → α → �
     · exact ih (step init x)
     · rfl
 
-/--
-  Unboxed C-ABI CAS digest & path-safety gate (`leansys_verify_cas_digest`):
-  Verifies that a CAS object's computed 64-bit digest equals the requested digest,
-  the digest is non-zero, and the key contains zero path-traversal characters (`hasPathSep == 0`).
--/
+/-- Unboxed C-ABI CAS digest & path-safety gate (`leansys_verify_cas_digest`). -/
 @[inline, export leansys_verify_cas_digest]
 def verifyCasDigest (expectedDigest computedDigest : UInt64) (hasPathSep : UInt8) : UInt8 :=
   if expectedDigest != 0 && expectedDigest == computedDigest && hasPathSep == 0 then 1 else 0
 
-/--
-  Unboxed C-ABI HTTP/1.1 request envelope gate (`leansys_check_http_bounds`):
-  Verifies that header count `≤ 32`, body length `≤ 4 MiB` (`4194304`),
-  received body bytes match `Content-Length`, and bearer auth check passes (`authOk == 1`).
--/
+/-- Unboxed C-ABI HTTP/1.1 request envelope gate (`leansys_check_http_bounds`). -/
 @[inline, export leansys_check_http_bounds]
 def checkHttpBounds (numHeaders : UInt32) (contentLen : UInt64) (actualBodyLen : UInt64)
     (authOk : UInt8) : UInt8 :=
   if numHeaders ≤ 32 && contentLen ≤ 4194304 && actualBodyLen == contentLen && authOk == 1 then 1 else 0
 
-/--
-  Universal `ProtocolRefinementSpec`:
-  Certifies that concrete wire frames accepted by the protocol gate refine an abstract
-  typed request/response transition system without buffer over-read or unauthenticated mutation.
--/
+/-- Universal `ProtocolRefinementSpec`: wire frames accepted by the gate refine typed transitions. -/
 structure ProtocolRefinementSpec (WireMsg AbsMsg : Type) where
   wireGate : WireMsg → Bool
   decodeAbs : WireMsg → Option AbsMsg
@@ -354,11 +307,7 @@ theorem cas_gate_rejects_tampered_or_traversal (c : CasCheck)
 
 /-! ## Layer I & II Extensions: Ecosystem Parity Systems Gates -/
 
-/--
-  Unboxed C-ABI JSONL / Binary Tape Span Verifier (`leansys_verify_jsonl_tape`):
-  Certifies that key and value spans `[keyOff, keyOff + keyLen)` and `[valOff, valOff + valLen)`
-  lie strictly inside `[0, bufCap]`, `keyOff + keyLen ≤ valOff`, and `depth ≤ 64`.
--/
+/-- Unboxed C-ABI JSONL / Binary Tape Span Verifier (`leansys_verify_jsonl_tape`). -/
 @[inline, export leansys_verify_jsonl_tape]
 def verifyJsonlTape (keyOff keyLen valOff valLen bufCap : UInt64) (depth : UInt32) : UInt8 :=
   if keyOff ≤ bufCap && keyLen ≤ bufCap - keyOff &&
@@ -396,11 +345,7 @@ theorem jsonl_tape_rejects_invalid_span (t : JsonlTapeCheck)
     (verifyJsonlTape t.keyOff t.keyLen t.valOff t.valLen t.bufCap t.depth == 1) = false :=
   jsonlTapeMetaSpec.rejects_unsafe () t h_bad
 
-/--
-  Unboxed C-ABI SPSC Shared-Memory Ring Buffer Cursor Gate (`leansys_verify_ring_cursor`):
-  Verifies that `cap > 0`, `tail ≤ head`, `head - tail ≤ cap` (unconsumed occupancy invariant),
-  and `msgLen ≤ cap - (head - tail)` (sufficient free space without overwrite).
--/
+/-- Unboxed C-ABI SPSC Shared-Memory Ring Buffer Cursor Gate (`leansys_verify_ring_cursor`). -/
 @[inline, export leansys_verify_ring_cursor]
 def verifyRingCursor (head tail cap msgLen : UInt64) : UInt8 :=
   if cap > 0 && tail ≤ head && head - tail ≤ cap && msgLen ≤ cap - (head - tail) then 1 else 0
@@ -424,18 +369,15 @@ def ringCursorMetaSpec : MetaGateSpec Unit RingCursorCheck where
 
 /-- Corollary 8: `verifyRingCursor` rejects any ring write that would overflow capacity or wrap unread tail data. -/
 theorem ring_cursor_rejects_overflow (r : RingCursorCheck)
-    (h_bad : (r.cap > 0 && r.tail ≤ r.head && r.head - r.tail ≤ r.cap && r.msgLen ≤ r.cap - (r.head - r.tail)) = false) :
+    (h_bad : (r.cap > 0 && r.tail ≤ r.head &&
+      r.head - r.tail ≤ r.cap && r.msgLen ≤ r.cap - (r.head - r.tail)) = false) :
     (verifyRingCursor r.head r.tail r.cap r.msgLen == 1) = false :=
   ringCursorMetaSpec.rejects_unsafe () r h_bad
 
 /-- Canonical SST Footer Magic `0x4C535354` (`"LSST"`). -/
 @[inline] def sstMagic : UInt32 := 0x4C535354
 
-/--
-  Unboxed C-ABI Sorted-String Table (SST) & Bloom Index Verifier (`leansys_verify_sst_block`):
-  Certifies `magic == 0x4C535354`, `indexOff ≤ fileSize`, `footerOff ≤ fileSize`,
-  `indexOff ≤ footerOff`, and `bloomMask != 0 || numEntries == 0`.
--/
+/-- Unboxed C-ABI Sorted-String Table (SST) & Bloom Index Verifier (`leansys_verify_sst_block`). -/
 @[inline, export leansys_verify_sst_block]
 def verifySstBlock (magic numEntries : UInt32) (indexOff footerOff fileSize bloomMask : UInt64) : UInt8 :=
   if magic == sstMagic && indexOff ≤ footerOff && footerOff ≤ fileSize &&
@@ -470,11 +412,7 @@ theorem sst_block_rejects_corrupt_index (s : SstBlockCheck)
     (verifySstBlock s.magic s.numEntries s.indexOff s.footerOff s.fileSize s.bloomMask == 1) = false :=
   sstBlockMetaSpec.rejects_unsafe () s h_bad
 
-/--
-  Unboxed C-ABI Non-Blocking Poll Reactor & Keep-Alive Gate (`leansys_verify_poll_interest`):
-  Certifies `activeConns ≤ maxConns`, `maxConns ≤ 1024`, `keepAliveReqs < maxKeepAlive`,
-  and `idleMs ≤ maxIdleMs`.
--/
+/-- Unboxed C-ABI Non-Blocking Poll Reactor & Keep-Alive Gate (`leansys_verify_poll_interest`). -/
 @[inline, export leansys_verify_poll_interest]
 def verifyPollInterest (activeConns maxConns keepAliveReqs maxKeepAlive idleMs maxIdleMs : UInt32) : UInt8 :=
   if activeConns ≤ maxConns && maxConns ≤ 1024 &&
@@ -509,10 +447,7 @@ theorem poll_interest_rejects_exhaustion (p : PollInterestCheck)
     (verifyPollInterest p.activeConns p.maxConns p.keepAliveReqs p.maxKeepAlive p.idleMs p.maxIdleMs == 1) = false :=
   pollInterestMetaSpec.rejects_unsafe () p h_bad
 
-/--
-  Unboxed C-ABI Subprocess Sandbox & Pipe Quota Gate (`leansys_verify_rlimit_budget`):
-  Certifies `rssBytes ≤ maxRssBytes`, `elapsedMs ≤ timeoutMs`, and `pipeBytes ≤ maxPipeBytes`.
--/
+/-- Unboxed C-ABI Subprocess Sandbox & Pipe Quota Gate (`leansys_verify_rlimit_budget`). -/
 @[inline, export leansys_verify_rlimit_budget]
 def verifyRlimitBudget (rssBytes maxRssBytes elapsedMs timeoutMs pipeBytes maxPipeBytes : UInt64) : UInt8 :=
   if rssBytes ≤ maxRssBytes && elapsedMs ≤ timeoutMs && pipeBytes ≤ maxPipeBytes then 1 else 0
@@ -538,14 +473,12 @@ def rlimitBudgetMetaSpec : MetaGateSpec Unit RlimitBudgetCheck where
 
 /-- Corollary 11: `verifyRlimitBudget` rejects any subprocess exceeding RSS, wall-clock timeout, or pipe output caps. -/
 theorem rlimit_budget_rejects_overrun (q : RlimitBudgetCheck)
-    (h_bad : (q.rssBytes ≤ q.maxRssBytes && q.elapsedMs ≤ q.timeoutMs && q.pipeBytes ≤ q.maxPipeBytes) = false) :
+    (h_bad : (q.rssBytes ≤ q.maxRssBytes &&
+      q.elapsedMs ≤ q.timeoutMs && q.pipeBytes ≤ q.maxPipeBytes) = false) :
     (verifyRlimitBudget q.rssBytes q.maxRssBytes q.elapsedMs q.timeoutMs q.pipeBytes q.maxPipeBytes == 1) = false :=
   rlimitBudgetMetaSpec.rejects_unsafe () q h_bad
 
-/--
-  Unboxed C-ABI 64-Bit XXH3/SplitMix Word Accumulator (`leansys_mix64_word`):
-  Mixes an 8-byte little-endian word into a 64-bit accumulator in O(1) register arithmetic.
--/
+/-- Unboxed C-ABI 64-Bit XXH3/SplitMix Word Accumulator (`leansys_mix64_word`). -/
 @[inline, export leansys_mix64_word]
 def mix64Word (acc word : UInt64) : UInt64 :=
   let z := (acc ^^^ (word * 0x9E3779B97F4A7C15)) * 0xBF58476D1CE4E5B9
@@ -557,11 +490,7 @@ theorem mix64Word_zero_diff : mix64Word 0 0 != mix64Word 0 1 := by decide
 
 /-! ## Layer I & II Extensions v0.2: Composite Keys, Token Auth, Log Window & JSON-RPC 2.0 Gates -/
 
-/--
-  Unboxed C-ABI Composite 192-Bit Key Order Verifier (`leansys_verify_composite_key_order`):
-  Certifies non-decreasing lexicographic order `(hiA, loA, seqA) ≤ (hiB, loB, seqB)`
-  for big-endian composite index keys `(uuid_hi, uuid_lo, seq)`.
--/
+/-- Unboxed C-ABI Composite 192-Bit Key Order Verifier (`leansys_verify_composite_key_order`). -/
 @[inline, export leansys_verify_composite_key_order]
 def verifyCompositeKeyOrder (hiA loA seqA hiB loB seqB : UInt64) : UInt8 :=
   if hiA < hiB || (hiA == hiB && (loA < loB || (loA == loB && seqA ≤ seqB))) then 1 else 0
@@ -587,16 +516,12 @@ def compositeKeyOrderMetaSpec : MetaGateSpec Unit CompositeKeyOrderCheck where
 
 /-- Corollary 13: `verifyCompositeKeyOrder` rejects any out-of-order composite key pair. -/
 theorem composite_key_order_rejects_inversion (k : CompositeKeyOrderCheck)
-    (h_bad : (k.hiA < k.hiB || (k.hiA == k.hiB && (k.loA < k.loB || (k.loA == k.loB && k.seqA ≤ k.seqB)))) = false) :
+    (h_bad : (k.hiA < k.hiB || (k.hiA == k.hiB &&
+      (k.loA < k.loB || (k.loA == k.loB && k.seqA ≤ k.seqB)))) = false) :
     (verifyCompositeKeyOrder k.hiA k.loA k.seqA k.hiB k.loB k.seqB == 1) = false :=
   compositeKeyOrderMetaSpec.rejects_unsafe () k h_bad
 
-/--
-  Unboxed C-ABI Constant-Time Token Rotation & Scoped Lease Gate (`leansys_verify_token_auth`):
-  Certifies that a presented token matches either the current secret (`matchCurrent == 1`)
-  or a non-empty previous rotation secret (`hasPrev == 1 && matchPrev == 1`),
-  and that the scoped lease has not expired (`nowEpoch < expiresAt`) and matches scope (`scopeOk == 1`).
--/
+/-- Unboxed C-ABI Constant-Time Token Rotation & Scoped Lease Gate (`leansys_verify_token_auth`). -/
 @[inline, export leansys_verify_token_auth]
 def verifyTokenAuth (matchCurrent hasPrev matchPrev scopeOk : UInt8) (nowEpoch expiresAt : UInt64) : UInt8 :=
   if (matchCurrent == 1 || (hasPrev == 1 && matchPrev == 1)) && scopeOk == 1 && nowEpoch < expiresAt then 1 else 0
@@ -622,15 +547,12 @@ def tokenAuthMetaSpec : MetaGateSpec Unit TokenAuthCheck where
 
 /-- Corollary 14: `verifyTokenAuth` rejects expired leases, wrong scopes, or unrotated token mismatches. -/
 theorem token_auth_rejects_unauthorized (a : TokenAuthCheck)
-    (h_bad : ((a.matchCurrent == 1 || (a.hasPrev == 1 && a.matchPrev == 1)) && a.scopeOk == 1 && a.nowEpoch < a.expiresAt) = false) :
+    (h_bad : ((a.matchCurrent == 1 || (a.hasPrev == 1 && a.matchPrev == 1)) &&
+      a.scopeOk == 1 && a.nowEpoch < a.expiresAt) = false) :
     (verifyTokenAuth a.matchCurrent a.hasPrev a.matchPrev a.scopeOk a.nowEpoch a.expiresAt == 1) = false :=
   tokenAuthMetaSpec.rejects_unsafe () a h_bad
 
-/--
-  Unboxed C-ABI Process Log Chunk & UTF-8 Window Verifier (`leansys_verify_log_window`):
-  Certifies that a `pread` log chunk `[startOff, nextOff)` lies inside `[0, fileLen]`,
-  `nextOff - startOff ≤ maxBytes`, and `maxBytes ≤ 262144` (256 KiB cap).
--/
+/-- Unboxed C-ABI Process Log Chunk & UTF-8 Window Verifier (`leansys_verify_log_window`). -/
 @[inline, export leansys_verify_log_window]
 def verifyLogWindow (startOff nextOff fileLen maxBytes : UInt64) : UInt8 :=
   if startOff ≤ nextOff && nextOff ≤ fileLen && nextOff - startOff ≤ maxBytes && maxBytes ≤ 262144 then 1 else 0
@@ -654,15 +576,12 @@ def logWindowMetaSpec : MetaGateSpec Unit LogWindowCheck where
 
 /-- Corollary 15: `verifyLogWindow` rejects inverted cursors, reads past EOF, or chunks exceeding 256 KiB. -/
 theorem log_window_rejects_invalid_chunk (w : LogWindowCheck)
-    (h_bad : (w.startOff ≤ w.nextOff && w.nextOff ≤ w.fileLen && w.nextOff - w.startOff ≤ w.maxBytes && w.maxBytes ≤ 262144) = false) :
+    (h_bad : (w.startOff ≤ w.nextOff && w.nextOff ≤ w.fileLen &&
+      w.nextOff - w.startOff ≤ w.maxBytes && w.maxBytes ≤ 262144) = false) :
     (verifyLogWindow w.startOff w.nextOff w.fileLen w.maxBytes == 1) = false :=
   logWindowMetaSpec.rejects_unsafe () w h_bad
 
-/--
-  Unboxed C-ABI JSON-RPC 2.0 Frame Verifier (`leansys_verify_jsonrpc_frame`):
-  Certifies `hasV2 == 1` (`"jsonrpc":"2.0"`), non-empty method (`0 < methodLen && methodLen ≤ 128`),
-  valid id/notification tag (`hasId ≤ 1`), and payload size `payloadLen ≤ 4194304` (4 MiB).
--/
+/-- Unboxed C-ABI JSON-RPC 2.0 Frame Verifier (`leansys_verify_jsonrpc_frame`). -/
 @[inline, export leansys_verify_jsonrpc_frame]
 def verifyJsonRpcFrame (hasV2 hasId : UInt8) (methodLen : UInt32) (payloadLen : UInt64) : UInt8 :=
   if hasV2 == 1 && hasId ≤ 1 && methodLen > 0 && methodLen ≤ 128 && payloadLen ≤ 4194304 then 1 else 0
@@ -686,15 +605,12 @@ def jsonRpcFrameMetaSpec : MetaGateSpec Unit JsonRpcFrameCheck where
 
 /-- Corollary 16: `verifyJsonRpcFrame` rejects non-2.0 JSON-RPC frames, empty/oversized method names, or >4 MiB payloads. -/
 theorem jsonrpc_frame_rejects_malformed (f : JsonRpcFrameCheck)
-    (h_bad : (f.hasV2 == 1 && f.hasId ≤ 1 && f.methodLen > 0 && f.methodLen ≤ 128 && f.payloadLen ≤ 4194304) = false) :
+    (h_bad : (f.hasV2 == 1 && f.hasId ≤ 1 && f.methodLen > 0 &&
+      f.methodLen ≤ 128 && f.payloadLen ≤ 4194304) = false) :
     (verifyJsonRpcFrame f.hasV2 f.hasId f.methodLen f.payloadLen == 1) = false :=
   jsonRpcFrameMetaSpec.rejects_unsafe () f h_bad
 
-/--
-  Unboxed C-ABI Universal Certificate Admission Gate (`leansys_gate_admit`):
-  Certifies `noSorryAx == 1` (`0 sorryAx`), `statementPinned == 1` (exact target statement match),
-  and `certVerified == 1` (mechanical proof/TV/benchmark certificate passed).
--/
+/-- Unboxed C-ABI Universal Certificate Admission Gate (`leansys_gate_admit`). -/
 @[inline, export leansys_gate_admit]
 def verifyGateAdmit (noSorryAx statementPinned certVerified : UInt8) : UInt8 :=
   if noSorryAx == 1 && statementPinned == 1 && certVerified == 1 then 1 else 0
@@ -720,5 +636,82 @@ theorem gate_admit_rejects_unverified (g : GateAdmitCheck)
     (h_bad : (g.noSorryAx == 1 && g.statementPinned == 1 && g.certVerified == 1) = false) :
     (verifyGateAdmit g.noSorryAx g.statementPinned g.certVerified == 1) = false :=
   gateAdmitMetaSpec.rejects_unsafe () g h_bad
+
+/-- Canonical Mmap Seqlock Magic `0x4C534D4D` (`"LSMM"`). -/
+@[inline] def mmapSeqlockMagic : UInt32 := 0x4C534D4D
+
+/-- Unboxed C-ABI Mmap Seqlock Generation, Magic/Version & Torn-Read Recovery Gate (`leansys_verify_mmap_seqlock`). -/
+@[inline, export leansys_verify_mmap_seqlock]
+def verifyMmapSeqlock (magic schemaVersion expectedVersion : UInt32)
+    (seqBefore seqAfter writerEpoch minEpoch payloadLen ringCap : UInt64) : UInt8 :=
+  if magic == mmapSeqlockMagic && schemaVersion == expectedVersion &&
+     seqBefore == seqAfter && seqBefore % 2 == 0 &&
+     writerEpoch >= minEpoch && payloadLen ≤ ringCap then 1 else 0
+
+/-- Mmap seqlock read check parameters (≤ 3 fields via tuple packing). -/
+structure MmapSeqlockCheck where
+  hdr    : UInt32 × UInt32 × UInt32
+  seqs   : UInt64 × UInt64 × UInt64 × UInt64
+  bounds : UInt64 × UInt64
+  deriving Repr, DecidableEq
+
+/-- Layer II Bundle 18: Shared-memory seqlock torn-read & epoch recovery gate. -/
+def mmapSeqlockMetaSpec : MetaGateSpec Unit MmapSeqlockCheck where
+  inv _ := True
+  gate _ m :=
+    verifyMmapSeqlock m.hdr.1 m.hdr.2.1 m.hdr.2.2
+      m.seqs.1 m.seqs.2.1 m.seqs.2.2.1 m.seqs.2.2.2 m.bounds.1 m.bounds.2 == 1
+  step _ _ := ()
+  safe _ m :=
+    (m.hdr.1 == 0x4C534D4D && m.hdr.2.1 == m.hdr.2.2 &&
+     m.seqs.1 == m.seqs.2.1 && m.seqs.1 % 2 == 0 &&
+     m.seqs.2.2.1 >= m.seqs.2.2.2 && m.bounds.1 ≤ m.bounds.2)
+  preserves_inv _ _ _ h := h
+  ensures_safe _ m h := by
+    unfold verifyMmapSeqlock mmapSeqlockMagic at h
+    split at h <;> first | assumption | contradiction
+
+/-- Corollary 18: `verifyMmapSeqlock` rejects torn seqlock reads, writer-in-flight odd seqs, stale epochs, or magic/version mismatches. -/
+theorem mmap_seqlock_rejects_torn_or_stale (m : MmapSeqlockCheck)
+    (h_bad : (m.hdr.1 == 0x4C534D4D && m.hdr.2.1 == m.hdr.2.2 &&
+      m.seqs.1 == m.seqs.2.1 && m.seqs.1 % 2 == 0 &&
+      m.seqs.2.2.1 >= m.seqs.2.2.2 && m.bounds.1 ≤ m.bounds.2) = false) :
+    (verifyMmapSeqlock m.hdr.1 m.hdr.2.1 m.hdr.2.2
+      m.seqs.1 m.seqs.2.1 m.seqs.2.2.1 m.seqs.2.2.2 m.bounds.1 m.bounds.2 == 1) = false :=
+  mmapSeqlockMetaSpec.rejects_unsafe () m h_bad
+
+/-- Unboxed C-ABI `/proc/<pid>/stat` `(comm)` Field Scanner Gate (`leansys_verify_proc_stat_fields`). -/
+@[inline, export leansys_verify_proc_stat_fields]
+def verifyProcStatFields (commOpenIdx commCloseIdx totalLen minFieldsAfterComm actualFields : UInt64) : UInt8 :=
+  if commOpenIdx < commCloseIdx && commCloseIdx + 2 ≤ totalLen &&
+     actualFields >= minFieldsAfterComm then 1 else 0
+
+/-- `/proc/<pid>/stat` `(comm)` scanner check parameters (≤ 3 fields). -/
+structure ProcStatFieldsCheck where
+  commOpenIdx  : UInt64
+  commCloseIdx : UInt64
+  tailBounds   : UInt64 × UInt64 × UInt64
+  deriving Repr, DecidableEq
+
+/-- Layer II Bundle 19: Stateless `/proc/<pid>/stat` `(comm)` field scanner gate. -/
+def procStatFieldsMetaSpec : MetaGateSpec Unit ProcStatFieldsCheck where
+  inv _ := True
+  gate _ p :=
+    verifyProcStatFields p.commOpenIdx p.commCloseIdx
+      p.tailBounds.1 p.tailBounds.2.1 p.tailBounds.2.2 == 1
+  step _ _ := ()
+  safe _ p :=
+    (p.commOpenIdx < p.commCloseIdx && p.commCloseIdx + 2 ≤ p.tailBounds.1 &&
+     p.tailBounds.2.2 >= p.tailBounds.2.1)
+  preserves_inv _ _ _ h := h
+  ensures_safe _ p h := by unfold verifyProcStatFields at h; split at h <;> simp_all
+
+/-- Corollary 19: `verifyProcStatFields` rejects malformed `(comm)` delimiters or truncated `/proc/<pid>/stat` field counts. -/
+theorem proc_stat_fields_rejects_malformed (p : ProcStatFieldsCheck)
+    (h_bad : (p.commOpenIdx < p.commCloseIdx && p.commCloseIdx + 2 ≤ p.tailBounds.1 &&
+      p.tailBounds.2.2 >= p.tailBounds.2.1) = false) :
+    (verifyProcStatFields p.commOpenIdx p.commCloseIdx
+      p.tailBounds.1 p.tailBounds.2.1 p.tailBounds.2.2 == 1) = false :=
+  procStatFieldsMetaSpec.rejects_unsafe () p h_bad
 
 end LeanSys.Spec
