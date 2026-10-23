@@ -76,7 +76,11 @@ def runSelfTest : IO UInt32 := do
   let rpcGateOk := verifyJsonRpcFrame 1 1 10 256 == 1 &&
                    verifyJsonRpcFrame 0 1 10 256 == 0 &&
                    verifyJsonRpcFrame 1 1 0 256 == 0
-  if !(sbOk && wfOk && casGateOk && httpGateOk && tapeGateOk && ringGateOk && sstGateOk && pollGateOk && rlimGateOk && mixGateOk && ckGateOk && tokGateOk && logGateOk && rpcGateOk) then
+  let admitGateOk := verifyGateAdmit 1 1 1 == 1 &&
+                     verifyGateAdmit 0 1 1 == 0 &&
+                     verifyGateAdmit 1 0 1 == 0 &&
+                     verifyGateAdmit 1 1 0 == 0
+  if !(sbOk && wfOk && casGateOk && httpGateOk && tapeGateOk && ringGateOk && sstGateOk && pollGateOk && rlimGateOk && mixGateOk && ckGateOk && tokGateOk && logGateOk && rpcGateOk && admitGateOk) then
     IO.eprintln "[lean-sys-core] FAIL: C-ABI Spec gates check failed"
     return 1
 
@@ -245,7 +249,7 @@ def runSelfTest : IO UInt32 := do
       IO.eprintln s!"[lean-sys-core] FAIL: unexpected HTTP response: {respBody}"
       return 1
 
-  IO.println s!"\{ \"ok\": true, \"binary\": \"lean-sys-core\", \"c_abi_gates\": 14, \"wal_torn_recovery\": true, \"cas_hardlink\": true, \"sst_bloom\": true, \"table_range_scan\": true, \"auth_rotation\": true, \"proc_log\": true, \"jsonrpc_2_0\": true, \"shm_ring\": true, \"jsonl_tape\": true, \"reactor_keepalive\": true, \"sandbox_rlimit\": true, \"pgid_reaper\": true, \"http_loopback_port\": {boundPort} }"
+  IO.println s!"\{ \"ok\": true, \"binary\": \"lean-sys-core\", \"c_abi_gates\": 15, \"wal_torn_recovery\": true, \"cas_hardlink\": true, \"sst_bloom\": true, \"table_range_scan\": true, \"auth_rotation\": true, \"proc_log\": true, \"jsonrpc_2_0\": true, \"shm_ring\": true, \"jsonl_tape\": true, \"reactor_keepalive\": true, \"sandbox_rlimit\": true, \"pgid_reaper\": true, \"http_loopback_port\": {boundPort} }"
   return 0
 
 /-- Run deterministic micro-benchmarks for `autoresearch/sys_arena.py` and emit JSON metrics. -/
@@ -312,7 +316,7 @@ def main (args : List String) : IO UInt32 := do
   | ["bench"] | ["--bench"] => LeanSys.Core.runBench 4000
   | ["bench", nStr] | ["--bench", nStr] => LeanSys.Core.runBench (nStr.toNat?.getD 4000)
   | ["--c-abi"] =>
-    IO.println "{\"ok\":true,\"exports\":[\"leansys_verify_slice_bounds\",\"leansys_verify_wal_frame\",\"leansys_verify_cas_digest\",\"leansys_check_http_bounds\",\"leansys_verify_jsonl_tape\",\"leansys_verify_ring_cursor\",\"leansys_verify_sst_block\",\"leansys_verify_poll_interest\",\"leansys_verify_rlimit_budget\",\"leansys_mix64_word\",\"leansys_verify_composite_key_order\",\"leansys_verify_token_auth\",\"leansys_verify_log_window\",\"leansys_verify_jsonrpc_frame\"]}"
+    IO.println "{\"ok\":true,\"exports\":[\"leansys_verify_slice_bounds\",\"leansys_verify_wal_frame\",\"leansys_verify_cas_digest\",\"leansys_check_http_bounds\",\"leansys_verify_jsonl_tape\",\"leansys_verify_ring_cursor\",\"leansys_verify_sst_block\",\"leansys_verify_poll_interest\",\"leansys_verify_rlimit_budget\",\"leansys_mix64_word\",\"leansys_verify_composite_key_order\",\"leansys_verify_token_auth\",\"leansys_verify_log_window\",\"leansys_verify_jsonrpc_frame\",\"leansys_gate_admit\"]}"
     return 0
   | _ =>
     IO.println "usage: lean-sys-core [self-test | bench | --c-abi]"

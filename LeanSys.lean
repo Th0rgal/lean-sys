@@ -3,6 +3,7 @@
 -/
 import LeanSys.Contracts.MetaGate
 import LeanSys.Contracts.SpeculativeGate
+import LeanSys.Gate
 import LeanSys.Spec
 import LeanSys.Posix
 import LeanSys.Hash

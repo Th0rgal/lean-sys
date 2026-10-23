@@ -10,7 +10,8 @@
     `leansys_verify_sst_block`, `leansys_verify_poll_interest`,
     `leansys_verify_rlimit_budget`, `leansys_mix64_word`,
     `leansys_verify_table_range`, `leansys_verify_token_auth`,
-    `leansys_verify_log_window`, `leansys_verify_jsonrpc_frame`
+    `leansys_verify_log_window`, `leansys_verify_jsonrpc_frame`,
+    `leansys_gate_admit`
 -/
 
 namespace LeanSys.Spec
@@ -688,5 +689,36 @@ theorem jsonrpc_frame_rejects_malformed (f : JsonRpcFrameCheck)
     (h_bad : (f.hasV2 == 1 && f.hasId ≤ 1 && f.methodLen > 0 && f.methodLen ≤ 128 && f.payloadLen ≤ 4194304) = false) :
     (verifyJsonRpcFrame f.hasV2 f.hasId f.methodLen f.payloadLen == 1) = false :=
   jsonRpcFrameMetaSpec.rejects_unsafe () f h_bad
+
+/--
+  Unboxed C-ABI Universal Certificate Admission Gate (`leansys_gate_admit`):
+  Certifies `noSorryAx == 1` (`0 sorryAx`), `statementPinned == 1` (exact target statement match),
+  and `certVerified == 1` (mechanical proof/TV/benchmark certificate passed).
+-/
+@[inline, export leansys_gate_admit]
+def verifyGateAdmit (noSorryAx statementPinned certVerified : UInt8) : UInt8 :=
+  if noSorryAx == 1 && statementPinned == 1 && certVerified == 1 then 1 else 0
+
+/-- Certificate admission gate check parameters. -/
+structure GateAdmitCheck where
+  noSorryAx       : UInt8
+  statementPinned : UInt8
+  certVerified    : UInt8
+  deriving Repr, DecidableEq
+
+/-- Layer II Bundle 17: Universal certificate admission gate (`leansys_gate_admit`). -/
+def gateAdmitMetaSpec : MetaGateSpec Unit GateAdmitCheck where
+  inv _ := True
+  gate _ g := verifyGateAdmit g.noSorryAx g.statementPinned g.certVerified == 1
+  step _ _ := ()
+  safe _ g := (g.noSorryAx == 1 && g.statementPinned == 1 && g.certVerified == 1)
+  preserves_inv _ _ _ h := h
+  ensures_safe _ g h := by unfold verifyGateAdmit at h; split at h <;> simp_all
+
+/-- Corollary 17: `verifyGateAdmit` rejects any candidate with `sorryAx`, mutated statement, or unverified certificate. -/
+theorem gate_admit_rejects_unverified (g : GateAdmitCheck)
+    (h_bad : (g.noSorryAx == 1 && g.statementPinned == 1 && g.certVerified == 1) = false) :
+    (verifyGateAdmit g.noSorryAx g.statementPinned g.certVerified == 1) = false :=
+  gateAdmitMetaSpec.rejects_unsafe () g h_bad
 
 end LeanSys.Spec
