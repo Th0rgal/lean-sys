@@ -87,8 +87,32 @@ def runSelfTest : IO UInt32 := do
   let procStatGateOk := verifyProcStatFields 5 18 64 5 12 == 1 &&
                         verifyProcStatFields 18 5 64 5 12 == 0 &&
                         verifyProcStatFields 5 18 64 15 12 == 0
-  if !(sbOk && wfOk && casGateOk && httpGateOk && tapeGateOk && ringGateOk && sstGateOk && pollGateOk && rlimGateOk && mixGateOk && ckGateOk && tokGateOk && logGateOk && rpcGateOk && admitGateOk && seqlockGateOk && procStatGateOk) then
+  let sseGateOk := verifySseFrameScan 4 12 64 2 0x41 == 1 &&
+                   verifySseFrameScan 4 12 64 2 0x85 == 0 &&
+                   verifySseFrameScan 60 12 64 2 0x41 == 0
+  let gfmGateOk := verifyGfmPipeScan 0 24 64 3 3 0 == 1 &&
+                   verifyGfmPipeScan 0 24 64 3 2 0 == 0 &&
+                   verifyGfmPipeScan 0 24 64 3 3 1 == 0
+  let tagGateOk := verifyTagScan 0 20 6 12 64 1 == 1 &&
+                   verifyTagScan 0 20 6 18 64 1 == 0 &&
+                   verifyTagScan 0 20 6 12 64 9 == 0
+  let trIdxGateOk := verifyTranscriptIndex 0 32 64 0x1111 0x2222 != 0 &&
+                     verifyTranscriptIndex 48 32 64 0x1111 0x2222 == 0
+  if !(sbOk && wfOk && casGateOk && httpGateOk && tapeGateOk && ringGateOk && sstGateOk && pollGateOk && rlimGateOk && mixGateOk && ckGateOk && tokGateOk && logGateOk && rpcGateOk && admitGateOk && seqlockGateOk && procStatGateOk && sseGateOk && gfmGateOk && tagGateOk && trIdxGateOk) then
     IO.eprintln "[lean-sys-core] FAIL: C-ABI Spec gates check failed"
+    return 1
+
+  -- 1b. Zero-Copy SSE Frame, GFM Pipe Table, Rich Tag & Transcript Turn Scanners
+  let sseChunk := ByteSlice.ofString "event: turn_delta\ndata: {\"delta\":\"ok\"}\nid: 42\n"
+  let (sseSpans, _) := scanSseFrames sseChunk
+  let gfmTable := ByteSlice.ofString "| ColA | ColB |\n|---|:-:|\n| a\\|b | c |\n"
+  let gfmRows := scanGfmPipeTable gfmTable
+  let tagSample := ByteSlice.ofString "See <file path=\"a.lean\"> and <image src=\"b.png\"> plus <svg viewBox=\"0 0 10 10\">"
+  let richTags := scanRichTags tagSample
+  let trSample := ByteSlice.ofString "{\"turn\":1}\n{\"turn\":2}\n"
+  let trTurns := indexTranscriptTurns trSample
+  if sseSpans.size != 3 || gfmRows.size != 3 || richTags.size != 3 || trTurns.size != 2 then
+    IO.eprintln "[lean-sys-core] FAIL: Zero-copy SSE/GFM/Tag/Transcript scanner mismatch"
     return 1
 
   -- 2. Zero-Copy JSONL Tape Codec & 64-Bit Word-Strided Hash (`LeanSys.Codec` & `LeanSys.Hash`)

@@ -750,4 +750,138 @@ theorem proc_stat_tail_step_strict_progress (closeOffset : Nat) (b b' : SliceBou
   ⟨((procStatTailParserSpec closeOffset).bounds_preserved b closeOffset b' h_step h_bounds).1,
    (procStatTailParserSpec closeOffset).strict_progress b closeOffset b' h_step h_prog⟩
 
+/-- Unboxed C-ABI SSE Frame Scanner Gate (`leansys_sse_frame_scan`):
+    validates fragmented SSE `event:` / `data:` / `id:` frame boundaries without splitting UTF-8 continuation bytes (`[0x80, 0xBF]`). -/
+@[inline, export leansys_sse_frame_scan]
+def verifySseFrameScan (frameOff frameLen chunkLen : UInt64) (fieldKind nextByte : UInt8) : UInt8 :=
+  if 0 < frameLen && frameOff + frameLen ≤ chunkLen &&
+     1 ≤ fieldKind && fieldKind ≤ 4 && (nextByte < 0x80 || 0xBF < nextByte) then 1 else 0
+
+/-- SSE frame scan check parameters (≤ 3 fields). -/
+structure SseFrameScanCheck where
+  bounds    : UInt64 × UInt64 × UInt64
+  fieldKind : UInt8
+  nextByte  : UInt8
+  deriving Repr, DecidableEq
+
+/-- Layer II Bundle 21: SSE incremental frame scanner gate (`leansys_sse_frame_scan`). -/
+def sseFrameScanMetaSpec : MetaGateSpec Unit SseFrameScanCheck where
+  inv _ := True
+  gate _ s := verifySseFrameScan s.bounds.1 s.bounds.2.1 s.bounds.2.2 s.fieldKind s.nextByte == 1
+  step _ _ := ()
+  safe _ s :=
+    (0 < s.bounds.2.1 && s.bounds.1 + s.bounds.2.1 ≤ s.bounds.2.2 &&
+     1 ≤ s.fieldKind && s.fieldKind ≤ 4 && (s.nextByte < 0x80 || 0xBF < s.nextByte))
+  preserves_inv _ _ _ h := h
+  ensures_safe _ s h := by unfold verifySseFrameScan at h; split at h <;> first | assumption | contradiction
+
+/-- Corollary 21: `verifySseFrameScan` rejects out-of-bounds SSE frames, unknown field kinds, or mid-UTF-8 continuation cuts. -/
+theorem sse_frame_scan_rejects_utf8_cut_or_oob (s : SseFrameScanCheck)
+    (h_bad : (0 < s.bounds.2.1 && s.bounds.1 + s.bounds.2.1 ≤ s.bounds.2.2 &&
+      1 ≤ s.fieldKind && s.fieldKind ≤ 4 && (s.nextByte < 0x80 || 0xBF < s.nextByte)) = false) :
+    (verifySseFrameScan s.bounds.1 s.bounds.2.1 s.bounds.2.2 s.fieldKind s.nextByte == 1) = false :=
+  sseFrameScanMetaSpec.rejects_unsafe () s h_bad
+
+/-- Unboxed C-ABI GFM Pipe Table Scanner Gate (`leansys_gfm_pipe_scan`):
+    validates single-pass GFM loose-pipe table row/separator spans and column alignment counts. -/
+@[inline, export leansys_gfm_pipe_scan]
+def verifyGfmPipeScan (rowOff rowLen bufLen : UInt64) (colCount sepCols : UInt32) (unterminatedEscape : UInt8) : UInt8 :=
+  if 0 < rowLen && rowOff + rowLen ≤ bufLen &&
+     0 < colCount && colCount ≤ 64 && colCount == sepCols && unterminatedEscape == 0 then 1 else 0
+
+/-- GFM pipe table scanner check parameters (≤ 3 fields). -/
+structure GfmPipeScanCheck where
+  bounds             : UInt64 × UInt64 × UInt64
+  cols               : UInt32 × UInt32
+  unterminatedEscape : UInt8
+  deriving Repr, DecidableEq
+
+/-- Layer II Bundle 22: GFM loose-pipe table scanner gate (`leansys_gfm_pipe_scan`). -/
+def gfmPipeScanMetaSpec : MetaGateSpec Unit GfmPipeScanCheck where
+  inv _ := True
+  gate _ g := verifyGfmPipeScan g.bounds.1 g.bounds.2.1 g.bounds.2.2 g.cols.1 g.cols.2 g.unterminatedEscape == 1
+  step _ _ := ()
+  safe _ g :=
+    (0 < g.bounds.2.1 && g.bounds.1 + g.bounds.2.1 ≤ g.bounds.2.2 &&
+     0 < g.cols.1 && g.cols.1 ≤ 64 && g.cols.1 == g.cols.2 && g.unterminatedEscape == 0)
+  preserves_inv _ _ _ h := h
+  ensures_safe _ g h := by unfold verifyGfmPipeScan at h; split at h <;> first | assumption | contradiction
+
+/-- Corollary 22: `verifyGfmPipeScan` rejects mismatched GFM separator column counts, >64 columns, or trailing escapes. -/
+theorem gfm_pipe_scan_rejects_malformed_table (g : GfmPipeScanCheck)
+    (h_bad : (0 < g.bounds.2.1 && g.bounds.1 + g.bounds.2.1 ≤ g.bounds.2.2 &&
+      0 < g.cols.1 && g.cols.1 ≤ 64 && g.cols.1 == g.cols.2 && g.unterminatedEscape == 0) = false) :
+    (verifyGfmPipeScan g.bounds.1 g.bounds.2.1 g.bounds.2.2 g.cols.1 g.cols.2 g.unterminatedEscape == 1) = false :=
+  gfmPipeScanMetaSpec.rejects_unsafe () g h_bad
+
+/-- Unboxed C-ABI Rich Tag Scanner Gate (`leansys_tag_scan`):
+    validates `<file>`, `<image>`, and `<svg>` span and attribute bounds without allocation. -/
+@[inline, export leansys_tag_scan]
+def verifyTagScan (tagOff tagLen attrOff attrLen bufLen : UInt64) (tagKind : UInt8) : UInt8 :=
+  if 0 < tagLen && tagOff + tagLen ≤ bufLen &&
+     tagOff ≤ attrOff && attrOff + attrLen ≤ tagOff + tagLen &&
+     1 ≤ tagKind && tagKind ≤ 3 then 1 else 0
+
+/-- Rich tag (`<file>`/`<image>`/`<svg>`) check parameters (≤ 3 fields). -/
+structure TagScanCheck where
+  tagBounds  : UInt64 × UInt64 × UInt64
+  attrBounds : UInt64 × UInt64
+  tagKind    : UInt8
+  deriving Repr, DecidableEq
+
+/-- Layer II Bundle 23: Rich tag (`<file>`/`<image>`/`<svg>`) scanner gate (`leansys_tag_scan`). -/
+def tagScanMetaSpec : MetaGateSpec Unit TagScanCheck where
+  inv _ := True
+  gate _ t := verifyTagScan t.tagBounds.1 t.tagBounds.2.1 t.attrBounds.1 t.attrBounds.2 t.tagBounds.2.2 t.tagKind == 1
+  step _ _ := ()
+  safe _ t :=
+    (0 < t.tagBounds.2.1 && t.tagBounds.1 + t.tagBounds.2.1 ≤ t.tagBounds.2.2 &&
+     t.tagBounds.1 ≤ t.attrBounds.1 && t.attrBounds.1 + t.attrBounds.2 ≤ t.tagBounds.1 + t.tagBounds.2.1 &&
+     1 ≤ t.tagKind && t.tagKind ≤ 3)
+  preserves_inv _ _ _ h := h
+  ensures_safe _ t h := by unfold verifyTagScan at h; split at h <;> first | assumption | contradiction
+
+/-- Corollary 23: `verifyTagScan` rejects attributes escaping their enclosing tag span or unknown tag kinds. -/
+theorem tag_scan_rejects_escaped_attr_or_kind (t : TagScanCheck)
+    (h_bad : (0 < t.tagBounds.2.1 && t.tagBounds.1 + t.tagBounds.2.1 ≤ t.tagBounds.2.2 &&
+      t.tagBounds.1 ≤ t.attrBounds.1 && t.attrBounds.1 + t.attrBounds.2 ≤ t.tagBounds.1 + t.tagBounds.2.1 &&
+      1 ≤ t.tagKind && t.tagKind ≤ 3) = false) :
+    (verifyTagScan t.tagBounds.1 t.tagBounds.2.1 t.attrBounds.1 t.attrBounds.2 t.tagBounds.2.2 t.tagKind == 1) = false :=
+  tagScanMetaSpec.rejects_unsafe () t h_bad
+
+/-- Unboxed C-ABI Transcript Turn Indexer & Digest Gate (`leansys_transcript_index`):
+    validates turn/block boundaries and mixes the per-turn 64-bit digest (`mix64Word`) for granular UI invalidation. -/
+@[inline, export leansys_transcript_index]
+def verifyTranscriptIndex (turnOff turnLen bufLen prevDigest blockHash : UInt64) : UInt64 :=
+  if 0 < turnLen && turnOff + turnLen ≤ bufLen then
+    let mixed := mix64Word (prevDigest ^^^ turnLen) blockHash
+    if mixed == 0 then 1 else mixed
+  else 0
+
+/-- Transcript turn index check parameters (≤ 3 fields). -/
+structure TranscriptIndexCheck where
+  bounds     : UInt64 × UInt64 × UInt64
+  prevDigest : UInt64
+  blockHash  : UInt64
+  deriving Repr, DecidableEq
+
+/-- Layer II Bundle 24: Transcript turn indexer & non-zero digest gate (`leansys_transcript_index`). -/
+def transcriptIndexMetaSpec : MetaGateSpec Unit TranscriptIndexCheck where
+  inv _ := True
+  gate _ x := verifyTranscriptIndex x.bounds.1 x.bounds.2.1 x.bounds.2.2 x.prevDigest x.blockHash != 0
+  step _ _ := ()
+  safe _ x := (0 < x.bounds.2.1 && x.bounds.1 + x.bounds.2.1 ≤ x.bounds.2.2)
+  preserves_inv _ _ _ h := h
+  ensures_safe _ x h := by
+    unfold verifyTranscriptIndex at h
+    split at h
+    · assumption
+    · contradiction
+
+/-- Corollary 24: `verifyTranscriptIndex` returns `0` whenever a turn span is empty or exceeds buffer bounds. -/
+theorem transcript_index_rejects_empty_or_oob (x : TranscriptIndexCheck)
+    (h_bad : (0 < x.bounds.2.1 && x.bounds.1 + x.bounds.2.1 ≤ x.bounds.2.2) = false) :
+    (verifyTranscriptIndex x.bounds.1 x.bounds.2.1 x.bounds.2.2 x.prevDigest x.blockHash != 0) = false :=
+  transcriptIndexMetaSpec.rejects_unsafe () x h_bad
+
 end LeanSys.Spec

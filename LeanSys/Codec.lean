@@ -236,4 +236,167 @@ def splitJsonlLines (s : ByteSlice) : Array ByteSlice := Id.run do
 
 end JsonTape
 
+/-- Zero-copy SSE field span `(fieldKind, valOff, valLen)` inside a borrowed `ByteSlice`.
+    `fieldKind`: `1 = event`, `2 = data`, `3 = id`, `4 = retry`. -/
+structure SseFieldSpan where
+  fieldKind : UInt8
+  valOff    : Nat
+  valLen    : Nat
+  deriving Repr, DecidableEq
+
+/-- Incremental zero-copy SSE frame scanner (`leansys_sse_frame_scan`) over a borrowed `ByteSlice`:
+    splits `event:` / `data:` / `id:` / `retry:` lines without cutting multi-byte UTF-8 continuation bytes (`[0x80, 0xBF]`). -/
+def scanSseFrames (s : ByteSlice) : Array SseFieldSpan × Nat := Id.run do
+  let ba := s.ba
+  let cap := ba.size
+  let limit := Nat.min (s.off + s.len) cap
+  let mut spans : Array SseFieldSpan := #[]
+  let mut lineStart := s.off
+  let mut i := s.off
+  while i < limit do
+    if byteAt ba i == 10 then
+      let lineEnd := if i > lineStart && byteAt ba (i - 1) == 13 then i - 1 else i
+      let lineLen := lineEnd - lineStart
+      if lineLen > 0 then
+        let mut colon := lineStart
+        while colon < lineEnd && byteAt ba colon != 58 do
+          colon := colon + 1
+        if colon < lineEnd then
+          let keyLen := colon - lineStart
+          let b0 := byteAt ba lineStart
+          let kind : UInt8 :=
+            if keyLen == 5 && b0 == 101 then 1 -- "event"
+            else if keyLen == 4 && b0 == 100 then 2 -- "data"
+            else if keyLen == 2 && b0 == 105 then 3 -- "id"
+            else if keyLen == 5 && b0 == 114 then 4 -- "retry"
+            else 0
+          let valStart := if colon + 1 < lineEnd && byteAt ba (colon + 1) == 32 then colon + 2 else colon + 1
+          let valLen := if lineEnd ≥ valStart then lineEnd - valStart else 0
+          let nextB := if i + 1 < limit then byteAt ba (i + 1) else 0
+          if valLen > 0 && verifySseFrameScan valStart.toUInt64 valLen.toUInt64 cap.toUInt64 kind nextB == 1 then
+            spans := spans.push { fieldKind := kind, valOff := valStart, valLen := valLen }
+      lineStart := i + 1
+    i := i + 1
+  return (spans, lineStart)
+
+/-- Zero-copy GFM pipe table row span `(rowOff, rowLen, colCount, isSeparator)`. -/
+structure GfmPipeRowSpan where
+  rowOff      : Nat
+  rowLen      : Nat
+  colCount    : UInt32
+  isSeparator : Bool
+  deriving Repr, DecidableEq
+
+/-- Single-pass zero-copy GFM loose-pipe table scanner (`leansys_gfm_pipe_scan`):
+    indexes pipe-delimited rows, respects escaped pipes `\|`, and validates column counts against the separator row. -/
+def scanGfmPipeTable (s : ByteSlice) : Array GfmPipeRowSpan := Id.run do
+  let ba := s.ba
+  let cap := ba.size
+  let limit := Nat.min (s.off + s.len) cap
+  let mut rawRows : Array (Nat × Nat × UInt32 × Bool × UInt8) := #[]
+  let mut sepCols : UInt32 := 0
+  let mut lineStart := s.off
+  let mut i := s.off
+  while i ≤ limit do
+    if i == limit || byteAt ba i == 10 then
+      let lineEnd := if i > lineStart && byteAt ba (i - 1) == 13 then i - 1 else i
+      let rowLen := lineEnd - lineStart
+      if rowLen > 0 then
+        let mut p := lineStart
+        let mut pipes : UInt32 := 0
+        let mut nonSep := false
+        let mut esc : UInt8 := 0
+        while p < lineEnd do
+          let c := byteAt ba p
+          if esc == 1 then
+            esc := 0
+          else if c == 92 then -- '\\'
+            esc := 1
+          else if c == 124 then -- '|'
+            pipes := pipes + 1
+          else if c != 45 && c != 58 && c != 32 && c != 9 then
+            nonSep := true
+          p := p + 1
+        if pipes > 0 then
+          let firstPipe := byteAt ba (JsonTape.skipWs ba lineStart lineEnd) == 124
+          let lastPipe := lineEnd > lineStart && byteAt ba (lineEnd - 1) == 124
+          let cols := pipes + 1 - (if firstPipe then 1 else 0) - (if lastPipe && pipes > 1 then 1 else 0)
+          let isSep := !nonSep && cols > 0
+          if isSep && sepCols == 0 then sepCols := cols
+          rawRows := rawRows.push (lineStart, rowLen, cols, isSep, esc)
+      lineStart := i + 1
+    i := i + 1
+  let mut out : Array GfmPipeRowSpan := #[]
+  let targetCols := if sepCols > 0 then sepCols else (rawRows[0]?.map (·.2.2.1)).getD 0
+  for (rOff, rLen, cols, isSep, esc) in rawRows do
+    if verifyGfmPipeScan rOff.toUInt64 rLen.toUInt64 cap.toUInt64 cols targetCols esc == 1 then
+      out := out.push { rowOff := rOff, rowLen := rLen, colCount := cols, isSeparator := isSep }
+  return out
+
+/-- Zero-copy rich tag (`<file>`, `<image>`, `<svg>`) span (`tagKind`: `1 = file`, `2 = image`, `3 = svg`). -/
+structure RichTagSpan where
+  tagKind : UInt8
+  tagOff  : Nat
+  tagLen  : Nat
+  attrOff : Nat
+  attrLen : Nat
+  deriving Repr, DecidableEq
+
+/-- Zero-copy `<file>`, `<image>`, `<svg>` tag scanner (`leansys_tag_scan`) over a borrowed `ByteSlice`. -/
+def scanRichTags (s : ByteSlice) : Array RichTagSpan := Id.run do
+  let ba := s.ba
+  let cap := ba.size
+  let limit := Nat.min (s.off + s.len) cap
+  let mut out : Array RichTagSpan := #[]
+  let mut i := s.off
+  while i + 4 < limit do
+    if byteAt ba i == 60 then -- '<'
+      let b1 := byteAt ba (i + 1)
+      let b2 := byteAt ba (i + 2)
+      let b3 := byteAt ba (i + 3)
+      let (kind, nameLen) : UInt8 × Nat :=
+        if b1 == 102 && b2 == 105 && b3 == 108 && i + 5 < limit && byteAt ba (i + 4) == 101 then (1, 4) -- "file"
+        else if b1 == 105 && b2 == 109 && b3 == 97 && i + 6 < limit && byteAt ba (i + 4) == 103 && byteAt ba (i + 5) == 101 then (2, 5) -- "image"
+        else if b1 == 115 && b2 == 118 && b3 == 103 then (3, 3) -- "svg"
+        else (0, 0)
+      if kind != 0 then
+        let attrStart := JsonTape.skipWs ba (i + 1 + nameLen) limit
+        let mut closeIdx := attrStart
+        while closeIdx < limit && byteAt ba closeIdx != 62 do -- '>'
+          closeIdx := closeIdx + 1
+        if closeIdx < limit then
+          let tagLen := (closeIdx + 1) - i
+          let attrLen := closeIdx - attrStart
+          if verifyTagScan i.toUInt64 tagLen.toUInt64 attrStart.toUInt64 attrLen.toUInt64 cap.toUInt64 kind == 1 then
+            out := out.push { tagKind := kind, tagOff := i, tagLen := tagLen, attrOff := attrStart, attrLen := attrLen }
+          i := closeIdx + 1
+        else
+          i := i + 1
+      else
+        i := i + 1
+    else
+      i := i + 1
+  return out
+
+/-- Zero-copy transcript turn span with 64-bit `xxh64Slice` + `leansys_transcript_index` digest. -/
+structure TranscriptTurnSpan where
+  turnOff : Nat
+  turnLen : Nat
+  digest  : UInt64
+  deriving Repr, DecidableEq
+
+/-- Zero-copy transcript turn indexer (`leansys_transcript_index`) computing per-turn 64-bit invalidation digests. -/
+def indexTranscriptTurns (s : ByteSlice) : Array TranscriptTurnSpan := Id.run do
+  let lines := JsonTape.splitJsonlLines s
+  let cap := s.ba.size
+  let mut out : Array TranscriptTurnSpan := #[]
+  let mut prevDigest : UInt64 := 0
+  for ln in lines do
+    let blkHash := LeanSys.Hash.xxh64Slice ln
+    let dig := verifyTranscriptIndex ln.off.toUInt64 ln.len.toUInt64 cap.toUInt64 prevDigest blkHash
+    if dig != 0 then
+      out := out.push { turnOff := ln.off, turnLen := ln.len, digest := dig }
+      prevDigest := dig
+  return out
+
 end LeanSys.Codec

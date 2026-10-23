@@ -118,6 +118,40 @@ extern "C" {
         min_fields_after_comm: u64,
         actual_fields: u64,
     ) -> u8;
+
+    pub fn leansys_sse_frame_scan(
+        frame_off: u64,
+        frame_len: u64,
+        chunk_len: u64,
+        field_kind: u8,
+        next_byte: u8,
+    ) -> u8;
+
+    pub fn leansys_gfm_pipe_scan(
+        row_off: u64,
+        row_len: u64,
+        buf_len: u64,
+        col_count: u32,
+        sep_cols: u32,
+        unterminated_escape: u8,
+    ) -> u8;
+
+    pub fn leansys_tag_scan(
+        tag_off: u64,
+        tag_len: u64,
+        attr_off: u64,
+        attr_len: u64,
+        buf_len: u64,
+        tag_kind: u8,
+    ) -> u8;
+
+    pub fn leansys_transcript_index(
+        turn_off: u64,
+        turn_len: u64,
+        buf_len: u64,
+        prev_digest: u64,
+        block_hash: u64,
+    ) -> u64;
 }
 
 pub const WAL_MAGIC: u32 = 0x4C53_5953;
@@ -355,6 +389,61 @@ pub fn verify_proc_stat_fields(
     }
 }
 
+#[inline]
+pub fn sse_frame_scan(
+    frame_off: u64,
+    frame_len: u64,
+    chunk_len: u64,
+    field_kind: u8,
+    next_byte: u8,
+) -> bool {
+    unsafe { leansys_sse_frame_scan(frame_off, frame_len, chunk_len, field_kind, next_byte) == 1 }
+}
+
+#[inline]
+pub fn gfm_pipe_scan(
+    row_off: u64,
+    row_len: u64,
+    buf_len: u64,
+    col_count: u32,
+    sep_cols: u32,
+    unterminated_escape: bool,
+) -> bool {
+    unsafe {
+        leansys_gfm_pipe_scan(
+            row_off,
+            row_len,
+            buf_len,
+            col_count,
+            sep_cols,
+            u8::from(unterminated_escape),
+        ) == 1
+    }
+}
+
+#[inline]
+pub fn tag_scan(
+    tag_off: u64,
+    tag_len: u64,
+    attr_off: u64,
+    attr_len: u64,
+    buf_len: u64,
+    tag_kind: u8,
+) -> bool {
+    unsafe { leansys_tag_scan(tag_off, tag_len, attr_off, attr_len, buf_len, tag_kind) == 1 }
+}
+
+#[inline]
+pub fn transcript_index(
+    turn_off: u64,
+    turn_len: u64,
+    buf_len: u64,
+    prev_digest: u64,
+    block_hash: u64,
+) -> u64 {
+    unsafe { leansys_transcript_index(turn_off, turn_len, buf_len, prev_digest, block_hash) }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -430,5 +519,18 @@ mod tests {
 
         assert!(verify_proc_stat_fields(5, 18, 120, 20, 35));
         assert!(!verify_proc_stat_fields(18, 5, 120, 20, 35));
+
+        assert!(sse_frame_scan(4, 12, 64, 2, 0x41));
+        assert!(!sse_frame_scan(4, 12, 64, 2, 0x85));
+
+        assert!(gfm_pipe_scan(0, 24, 64, 3, 3, false));
+        assert!(!gfm_pipe_scan(0, 24, 64, 3, 2, false));
+        assert!(!gfm_pipe_scan(0, 24, 64, 3, 3, true));
+
+        assert!(tag_scan(0, 20, 6, 12, 64, 1));
+        assert!(!tag_scan(0, 20, 6, 18, 64, 1));
+
+        assert_ne!(transcript_index(0, 32, 64, 0x1111, 0x2222), 0);
+        assert_eq!(transcript_index(48, 32, 64, 0x1111, 0x2222), 0);
     }
 }
