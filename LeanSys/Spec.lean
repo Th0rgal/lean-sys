@@ -1132,4 +1132,44 @@ theorem dag_wave_step_rejects_unready_or_overflow (w : DagWaveStepCheck)
     (verifyDagWaveStep w.wave.1 w.wave.2 w.progress.1 w.progress.2 w.workers.1 w.workers.2 == 1) = false :=
   dagWaveStepMetaSpec.rejects_unsafe () w h_bad
 
+/--
+  Unboxed C-ABI iOS Jetsam & App-Extension Dirty-RSS Budget Gate (`leansys_verify_ios_jetsam_budget`):
+  Certifies that an allocation of `allocBytes` on top of `dirtyRssBytes` stays within `maxJetsamBytes`
+  without overflow (`subsliceOk dirtyRssBytes allocBytes maxJetsamBytes`), with non-zero 16 KB
+  page alignment (`0 < allocBytes && pageAlignMask == 16383`) and iOS App Extension cap (`≤ 24 MiB`
+  when `isAppExtension == 1`).
+-/
+@[inline, export leansys_verify_ios_jetsam_budget]
+def verifyIosJetsamBudget (dirtyRssBytes allocBytes maxJetsamBytes pageAlignMask : UInt64)
+    (isAppExtension : UInt8) : UInt8 :=
+  if 0 < allocBytes && pageAlignMask == 16383 &&
+     subsliceOk dirtyRssBytes allocBytes maxJetsamBytes &&
+     isAppExtension ≤ 1 && (isAppExtension == 0 || maxJetsamBytes ≤ 25165824) then 1 else 0
+
+/-- iOS Jetsam & App-Extension dirty-RSS budget check parameters (≤ 3 fields). -/
+structure IosJetsamBudgetCheck where
+  rssBounds      : UInt64 × UInt64
+  limitAndAlign  : UInt64 × UInt64
+  isAppExtension : UInt8
+  deriving Repr, DecidableEq
+
+/-- Layer II Bundle 31: iOS Jetsam & App-Extension dirty-RSS budget gate (`leansys_verify_ios_jetsam_budget`). -/
+def iosJetsamBudgetMetaSpec : MetaGateSpec Unit IosJetsamBudgetCheck where
+  inv _ := True
+  gate _ j := verifyIosJetsamBudget j.rssBounds.1 j.rssBounds.2 j.limitAndAlign.1 j.limitAndAlign.2 j.isAppExtension == 1
+  step _ _ := ()
+  safe _ j := (0 < j.rssBounds.2 && j.limitAndAlign.2 == 16383 &&
+               j.rssBounds.1 ≤ j.limitAndAlign.1 && j.rssBounds.2 ≤ j.limitAndAlign.1 - j.rssBounds.1 &&
+               j.isAppExtension ≤ 1 && (j.isAppExtension == 0 || j.limitAndAlign.1 ≤ 25165824))
+  preserves_inv _ _ _ h := h
+  ensures_safe _ j h := by unfold verifyIosJetsamBudget subsliceOk at h; split at h <;> simp_all
+
+/-- Corollary 31: `verifyIosJetsamBudget` rejects unaligned pages, overflow, or App Extension >24 MiB RSS. -/
+theorem ios_jetsam_budget_rejects_overflow_or_excess (j : IosJetsamBudgetCheck)
+    (h_bad : (0 < j.rssBounds.2 && j.limitAndAlign.2 == 16383 &&
+              j.rssBounds.1 ≤ j.limitAndAlign.1 && j.rssBounds.2 ≤ j.limitAndAlign.1 - j.rssBounds.1 &&
+              j.isAppExtension ≤ 1 && (j.isAppExtension == 0 || j.limitAndAlign.1 ≤ 25165824)) = false) :
+    (verifyIosJetsamBudget j.rssBounds.1 j.rssBounds.2 j.limitAndAlign.1 j.limitAndAlign.2 j.isAppExtension == 1) = false :=
+  iosJetsamBudgetMetaSpec.rejects_unsafe () j h_bad
+
 end LeanSys.Spec

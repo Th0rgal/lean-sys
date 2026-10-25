@@ -126,7 +126,12 @@ def runSelfTest : IO UInt32 := do
                        verifyDagWaveStep 0 0 8 16 4 4 == 0 &&
                        verifyDagWaveStep 0 12 8 16 4 4 == 0 &&
                        verifyDagWaveStep 0 4 8 16 6 4 == 0
-  if !(sbOk && wfOk && casGateOk && httpGateOk && tapeGateOk && ringGateOk && sstGateOk && pollGateOk && rlimGateOk && mixGateOk && ckGateOk && tokGateOk && logGateOk && rpcGateOk && admitGateOk && seqlockGateOk && procStatGateOk && sseGateOk && gfmGateOk && tagGateOk && trIdxGateOk && parChunkGateOk && arenaDisjointGateOk && snapVisGateOk && routeMatchGateOk && triageGateOk && dagWaveGateOk) then
+  let jetsamGateOk := verifyIosJetsamBudget 4194304 65536 134217728 16383 0 == 1 &&
+                      verifyIosJetsamBudget 4194304 65536 25165824 16383 1 == 1 &&
+                      verifyIosJetsamBudget 4194304 65536 33554432 16383 1 == 0 &&
+                      verifyIosJetsamBudget 4194304 65536 134217728 4095 0 == 0 &&
+                      verifyIosJetsamBudget 134217728 65536 134217728 16383 0 == 0
+  if !(sbOk && wfOk && casGateOk && httpGateOk && tapeGateOk && ringGateOk && sstGateOk && pollGateOk && rlimGateOk && mixGateOk && ckGateOk && tokGateOk && logGateOk && rpcGateOk && admitGateOk && seqlockGateOk && procStatGateOk && sseGateOk && gfmGateOk && tagGateOk && trIdxGateOk && parChunkGateOk && arenaDisjointGateOk && snapVisGateOk && routeMatchGateOk && triageGateOk && dagWaveGateOk && jetsamGateOk) then
     IO.eprintln "[lean-sys-core] FAIL: C-ABI Spec gates check failed"
     return 1
 
