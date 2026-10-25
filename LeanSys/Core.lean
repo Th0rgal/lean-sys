@@ -17,6 +17,7 @@ import LeanSys.JsonRpc
 import LeanSys.Http
 import LeanSys.Reactor
 import LeanSys.Sandbox
+import LeanSys.Par
 
 namespace LeanSys.Core
 
@@ -34,6 +35,7 @@ open LeanSys.JsonRpc
 open LeanSys.Http
 open LeanSys.Reactor
 open LeanSys.Sandbox
+open LeanSys.Par
 
 /-- Run the complete `lean-sys-core self-test` suite across all 10 C-ABI gates and 8 runtime modules. -/
 def runSelfTest : IO UInt32 := do
@@ -119,8 +121,24 @@ def runSelfTest : IO UInt32 := do
                       verifyCounterexampleTriage 1 0 0 3 == 1 &&
                       verifyCounterexampleTriage 1 1 0 3 == 0 &&
                       verifyCounterexampleTriage 0 1 0 1 == 0
-  if !(sbOk && wfOk && casGateOk && httpGateOk && tapeGateOk && ringGateOk && sstGateOk && pollGateOk && rlimGateOk && mixGateOk && ckGateOk && tokGateOk && logGateOk && rpcGateOk && admitGateOk && seqlockGateOk && procStatGateOk && sseGateOk && gfmGateOk && tagGateOk && trIdxGateOk && parChunkGateOk && arenaDisjointGateOk && snapVisGateOk && routeMatchGateOk && triageGateOk) then
+  let dagWaveGateOk := verifyDagWaveStep 0 4 8 16 4 4 == 1 &&
+                       verifyDagWaveStep 1 4 8 16 4 4 == 0 &&
+                       verifyDagWaveStep 0 0 8 16 4 4 == 0 &&
+                       verifyDagWaveStep 0 12 8 16 4 4 == 0 &&
+                       verifyDagWaveStep 0 4 8 16 6 4 == 0
+  if !(sbOk && wfOk && casGateOk && httpGateOk && tapeGateOk && ringGateOk && sstGateOk && pollGateOk && rlimGateOk && mixGateOk && ckGateOk && tokGateOk && logGateOk && rpcGateOk && admitGateOk && seqlockGateOk && procStatGateOk && sseGateOk && gfmGateOk && tagGateOk && trIdxGateOk && parChunkGateOk && arenaDisjointGateOk && snapVisGateOk && routeMatchGateOk && triageGateOk && dagWaveGateOk) then
     IO.eprintln "[lean-sys-core] FAIL: C-ABI Spec gates check failed"
+    return 1
+
+  -- 1a. Certified Multi-Threaded Chunk, Slice & DAG Wave Scheduler (`LeanSys.Par`)
+  let parBuf := ByteArray.mk (Array.replicate 4096 (0x5A : UInt8))
+  let parXor := parReduceSlices parBuf 1024 4 (0 : UInt64) (· ^^^ ·) (fun sl => xxh64Slice sl 0)
+  let seqChunks := partitionRange 4096 1024 4
+  let seqXor := seqChunks.foldl (fun acc c =>
+    acc ^^^ xxh64Slice { data := parBuf, off := c.startIdx, len := c.endIdx - c.startIdx } 0) (0 : UInt64)
+  let waveOut ← parMapWave 4 #[10, 20, 30, 40, 50] (fun x => pure (x * 2))
+  if parXor == 0 || parXor != seqXor || seqChunks.size != 4 || waveOut != #[20, 40, 60, 80, 100] then
+    IO.eprintln "[lean-sys-core] FAIL: LeanSys.Par multi-threaded reduction or wave order mismatch"
     return 1
 
   -- 1b. Zero-Copy SSE Frame, GFM Pipe Table, Rich Tag & Transcript Turn Scanners
@@ -321,7 +339,7 @@ def runSelfTest : IO UInt32 := do
       IO.eprintln s!"[lean-sys-core] FAIL: unexpected HTTP response: {respBody}"
       return 1
 
-  IO.println s!"\{ \"ok\": true, \"binary\": \"lean-sys-core\", \"c_abi_gates\": 26, \"wal_torn_recovery\": true, \"cas_hardlink\": true, \"sst_bloom\": true, \"table_range_scan\": true, \"auth_rotation\": true, \"proc_log\": true, \"proc_stat_scanner\": true, \"jsonrpc_2_0\": true, \"shm_ring\": true, \"mmap_seqlock\": true, \"jsonl_tape\": true, \"reactor_keepalive\": true, \"sandbox_rlimit\": true, \"pgid_reaper\": true, \"http_loopback_port\": {boundPort} }"
+  IO.println s!"\{ \"ok\": true, \"binary\": \"lean-sys-core\", \"c_abi_gates\": 27, \"par_scheduler\": true, \"wal_torn_recovery\": true, \"cas_hardlink\": true, \"sst_bloom\": true, \"table_range_scan\": true, \"auth_rotation\": true, \"proc_log\": true, \"proc_stat_scanner\": true, \"jsonrpc_2_0\": true, \"shm_ring\": true, \"mmap_seqlock\": true, \"jsonl_tape\": true, \"reactor_keepalive\": true, \"sandbox_rlimit\": true, \"pgid_reaper\": true, \"http_loopback_port\": {boundPort} }"
   return 0
 
 /-- Run deterministic micro-benchmarks for `lean-sys-core bench` and emit JSON metrics. -/

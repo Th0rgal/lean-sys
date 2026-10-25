@@ -1095,4 +1095,41 @@ theorem counterexample_triage_rejects_inconsistent (c : CounterexampleTriageChec
     (verifyCounterexampleTriage c.flags.1 c.flags.2 c.refDisagreesWithCand c.triageClass == 1) = false :=
   counterexampleTriageMetaSpec.rejects_unsafe () c h_bad
 
+/--
+  Unboxed C-ABI Lock-Free DAG Wave & Work-Stealing Admission Verifier (`leansys_verify_dag_wave_step`):
+  Certifies that a ready wave of `waveSize` tasks has zero unresolved dependencies (`inDegreeSum == 0`),
+  non-empty progress (`0 < waveSize`), bounded worker concurrency (`0 < activeWorkers ≤ maxWorkers`),
+  and overflow-free completion accounting (`subsliceOk completedTasks waveSize totalTasks`).
+-/
+@[inline, export leansys_verify_dag_wave_step]
+def verifyDagWaveStep (inDegreeSum waveSize completedTasks totalTasks activeWorkers maxWorkers : UInt64) : UInt8 :=
+  if inDegreeSum == 0 && 0 < waveSize && subsliceOk completedTasks waveSize totalTasks &&
+     0 < activeWorkers && activeWorkers ≤ maxWorkers then 1 else 0
+
+/-- Lock-free DAG wave admission check parameters (≤ 3 fields). -/
+structure DagWaveStepCheck where
+  wave       : UInt64 × UInt64
+  progress   : UInt64 × UInt64
+  workers    : UInt64 × UInt64
+  deriving Repr, DecidableEq
+
+/-- Layer II Bundle 30: Lock-free DAG wave & work-stealing admission gate (`leansys_verify_dag_wave_step`). -/
+def dagWaveStepMetaSpec : MetaGateSpec Unit DagWaveStepCheck where
+  inv _ := True
+  gate _ w := verifyDagWaveStep w.wave.1 w.wave.2 w.progress.1 w.progress.2 w.workers.1 w.workers.2 == 1
+  step _ _ := ()
+  safe _ w := (w.wave.1 == 0 && 0 < w.wave.2 &&
+               w.progress.1 ≤ w.progress.2 && w.wave.2 ≤ w.progress.2 - w.progress.1 &&
+               0 < w.workers.1 && w.workers.1 ≤ w.workers.2)
+  preserves_inv _ _ _ h := h
+  ensures_safe _ w h := by unfold verifyDagWaveStep subsliceOk at h; split at h <;> simp_all
+
+/-- Corollary 30: `verifyDagWaveStep` rejects waves with unresolved dependencies, empty wave size, task overflow, or invalid worker bounds. -/
+theorem dag_wave_step_rejects_unready_or_overflow (w : DagWaveStepCheck)
+    (h_bad : (w.wave.1 == 0 && 0 < w.wave.2 &&
+              w.progress.1 ≤ w.progress.2 && w.wave.2 ≤ w.progress.2 - w.progress.1 &&
+              0 < w.workers.1 && w.workers.1 ≤ w.workers.2) = false) :
+    (verifyDagWaveStep w.wave.1 w.wave.2 w.progress.1 w.progress.2 w.workers.1 w.workers.2 == 1) = false :=
+  dagWaveStepMetaSpec.rejects_unsafe () w h_bad
+
 end LeanSys.Spec
