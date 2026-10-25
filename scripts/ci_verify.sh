@@ -44,4 +44,15 @@ if grep -rn '^\s*sorry\b' LeanSys/ LeanSys.lean; then
   echo "ERROR: Forbidden 'sorry' found in LeanSys!" >&2
   exit 1
 fi
-echo "[lean-sys] ALL 5 CI GATES PASSED (26/26 tight specs, 17 C-ABI exports, c/lean_sys_shim.c=${SHIM_LOC} LOC, TCB_CLEAN)"
+FORBIDDEN_RE="max""well|certified-""research|research-""governor"
+if git grep -niE "$FORBIDDEN_RE" >/dev/null 2>&1; then
+  echo "ERROR: Forbidden external governor reference found in lean-sys!" >&2
+  git grep -niE "$FORBIDDEN_RE" >&2
+  exit 1
+fi
+DUP_EXPORTS="$(grep -rhoE 'export[[:space:]]+[A-Za-z0-9_]+' LeanSys/ LeanSys.lean | awk '{print $2}' | sort | uniq -d)"
+if [ -n "$DUP_EXPORTS" ]; then
+  echo "ERROR: Duplicate C-ABI @[export] symbols found in LeanSys: $DUP_EXPORTS" >&2
+  exit 1
+fi
+echo "[lean-sys] ALL 5 CI GATES PASSED (36/36 tight specs, 26 C-ABI exports, c/lean_sys_shim.c=${SHIM_LOC} LOC, TCB_CLEAN)"
