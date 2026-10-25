@@ -67,9 +67,13 @@ namespace Db
   abbrev flushAndCompactStore := LeanSys.Lsm.SstTable.flushAndCompactStore
   abbrev openSst := LeanSys.Lsm.SstTable.openSst
   abbrev CompositeKey := LeanSys.Table.CompositeKey
+  abbrev tombstoneMarker := LeanSys.Table.tombstoneMarker
+  abbrev isTombstoneSlice := LeanSys.Table.isTombstoneSlice
   abbrev putComposite := LeanSys.Table.putComposite
+  abbrev deleteComposite := LeanSys.Table.deleteComposite
   abbrev getComposite? := LeanSys.Table.getComposite?
   abbrev rangeScan := LeanSys.Table.rangeScan
+  abbrev rangeScanUpTo := LeanSys.Table.rangeScanUpTo
   abbrev rangeScanSnapshot := LeanSys.Table.rangeScanSnapshot
 end Db
 

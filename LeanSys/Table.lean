@@ -151,7 +151,8 @@ def rangeScanSnapshot (tbl : SstTable) (loKey hiKey : CompositeKey) (maxSnapshot
         let e := es[idx]!
         if hiStr < e.key then break
         match decodeUserKeyAndSeq? e.key with
-        | none => break
+        | none =>
+          idx := idx + 1
         | some (uPrefix, entrySeq) =>
           if uPrefix != groupPrefix then break
           if e.valOff + e.valLen ≤ tbl.rawBuf.size then
