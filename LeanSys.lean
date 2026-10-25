@@ -28,7 +28,7 @@ namespace Par
   abbrev partitionRange := LeanSys.Par.partitionRange
   abbrev parMapChunks {α : Type} [Inhabited α] := @LeanSys.Par.parMapChunks α _
   abbrev parReduceSlices {β : Type} [Inhabited β] := @LeanSys.Par.parReduceSlices β _
-  abbrev parMapWave {α β : Type} := @LeanSys.Par.parMapWave α β
+  abbrev parMapWave {α β : Type} [Inhabited α] := @LeanSys.Par.parMapWave α β _
   abbrev verifyParChunk := LeanSys.Spec.verifyParChunk
   abbrev verifyArenaDisjoint := LeanSys.Spec.verifyArenaDisjoint
   abbrev verifyDagWaveStep := LeanSys.Spec.verifyDagWaveStep

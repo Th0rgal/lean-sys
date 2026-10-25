@@ -135,7 +135,7 @@ def runSelfTest : IO UInt32 := do
   let parXor := parReduceSlices parBuf 1024 4 (0 : UInt64) (· ^^^ ·) (fun sl => xxh64Slice sl 0)
   let seqChunks := partitionRange 4096 1024 4
   let seqXor := seqChunks.foldl (fun acc c =>
-    acc ^^^ xxh64Slice { data := parBuf, off := c.startIdx, len := c.endIdx - c.startIdx } 0) (0 : UInt64)
+    acc ^^^ xxh64Slice { ba := parBuf, off := c.startIdx, len := c.endIdx - c.startIdx } 0) (0 : UInt64)
   let waveOut ← parMapWave 4 #[10, 20, 30, 40, 50] (fun x => pure (x * 2))
   if parXor == 0 || parXor != seqXor || seqChunks.size != 4 || waveOut != #[20, 40, 60, 80, 100] then
     IO.eprintln "[lean-sys-core] FAIL: LeanSys.Par multi-threaded reduction or wave order mismatch"

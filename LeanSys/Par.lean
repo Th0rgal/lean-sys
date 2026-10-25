@@ -59,14 +59,14 @@ def parReduceSlices [Inhabited β] (buf : @& ByteArray) (minGrain maxWorkers : N
   let partials := parMapChunks totalLen minGrain maxWorkers fun c =>
     let len := c.endIdx - c.startIdx
     if verifySliceBounds c.startIdx.toUInt64 len.toUInt64 totalLen.toUInt64 == 1 then
-      mapSlice { data := buf, off := c.startIdx, len := len }
+      mapSlice { ba := buf, off := c.startIdx, len := len }
     else
       init
   partials.foldl op init
 
 /-- Execute a ready DAG wave of `items` (`inDegreeSum = 0`) across bounded parallel worker batches
     (`maxWorkers`), gated by `verifyDagWaveStep`, preserving exact deterministic index order. -/
-def parMapWave (maxWorkers : Nat) (items : Array α) (taskFn : α → IO β) : IO (Array β) := do
+def parMapWave [Inhabited α] (maxWorkers : Nat) (items : Array α) (taskFn : α → IO β) : IO (Array β) := do
   let total := items.size
   if total == 0 then
     return #[]
