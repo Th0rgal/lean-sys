@@ -32,6 +32,9 @@ namespace Core
   abbrev bloomInsert := LeanSys.Hash.bloomInsert
   abbrev bloomContains := LeanSys.Hash.bloomContains
   abbrev verifySliceBounds := LeanSys.Spec.verifySliceBounds
+  abbrev verifyCounterexampleTriage := LeanSys.Spec.verifyCounterexampleTriage
+  abbrev checkCounterexampleTriage := LeanSys.Contracts.checkCounterexampleTriage
+  abbrev CounterexampleTriageInput := LeanSys.Contracts.CounterexampleTriageInput
   abbrev mix64Word := LeanSys.Spec.mix64Word
 end Core
 

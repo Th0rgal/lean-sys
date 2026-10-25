@@ -1053,4 +1053,46 @@ theorem http_route_match_rejects_mismatch_or_oob (r : HttpRouteMatchCheck)
     (verifyHttpRouteMatch r.flags.1 r.flags.2 r.routeIdx r.routeCount == 1) = false :=
   httpRouteMatchMetaSpec.rejects_unsafe () r h_bad
 
+/--
+  Unboxed C-ABI Counterexample Triage Verifier (`leansys_verify_counterexample_triage`):
+  Certifies that a counterexample witness (`hasViolation == 1`) is classified into:
+  - `1 = SpecTooStrong` when `hasMissingHypHint == 1`
+  - `2 = ReferenceDiscrepancy` when `hasMissingHypHint == 0` and `refDisagreesWithCandidate == 1`
+  - `3 = CandidateBug` when `hasMissingHypHint == 0` and `refDisagreesWithCandidate == 0`
+-/
+@[inline, export leansys_verify_counterexample_triage]
+def verifyCounterexampleTriage (hasViolation hasMissingHypHint refDisagreesWithCandidate triageClass : UInt8) : UInt8 :=
+  if hasViolation == 1 &&
+     ((hasMissingHypHint == 1 && triageClass == 1) ||
+      (hasMissingHypHint == 0 && refDisagreesWithCandidate == 1 && triageClass == 2) ||
+      (hasMissingHypHint == 0 && refDisagreesWithCandidate == 0 && triageClass == 3)) then 1 else 0
+
+/-- Counterexample triage check parameters (≤ 3 fields). -/
+structure CounterexampleTriageCheck where
+  flags                    : UInt8 × UInt8
+  refDisagreesWithCand     : UInt8
+  triageClass              : UInt8
+  deriving Repr, DecidableEq
+
+/-- Layer II Bundle 29: Counterexample triage consistency gate (`leansys_verify_counterexample_triage`). -/
+def counterexampleTriageMetaSpec : MetaGateSpec Unit CounterexampleTriageCheck where
+  inv _ := True
+  gate _ c := verifyCounterexampleTriage c.flags.1 c.flags.2 c.refDisagreesWithCand c.triageClass == 1
+  step _ _ := ()
+  safe _ c := (c.flags.1 == 1 &&
+               ((c.flags.2 == 1 && c.triageClass == 1) ||
+                (c.flags.2 == 0 && c.refDisagreesWithCand == 1 && c.triageClass == 2) ||
+                (c.flags.2 == 0 && c.refDisagreesWithCand == 0 && c.triageClass == 3)))
+  preserves_inv _ _ _ h := h
+  ensures_safe _ c h := by unfold verifyCounterexampleTriage at h; split at h <;> simp_all
+
+/-- Corollary 29: `verifyCounterexampleTriage` rejects inconsistent counterexample triage classifications. -/
+theorem counterexample_triage_rejects_inconsistent (c : CounterexampleTriageCheck)
+    (h_bad : (c.flags.1 == 1 &&
+              ((c.flags.2 == 1 && c.triageClass == 1) ||
+               (c.flags.2 == 0 && c.refDisagreesWithCand == 1 && c.triageClass == 2) ||
+               (c.flags.2 == 0 && c.refDisagreesWithCand == 0 && c.triageClass == 3))) = false) :
+    (verifyCounterexampleTriage c.flags.1 c.flags.2 c.refDisagreesWithCand c.triageClass == 1) = false :=
+  counterexampleTriageMetaSpec.rejects_unsafe () c h_bad
+
 end LeanSys.Spec

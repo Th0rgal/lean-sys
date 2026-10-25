@@ -114,7 +114,12 @@ def runSelfTest : IO UInt32 := do
                           verifyHttpRouteMatch 1 0 0 4 == 0 &&
                           verifyHttpRouteMatch 1 1 4 4 == 0 &&
                           verifyHttpRouteMatch 1 1 0 65 == 0
-  if !(sbOk && wfOk && casGateOk && httpGateOk && tapeGateOk && ringGateOk && sstGateOk && pollGateOk && rlimGateOk && mixGateOk && ckGateOk && tokGateOk && logGateOk && rpcGateOk && admitGateOk && seqlockGateOk && procStatGateOk && sseGateOk && gfmGateOk && tagGateOk && trIdxGateOk && parChunkGateOk && arenaDisjointGateOk && snapVisGateOk && routeMatchGateOk) then
+  let triageGateOk := verifyCounterexampleTriage 1 1 0 1 == 1 &&
+                      verifyCounterexampleTriage 1 0 1 2 == 1 &&
+                      verifyCounterexampleTriage 1 0 0 3 == 1 &&
+                      verifyCounterexampleTriage 1 1 0 3 == 0 &&
+                      verifyCounterexampleTriage 0 1 0 1 == 0
+  if !(sbOk && wfOk && casGateOk && httpGateOk && tapeGateOk && ringGateOk && sstGateOk && pollGateOk && rlimGateOk && mixGateOk && ckGateOk && tokGateOk && logGateOk && rpcGateOk && admitGateOk && seqlockGateOk && procStatGateOk && sseGateOk && gfmGateOk && tagGateOk && trIdxGateOk && parChunkGateOk && arenaDisjointGateOk && snapVisGateOk && routeMatchGateOk && triageGateOk) then
     IO.eprintln "[lean-sys-core] FAIL: C-ABI Spec gates check failed"
     return 1
 
@@ -132,9 +137,9 @@ def runSelfTest : IO UInt32 := do
     return 1
 
   -- 2. Zero-Copy JSONL Tape Codec & 64-Bit Word-Strided Hash (`LeanSys.Codec` & `LeanSys.Hash`)
-  let sampleJson := ByteSlice.ofString "{\"schema\":\"certified-research.telemetry.v1\",\"event_id\":\"ev-900\",\"tokens_used\":4200,\"verified\":true}"
+  let sampleJson := ByteSlice.ofString "{\"schema\":\"lean-sys.telemetry.v1\",\"event_id\":\"ev-900\",\"tokens_used\":4200,\"verified\":true}"
   let tape := JsonTape.indexJsonObject sampleJson
-  if JsonTape.lookupString? tape "schema" != some "certified-research.telemetry.v1" ||
+  if JsonTape.lookupString? tape "schema" != some "lean-sys.telemetry.v1" ||
      JsonTape.lookupString? tape "event_id" != some "ev-900" ||
      JsonTape.lookupNat? tape "tokens_used" != some 4200 ||
      JsonTape.lookupBool? tape "verified" != some true then
@@ -316,7 +321,7 @@ def runSelfTest : IO UInt32 := do
       IO.eprintln s!"[lean-sys-core] FAIL: unexpected HTTP response: {respBody}"
       return 1
 
-  IO.println s!"\{ \"ok\": true, \"binary\": \"lean-sys-core\", \"c_abi_gates\": 25, \"wal_torn_recovery\": true, \"cas_hardlink\": true, \"sst_bloom\": true, \"table_range_scan\": true, \"auth_rotation\": true, \"proc_log\": true, \"proc_stat_scanner\": true, \"jsonrpc_2_0\": true, \"shm_ring\": true, \"mmap_seqlock\": true, \"jsonl_tape\": true, \"reactor_keepalive\": true, \"sandbox_rlimit\": true, \"pgid_reaper\": true, \"http_loopback_port\": {boundPort} }"
+  IO.println s!"\{ \"ok\": true, \"binary\": \"lean-sys-core\", \"c_abi_gates\": 26, \"wal_torn_recovery\": true, \"cas_hardlink\": true, \"sst_bloom\": true, \"table_range_scan\": true, \"auth_rotation\": true, \"proc_log\": true, \"proc_stat_scanner\": true, \"jsonrpc_2_0\": true, \"shm_ring\": true, \"mmap_seqlock\": true, \"jsonl_tape\": true, \"reactor_keepalive\": true, \"sandbox_rlimit\": true, \"pgid_reaper\": true, \"http_loopback_port\": {boundPort} }"
   return 0
 
 /-- Run deterministic micro-benchmarks for `autoresearch/sys_arena.py` and emit JSON metrics. -/
@@ -338,7 +343,7 @@ def runBench (iters : Nat := 2000) : IO UInt32 := do
   let hashMbPerSec := (iters * 4096 * 1000) / hashNs
 
   -- 2. Zero-Copy JsonTape parse + lookup throughput
-  let sampleLine := ByteSlice.ofString "{\"schema\":\"certified-research.telemetry.v1\",\"event_id\":\"ev-bench-001\",\"goal_class\":\"lean_sys_parity\",\"tokens_used\":4800,\"verified\":true}"
+  let sampleLine := ByteSlice.ofString "{\"schema\":\"lean-sys.telemetry.v1\",\"event_id\":\"ev-bench-001\",\"goal_class\":\"lean_sys_parity\",\"tokens_used\":4800,\"verified\":true}"
   let tCodec0 ← IO.monoNanosNow
   let mut tokSum : Nat := 0
   for _ in [0:iters] do

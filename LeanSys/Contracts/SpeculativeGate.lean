@@ -36,7 +36,7 @@ theorem speculative_gate_complete {Goal Cert : Type}
     evalWithUntrustedAccelerator accel kernelVerifyCert kernelFallback g = true := by
   unfold evalWithUntrustedAccelerator; split <;> simp_all
 
-/-- Universal Speculative Gate combinator for artifact/code transformations (`lean-native` / `maxwell` pattern). -/
+/-- Universal Speculative Gate combinator for artifact/code transformations (`lean-native` pattern). -/
 @[inline] def evalWithUntrustedOptPlugin {Decl Cert : Type}
     (plugin : Decl → Option (Decl × Cert)) (verifyGate : Decl → Decl → Cert → Bool) (d : Decl) : Decl :=
   match plugin d with

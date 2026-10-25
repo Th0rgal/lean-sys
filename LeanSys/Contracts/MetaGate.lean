@@ -5,7 +5,7 @@
 namespace LeanSys.Contracts
 
 /-- Universal 4-property Meta-Gate specification bundle proving soundness, completeness,
-    non-vacuity, and tightness across `lean-sys`, `turbo-lean`, `lean-native`, and `maxwell`. -/
+    non-vacuity, and tightness across `lean-sys`, `turbo-lean`, and `lean-native`. -/
 structure MetaGateSpec (Input : Type) (Safe : Input → Prop) where
   gate       : Input → Bool
   sound      : ∀ x, gate x = true → Safe x
