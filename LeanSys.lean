@@ -24,11 +24,6 @@ namespace LeanSys
 
 /-! ## Zero-lock multi-threaded chunk, slice, and DAG wave scheduler (`LeanSys.Par`) -/
 namespace Par
-  abbrev ChunkSpan := LeanSys.Par.ChunkSpan
-  abbrev partitionRange := LeanSys.Par.partitionRange
-  abbrev parMapChunks {α : Type} [Inhabited α] := @LeanSys.Par.parMapChunks α _
-  abbrev parReduceSlices {β : Type} [Inhabited β] := @LeanSys.Par.parReduceSlices β _
-  abbrev parMapWave {α β : Type} [Inhabited α] := @LeanSys.Par.parMapWave α β _
   abbrev verifyParChunk := LeanSys.Spec.verifyParChunk
   abbrev verifyArenaDisjoint := LeanSys.Spec.verifyArenaDisjoint
   abbrev verifyDagWaveStep := LeanSys.Spec.verifyDagWaveStep
