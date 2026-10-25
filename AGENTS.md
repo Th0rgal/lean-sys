@@ -5,7 +5,7 @@
 `lean-sys` is the **Verified Systems, Storage, and Wire Runtime Foundation** (`0 import Lean`, `0 sorryAx`, `libleanrt.a`-only) for the Lean 4 verification, native compilation, and orchestration stack:
 
 - **`lean-sys` (`Th0rgal/lean-sys` — Verified POSIX, Crash-Atomic WAL/CAS, Composite-Key Table, Token Auth, Sliding-Window Log & HTTP/JSON-RPC Runtime)**:
-  Provides <!-- inventory:leansys_cabi -->28<!-- /inventory:leansys_cabi --> unboxed C-ABI safety gates (`LeanSys/Spec.lean` + `LeanSys/Gate.lean`), a leaf-only C shim (`c/lean_sys_shim.c`, `<!-- inventory:leansys_shim_loc -->70<!-- /inventory:leansys_shim_loc --> LOC ≤ 65 LOC`), zero-copy borrowed `ByteSlice` views, bracketed POSIX descriptors (`Fd`, `DirLock`, `ChildGroup` `-pgid` reaper), a crash-atomic append-only WAL + hardlinked CAS (`LeanSys/Store.lean`), composite-key range & secondary-index tables (`LeanSys/Table.lean`), token-rotation/revocation/expiry auth (`LeanSys/Auth.lean`), sliding-window stdout/stderr tail log rings (`LeanSys/ProcLog.lean`), zero-copy JSON-RPC 2.0 envelope codecs (`LeanSys/JsonRpc.lean`), and a zero-copy bounded HTTP/1.1 engine (`LeanSys/Http.lean`).
+  Provides <!-- inventory:leansys_cabi -->29<!-- /inventory:leansys_cabi --> unboxed C-ABI safety gates (`LeanSys/Spec.lean` + `LeanSys/Gate.lean`), a leaf-only C shim (`c/lean_sys_shim.c`, `<!-- inventory:leansys_shim_loc -->63<!-- /inventory:leansys_shim_loc --> LOC ≤ 65 LOC`), zero-copy borrowed `ByteSlice` views, bracketed POSIX descriptors (`Fd`, `DirLock`, `ChildGroup` `-pgid` reaper), a crash-atomic append-only WAL + hardlinked CAS (`LeanSys/Store.lean`), composite-key range & secondary-index tables (`LeanSys/Table.lean`), token-rotation/revocation/expiry auth (`LeanSys/Auth.lean`), sliding-window stdout/stderr tail log rings (`LeanSys/ProcLog.lean`), zero-copy JSON-RPC 2.0 envelope codecs (`LeanSys/JsonRpc.lean`), and a zero-copy bounded HTTP/1.1 engine (`LeanSys/Http.lean`).
 - **`turbo-lean` (`Th0rgal/turbo-lean` — Incremental Verification, `LeanNative` Compiler, Zygote Elaboration & Spec Auditor)**:
   Unifies the incremental verification oracle (`TurboLean`) and the verified `LNIR` native/SIMD/GPU/TPU compiler (`LeanNative`). Links `lean-sys` C-ABI gates (`leansys_verify_*`, `leansys_check_http_bounds`, `leansys_gate_admit`, `leansys_mix64_word`, `leansys_verify_counterexample_triage`) into `TurboLean/ShmIpc.lean` and `crates/turbo-lean/src/c_abi.rs`, while `LeanNative` remains focused on pure numeric/tensor/ISA codegen and relies on `lean-sys` whenever compiled native Lean 4 programs interact with the OS (storage, IPC, networking, or process sandboxing).
 - **`orb` (`Th0rgal/sandboxed.sh` — Formal Orchestration & Node Lifecycle Kernel)**:
@@ -35,25 +35,25 @@ Wire / Disk I/O ──► Stage 0: Unboxed C-ABI Bounds & Auth Gate (`LeanSys/Sp
 
 4. **Strict TCB & Dependency Hygiene (`c/lean_sys_shim.c ≤ 65 LOC`, `0 import Lean`)**:
    - `lean-sys-core` must link **only** against `libleanrt.a` and standard POSIX `libc` (`supportInterpreter := false`).
-   - **Zero `import Lean`**, **zero `libsqlite3`**, **zero `libcurl`/`libssl`**, and **zero parsing or allocation logic in C**. The C shim (`<!-- inventory:leansys_shim_loc -->70<!-- /inventory:leansys_shim_loc --> LOC`) is restricted to leaf POSIX syscall wrappers.
+   - **Zero `import Lean`**, **zero `libsqlite3`**, **zero `libcurl`/`libssl`**, and **zero parsing or allocation logic in C**. The C shim (`<!-- inventory:leansys_shim_loc -->63<!-- /inventory:leansys_shim_loc --> LOC`) is restricted to leaf POSIX syscall wrappers.
 
 5. **Mathlib4 Algebraic Proof Style**:
    Proofs in `LeanSys/Spec.lean` must use concise algebraic idioms (`split <;> simp_all`, `simpa`, `omega`, induction with single-line branches). Verbose `cases <;> cases` trees are forbidden.
 
 6. **LOC & Trust-Surface Ratchet ($\Delta\text{LOC}_{\text{C}} \le 0$)**:
-   Every feature addition or optimization must preserve or shrink the C shim footprint (`<!-- inventory:leansys_shim_loc -->70<!-- /inventory:leansys_shim_loc --> LOC ≤ 65 LOC`) and generalize Layer I combinators in `LeanSys/Spec.lean` rather than accreting ad-hoc parsers or unsafe FFI glue.
+   Every feature addition or optimization must preserve or shrink the C shim footprint (`<!-- inventory:leansys_shim_loc -->63<!-- /inventory:leansys_shim_loc --> LOC ≤ 65 LOC`) and generalize Layer I combinators in `LeanSys/Spec.lean` rather than accreting ad-hoc parsers or unsafe FFI glue.
 
 7. **Doc & Context Ratchet (`--sync-docs`)**:
-   Any commit that changes theorems, tight specs, or C-ABI exports must keep `README.md` and `AGENTS.md` aligned with the verified inventory (<!-- inventory:leansys_summary -->38/38 tight specs (36 in Spec.lean + 2 in Hash.lean + 2 in Gate.lean, 28 C-ABI exports, c/lean_sys_shim.c=70 LOC, 0 sorryAx)<!-- /inventory:leansys_summary -->). `./scripts/ci_verify.sh --sync-docs` enforces that check.
+   Any commit that changes theorems, tight specs, or C-ABI exports must keep `README.md` and `AGENTS.md` aligned with the verified inventory (<!-- inventory:leansys_summary -->39/39 tight specs (37 in Spec.lean + 2 in Hash.lean + 2 in Gate.lean, 29 C-ABI exports, c/lean_sys_shim.c=63 LOC, 0 sorryAx)<!-- /inventory:leansys_summary -->). `./scripts/ci_verify.sh --sync-docs` enforces that check.
 
 ---
 
 ## 3. Repository Layout & Verification Entrypoints
 
-- **Formal Systems Specifications & <!-- inventory:leansys_cabi -->28<!-- /inventory:leansys_cabi --> C-ABI Gates**: [`LeanSys/Spec.lean`](LeanSys/Spec.lean), [`LeanSys/Gate.lean`](LeanSys/Gate.lean), [`LeanSys/Contracts/MetaGate.lean`](LeanSys/Contracts/MetaGate.lean), [`LeanSys/Contracts/SpeculativeGate.lean`](LeanSys/Contracts/SpeculativeGate.lean) (`<!-- inventory:leansys_total_tight -->38<!-- /inventory:leansys_total_tight -->/<!-- inventory:leansys_total_tight -->38<!-- /inventory:leansys_total_tight --> non_vacuous_and_tight`, `<!-- inventory:leansys_cabi -->28<!-- /inventory:leansys_cabi -->` C-ABI exports)
+- **Formal Systems Specifications & <!-- inventory:leansys_cabi -->29<!-- /inventory:leansys_cabi --> C-ABI Gates**: [`LeanSys/Spec.lean`](LeanSys/Spec.lean), [`LeanSys/Gate.lean`](LeanSys/Gate.lean), [`LeanSys/Contracts/MetaGate.lean`](LeanSys/Contracts/MetaGate.lean), [`LeanSys/Contracts/SpeculativeGate.lean`](LeanSys/Contracts/SpeculativeGate.lean) (`<!-- inventory:leansys_total_tight -->39<!-- /inventory:leansys_total_tight -->/<!-- inventory:leansys_total_tight -->39<!-- /inventory:leansys_total_tight --> non_vacuous_and_tight`, `<!-- inventory:leansys_cabi -->29<!-- /inventory:leansys_cabi -->` C-ABI exports)
 - **64-Bit Word-Strided Hash (`xxh64Slice`) & 3-Probe Bloom Filter**: [`LeanSys/Hash.lean`](LeanSys/Hash.lean) (`or_and_self`, `bloom_no_false_negative`)
 - **Zero-Copy JSON/JSONL Tape Indexer (`JsonTape`)**: [`LeanSys/Codec.lean`](LeanSys/Codec.lean)
-- **Leaf POSIX C Shim (`<!-- inventory:leansys_shim_loc -->70<!-- /inventory:leansys_shim_loc --> LOC`) & Typed FFI**: [`c/lean_sys_shim.c`](c/lean_sys_shim.c), [`LeanSys/Posix.lean`](LeanSys/Posix.lean)
+- **Leaf POSIX C Shim (`<!-- inventory:leansys_shim_loc -->63<!-- /inventory:leansys_shim_loc --> LOC`) & Typed FFI**: [`c/lean_sys_shim.c`](c/lean_sys_shim.c), [`LeanSys/Posix.lean`](LeanSys/Posix.lean)
 - **Crash-Atomic WAL (`putBatch` Group-Commit) & Hardlinked CAS**: [`LeanSys/Store.lean`](LeanSys/Store.lean)
 - **Composite-Key Range Scans & Secondary Index Table (`IndexedTable`)**: [`LeanSys/Table.lean`](LeanSys/Table.lean)
 - **Token Rotation, Revocation Generation & Expiry Auth (`TokenVerifier`)**: [`LeanSys/Auth.lean`](LeanSys/Auth.lean)
@@ -89,4 +89,4 @@ nm -u .lake/build/bin/lean-sys-core | grep -E 'lean_elab|lean_environment|sqlite
 2. **Layer 2 — Lexicographic Objective (`J_sys`)**:
    - **Primary**: Maximize I/O & RPC throughput geomean $\text{Geomean}(\text{Throughput}_{\text{WAL}}, \text{Throughput}_{\text{CAS}}, \text{Req/s}_{\text{HTTP/IPC}})$ and minimize tail latency $\text{p99}_{\mu\text{s}}$.
    - **Secondary**: Minimize heap allocations per request (`alloc_bytes / op`) and stripped binary size (`< 2.5 MB`).
-   - **Resource Envelope**: $\text{LOC}(\text{c/lean\_sys\_shim.c}) \le 65$ (`<!-- inventory:leansys_shim_loc -->70<!-- /inventory:leansys_shim_loc --> LOC`), $\text{FD}_{\text{leaked}} = 0$, $\text{OrphanProcesses} = 0$, and $\Delta\text{LOC} \le 0$.
+   - **Resource Envelope**: $\text{LOC}(\text{c/lean\_sys\_shim.c}) \le 65$ (`<!-- inventory:leansys_shim_loc -->63<!-- /inventory:leansys_shim_loc --> LOC`), $\text{FD}_{\text{leaked}} = 0$, $\text{OrphanProcesses} = 0$, and $\Delta\text{LOC} \le 0$.

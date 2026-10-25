@@ -1172,4 +1172,42 @@ theorem ios_jetsam_budget_rejects_overflow_or_excess (j : IosJetsamBudgetCheck)
     (verifyIosJetsamBudget j.rssBounds.1 j.rssBounds.2 j.limitAndAlign.1 j.limitAndAlign.2 j.isAppExtension == 1) = false :=
   iosJetsamBudgetMetaSpec.rejects_unsafe () j h_bad
 
+/--
+  Unboxed C-ABI Bounded Worker Pool & Asymmetric P/E-Core Micro-Chunk Gate (`leansys_verify_worker_budget`):
+  Certifies that `0 < activeWorkers ≤ maxWorkers ≤ 64`, `0 < totalLen`, `activeWorkers ≤ microChunks ≤ maxWorkers * 8`,
+  and on mobile heterogeneous SoCs (`isMobileHetero == 1`, e.g. Apple A15 2P+4E), `maxWorkers ≤ 6`.
+-/
+@[inline, export leansys_verify_worker_budget]
+def verifyWorkerBudget (activeWorkers maxWorkers microChunks totalLen : UInt64)
+    (isMobileHetero : UInt8) : UInt8 :=
+  if 0 < activeWorkers && activeWorkers ≤ maxWorkers && maxWorkers ≤ 64 &&
+     0 < totalLen && activeWorkers ≤ microChunks && microChunks ≤ maxWorkers * 8 &&
+     isMobileHetero ≤ 1 && (isMobileHetero == 0 || maxWorkers ≤ 6) then 1 else 0
+
+/-- Bounded worker pool & P/E micro-chunk check parameters (≤ 3 fields). -/
+structure WorkerBudgetCheck where
+  workers        : UInt64 × UInt64
+  chunksAndTotal : UInt64 × UInt64
+  isMobileHetero : UInt8
+  deriving Repr, DecidableEq
+
+/-- Layer II Bundle 32: Bounded worker pool & P/E micro-chunk admission gate (`leansys_verify_worker_budget`). -/
+def workerBudgetMetaSpec : MetaGateSpec Unit WorkerBudgetCheck where
+  inv _ := True
+  gate _ b := verifyWorkerBudget b.workers.1 b.workers.2 b.chunksAndTotal.1 b.chunksAndTotal.2 b.isMobileHetero == 1
+  step _ _ := ()
+  safe _ b := (0 < b.workers.1 && b.workers.1 ≤ b.workers.2 && b.workers.2 ≤ 64 &&
+               0 < b.chunksAndTotal.2 && b.workers.1 ≤ b.chunksAndTotal.1 && b.chunksAndTotal.1 ≤ b.workers.2 * 8 &&
+               b.isMobileHetero ≤ 1 && (b.isMobileHetero == 0 || b.workers.2 ≤ 6))
+  preserves_inv _ _ _ h := h
+  ensures_safe _ b h := by unfold verifyWorkerBudget at h; split at h <;> simp_all
+
+/-- Corollary 32: `verifyWorkerBudget` rejects unbounded worker pools, empty work, excessive micro-chunks, or >6 mobile threads. -/
+theorem worker_budget_rejects_unbounded_or_overflow (b : WorkerBudgetCheck)
+    (h_bad : (0 < b.workers.1 && b.workers.1 ≤ b.workers.2 && b.workers.2 ≤ 64 &&
+              0 < b.chunksAndTotal.2 && b.workers.1 ≤ b.chunksAndTotal.1 && b.chunksAndTotal.1 ≤ b.workers.2 * 8 &&
+              b.isMobileHetero ≤ 1 && (b.isMobileHetero == 0 || b.workers.2 ≤ 6)) = false) :
+    (verifyWorkerBudget b.workers.1 b.workers.2 b.chunksAndTotal.1 b.chunksAndTotal.2 b.isMobileHetero == 1) = false :=
+  workerBudgetMetaSpec.rejects_unsafe () b h_bad
+
 end LeanSys.Spec

@@ -131,18 +131,25 @@ def runSelfTest : IO UInt32 := do
                       verifyIosJetsamBudget 4194304 65536 33554432 16383 1 == 0 &&
                       verifyIosJetsamBudget 4194304 65536 134217728 4095 0 == 0 &&
                       verifyIosJetsamBudget 134217728 65536 134217728 16383 0 == 0
-  if !(sbOk && wfOk && casGateOk && httpGateOk && tapeGateOk && ringGateOk && sstGateOk && pollGateOk && rlimGateOk && mixGateOk && ckGateOk && tokGateOk && logGateOk && rpcGateOk && admitGateOk && seqlockGateOk && procStatGateOk && sseGateOk && gfmGateOk && tagGateOk && trIdxGateOk && parChunkGateOk && arenaDisjointGateOk && snapVisGateOk && routeMatchGateOk && triageGateOk && dagWaveGateOk && jetsamGateOk) then
+  let workerGateOk := verifyWorkerBudget 4 6 24 4096 1 == 1 &&
+                      verifyWorkerBudget 4 8 24 4096 1 == 0 &&
+                      verifyWorkerBudget 4 8 24 4096 0 == 1 &&
+                      verifyWorkerBudget 0 6 24 4096 1 == 0
+  if !(sbOk && wfOk && casGateOk && httpGateOk && tapeGateOk && ringGateOk && sstGateOk && pollGateOk && rlimGateOk && mixGateOk && ckGateOk && tokGateOk && logGateOk && rpcGateOk && admitGateOk && seqlockGateOk && procStatGateOk && sseGateOk && gfmGateOk && tagGateOk && trIdxGateOk && parChunkGateOk && arenaDisjointGateOk && snapVisGateOk && routeMatchGateOk && triageGateOk && dagWaveGateOk && jetsamGateOk && workerGateOk) then
     IO.eprintln "[lean-sys-core] FAIL: C-ABI Spec gates check failed"
     return 1
 
-  -- 1a. Certified Multi-Threaded Chunk, Slice & DAG Wave Scheduler (`LeanSys.Par`)
+  -- 1a. Certified Multi-Threaded Chunk, Slice, Micro-Chunk & DAG Wave Scheduler (`LeanSys.Par`)
   let parBuf := ByteArray.mk (Array.replicate 4096 (0x5A : UInt8))
   let parXor := parReduceSlices parBuf 1024 4 (0 : UInt64) (· ^^^ ·) (fun sl => xxh64Slice sl sl.off.toUInt64)
   let seqChunks := partitionRange 4096 1024 4
   let seqXor := seqChunks.foldl (fun acc c =>
     acc ^^^ xxh64Slice { ba := parBuf, off := c.startIdx, len := c.endIdx - c.startIdx } c.startIdx.toUInt64) (0 : UInt64)
   let waveOut ← parMapWave 4 #[10, 20, 30, 40, 50] (fun x => pure (x * 2))
-  if parXor == 0 || parXor != seqXor || seqChunks.size != 4 || waveOut != #[20, 40, 60, 80, 100] then
+  let microOut ← parMapMicroChunks 4096 { maxWorkers := 6, microChunkFactor := 4, minGrain := 256, isMobileHetero := true }
+    (fun c => pure (c.endIdx - c.startIdx))
+  let microSum := microOut.foldl (· + ·) 0
+  if parXor == 0 || parXor != seqXor || seqChunks.size != 4 || waveOut != #[20, 40, 60, 80, 100] || microSum != 4096 then
     IO.eprintln "[lean-sys-core] FAIL: LeanSys.Par multi-threaded reduction or wave order mismatch"
     return 1
 
@@ -213,8 +220,13 @@ def runSelfTest : IO UInt32 := do
     | do IO.eprintln "[lean-sys-core] FAIL: SstTable.flushFromStore"; return 1
   let .ok sstOpened ← SstTable.openSst sstPath
     | do IO.eprintln "[lean-sys-core] FAIL: SstTable.openSst"; return 1
+  let .ok sstLazy ← SstTable.openSstLazy sstPath
+    | do IO.eprintln "[lean-sys-core] FAIL: SstTable.openSstLazy"; return 1
+  let lazyAlpha ← SstTable.getLazyIO? sstLazy "alpha"
   if SstTable.getString? sstOpened "alpha" != some "value-alpha-1" ||
      SstTable.getString? sstOpened "gamma" != some "value-gamma-3" ||
+     lazyAlpha.map String.fromUTF8! != some "value-alpha-1" ||
+     sstLazy.rawBuf.size != 0 ||
      (SstTable.getString? sstOpened "nonexistent-key").isSome then
     IO.eprintln "[lean-sys-core] FAIL: SstTable Bloom/binary-search lookup mismatch"
     return 1

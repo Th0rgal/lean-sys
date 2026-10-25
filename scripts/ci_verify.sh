@@ -32,8 +32,8 @@ if nm -u .lake/build/bin/lean-sys-core | grep -E 'lean_elab|lean_environment|sql
   exit 1
 fi
 SHIM_LOC="$(wc -l < c/lean_sys_shim.c | tr -d ' ')"
-if [ "$SHIM_LOC" -gt 70 ]; then
-  echo "ERROR: c/lean_sys_shim.c has $SHIM_LOC lines (> 70 LOC cap)!" >&2
+if [ "$SHIM_LOC" -gt 65 ]; then
+  echo "ERROR: c/lean_sys_shim.c has $SHIM_LOC lines (> 65 LOC cap)!" >&2
   exit 1
 fi
 if grep -rn '^import Lean\b' LeanSys/ LeanSys.lean; then

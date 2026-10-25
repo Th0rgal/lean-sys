@@ -164,6 +164,43 @@ def getSlice? (tbl : SstTable) (key : String) : Option ByteSlice :=
 def getString? (tbl : SstTable) (key : String) : Option String :=
   (get? tbl key).map ByteSlice.toStringLossy
 
+/-- Open an SST file in zero-value-RAM mode (`rawBuf := ByteArray.empty`), retaining only the
+    verified index directory + Bloom filter mask so mobile/iOS callers under Jetsam limits never
+    hold value pages in dirty heap memory. -/
+def openSstLazy (sstPath : String) : IO (SysResult SstTable) := do
+  match ← openSst sstPath with
+  | .error e => pure (.error e)
+  | .ok tbl => pure (.ok { tbl with rawBuf := ByteArray.empty })
+
+/-- Lookup a value by `key` in `SstTable`, using in-memory `rawBuf` when resident or lazy `preadByteArray`
+    when opened via `openSstLazy`. -/
+def getLazyIO? (tbl : SstTable) (key : String) : IO (Option ByteArray) := do
+  if !bloomContains tbl.bloomMask (xxh64String key) then
+    return none
+  let es := tbl.entries
+  let mut lo : Nat := 0
+  let mut hi : Nat := es.size
+  let mut found? : Option SstIndexEntry := none
+  while lo < hi do
+    let mid := (lo + hi) >>> 1
+    let e := es[mid]!
+    if e.key == key then
+      found? := some e
+      lo := hi
+    else if e.key < key then lo := mid + 1
+    else hi := mid
+  match found? with
+  | none => return none
+  | some e =>
+    if e.valOff + e.valLen ≤ tbl.rawBuf.size then
+      return some (tbl.rawBuf.extract e.valOff (e.valOff + e.valLen))
+    else
+      match ← withFd tbl.path 0 (fun fd => do
+        let b ← preadByteArray fd e.valOff.toUInt64 e.valLen
+        pure (.ok b)) with
+      | .ok b => return if b.size == e.valLen then some b else none
+      | .error _ => return none
+
 /-- Atomically flush `st` into a sorted SST file at `sstPath` and compact the WAL,
     returning the compacted `(Store.Handle × SstTable)` pair. -/
 def flushAndCompactStore (st : Store.Handle) (sstPath : String) : IO (SysResult (Store.Handle × SstTable)) := do

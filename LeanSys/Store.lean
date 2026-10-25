@@ -259,15 +259,14 @@ def get? (h : Handle) (key : String) : Option ByteArray :=
 def getString? (h : Handle) (key : String) : Option String :=
   (h.kv.get? key).map String.fromUTF8!
 
-/-- Atomically compact the WAL by writing live keys to `state.wal.tmp`, `fsync`ing, and `rename`ing over `state.wal`. -/
+/-- Atomically compact the WAL in O(N) single-allocation pass by pre-calculating total frame bytes,
+    encoding live keys in-place into `state.wal.compact.tmp`, `fsync`ing, and `rename`ing over `state.wal`. -/
 def compact (h : Handle) : IO (SysResult Handle) := do
   withDirLock h.lockPath false fun _ => do
     let tmpPath := h.walPath ++ ".compact.tmp"
-    let mut compacted := ByteArray.empty
-    let mut count := 0
-    for (k, v) in h.kv.toList do
-      compacted := compacted ++ encodeWalKVFrame k (ByteSlice.ofByteArray v)
-      count := count + 1
+    let (cap, count) := h.kv.fold (fun (c, n) k v => (c + 20 + k.utf8ByteSize + v.size, n + 1)) (0, 0)
+    let compacted := h.kv.fold (fun buf k v => encodeFrame buf k.toUTF8 (ByteSlice.ofByteArray v))
+      (ByteArray.emptyWithCapacity cap)
     match ← withFd tmpPath 4 (fun fd => writeAll fd compacted true) with
     | .error e => pure (.error e)
     | .ok _ =>

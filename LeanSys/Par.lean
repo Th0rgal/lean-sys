@@ -16,33 +16,44 @@ structure ChunkSpan where
   endIdx   : Nat
   deriving Repr, DecidableEq, Inhabited
 
+/-- Bounded worker pool & micro-chunk configuration (calibrated for heterogeneous P/E cores such as Apple A15 2P+4E). -/
+structure WorkerBudget where
+  maxWorkers       : Nat  := 6
+  microChunkFactor : Nat  := 4
+  minGrain         : Nat  := 64
+  isMobileHetero   : Bool := false
+  deriving Repr, DecidableEq, Inhabited
+
+/-- Closed-form remainder-balanced partition of `[0, totalLen)` into `k = min totalLen numChunks`
+    disjoint chunks where chunk `i` has length `totalLen / k + (if i < totalLen % k then 1 else 0)`,
+    certified by `verifyParChunk` and `verifyArenaDisjoint`. -/
+def partitionRangeBalanced (totalLen minGrain numChunks : Nat) : Array ChunkSpan := Id.run do
+  if totalLen == 0 then
+    return #[]
+  let maxByGrain := Nat.max 1 (totalLen / Nat.max 1 minGrain)
+  let k := Nat.max 1 (Nat.min (Nat.min totalLen (Nat.max 1 numChunks)) maxByGrain)
+  let q := totalLen / k
+  let r := totalLen % k
+  let mut chunks : Array ChunkSpan := Array.mkEmpty k
+  let mut cur : Nat := 0
+  for i in [0:k] do
+    let step := q + (if i < r then 1 else 0)
+    let next := cur + step
+    if verifyParChunk cur.toUInt64 next.toUInt64 totalLen.toUInt64 minGrain.toUInt64 != 1 then
+      return #[{ startIdx := 0, endIdx := totalLen }]
+    if let some prev := chunks.back? then
+      let lenA := (prev.endIdx - prev.startIdx).toUInt64
+      if verifyArenaDisjoint prev.startIdx.toUInt64 lenA cur.toUInt64 step.toUInt64 totalLen.toUInt64 != 1 then
+        return #[{ startIdx := 0, endIdx := totalLen }]
+    chunks := chunks.push { startIdx := cur, endIdx := next }
+    cur := next
+  return chunks
+
 /-- Partition `[0, totalLen)` into at most `maxWorkers` disjoint chunks of size `≥ minGrain`
     (except possibly the final tail chunk), certifying every chunk via `verifyParChunk`
     and every adjacent pair via `verifyArenaDisjoint`. -/
-def partitionRange (totalLen minGrain maxWorkers : Nat) : Array ChunkSpan := Id.run do
-  if totalLen == 0 then
-    return #[]
-  let workers := Nat.max 1 maxWorkers
-  let rawChunk := Nat.max 1 ((totalLen + workers - 1) / workers)
-  let step := Nat.max minGrain rawChunk
-  let mut chunks : Array ChunkSpan := #[]
-  let mut cur : Nat := 0
-  while cur < totalLen do
-    let next := Nat.min totalLen (cur + step)
-    if verifyParChunk cur.toUInt64 next.toUInt64 totalLen.toUInt64 minGrain.toUInt64 == 1 then
-      if let some prev := chunks.back? then
-        let lenA := (prev.endIdx - prev.startIdx).toUInt64
-        let lenB := (next - cur).toUInt64
-        if verifyArenaDisjoint prev.startIdx.toUInt64 lenA cur.toUInt64 lenB totalLen.toUInt64 == 1 then
-          chunks := chunks.push { startIdx := cur, endIdx := next }
-        else
-          return #[{ startIdx := 0, endIdx := totalLen }]
-      else
-        chunks := chunks.push { startIdx := cur, endIdx := next }
-    else
-      return #[{ startIdx := 0, endIdx := totalLen }]
-    cur := next
-  return chunks
+def partitionRange (totalLen minGrain maxWorkers : Nat) : Array ChunkSpan :=
+  partitionRangeBalanced totalLen minGrain maxWorkers
 
 /-- Execute `f` in parallel across certified disjoint `ChunkSpan` partitions of `[0, totalLen)`
     using `Task.spawn` (`prio := .dedicated`) and collect results in deterministic chunk order. -/
@@ -93,5 +104,53 @@ def parMapWave [Inhabited α] (maxWorkers : Nat) (items : Array α) (taskFn : α
       | .error e => throw e
     completed := completed + waveSize
   return out
+
+/-- Dynamic micro-chunk work stealing across a bounded worker pool (`budget.maxWorkers`),
+    gated by `verifyWorkerBudget`. Decomposes `[0, totalLen)` into up to `maxWorkers * microChunkFactor`
+    certified chunks pulled from a shared atomic `IO.Ref Nat` cursor so faster P-cores (e.g. Apple A15
+    Avalanche) naturally process more chunks than E-cores (Blizzard) without barrier stragglers,
+    and reassembles outputs in exact deterministic chunk index order. -/
+def parMapMicroChunks [Inhabited α] (totalLen : Nat) (budget : WorkerBudget := {})
+    (f : ChunkSpan → IO α) : IO (Array α) := do
+  if totalLen == 0 then
+    return #[]
+  let maxW := Nat.min 64 (Nat.max 1 (if budget.isMobileHetero then Nat.min 6 budget.maxWorkers else budget.maxWorkers))
+  let factor := Nat.min 8 (Nat.max 1 budget.microChunkFactor)
+  let targetChunks := Nat.max 1 (Nat.min totalLen (maxW * factor))
+  let chunks := partitionRangeBalanced totalLen budget.minGrain targetChunks
+  let nChunks := chunks.size
+  if nChunks == 0 then
+    return #[]
+  let activeW := Nat.max 1 (Nat.min maxW nChunks)
+  let heteroFlag : UInt8 := if budget.isMobileHetero then 1 else 0
+  if verifyWorkerBudget activeW.toUInt64 maxW.toUInt64 (Nat.max activeW nChunks).toUInt64 totalLen.toUInt64 heteroFlag != 1 then
+    throw (IO.userError "LeanSys.Par.parMapMicroChunks: verifyWorkerBudget rejected worker/chunk bounds")
+  if activeW == 1 then
+    chunks.mapM f
+  else
+    let cursorRef ← IO.mkRef (0 : Nat)
+    let mut workers : Array (Task (Except IO.Error (Array (Nat × α)))) := Array.mkEmpty activeW
+    for _ in [0:activeW] do
+      let t ← IO.asTask (prio := .dedicated) do
+        let mut localOut : Array (Nat × α) := #[]
+        let mut keepGoing := true
+        while keepGoing do
+          let idx ← cursorRef.modifyGet fun c => (c, c + 1)
+          if h : idx < chunks.size then
+            let v ← f chunks[idx]
+            localOut := localOut.push (idx, v)
+          else
+            keepGoing := false
+        return localOut
+      workers := workers.push t
+    let mut ordered : Array α := Array.replicate nChunks default
+    for w in workers do
+      match w.get with
+      | .error e => throw e
+      | .ok pairs =>
+        for (idx, v) in pairs do
+          if idx < ordered.size then
+            ordered := ordered.set! idx v
+    return ordered
 
 end LeanSys.Par
