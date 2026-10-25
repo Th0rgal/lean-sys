@@ -17,6 +17,15 @@
 #ifndef MSG_NOSIGNAL
 #define MSG_NOSIGNAL 0
 #endif
+#ifdef __APPLE__
+#define LS_CLONE(s, d) (clonefile(s, d, 0) == 0 ? 0 : link(s, d))
+#define LS_FSYNC(fd) (fcntl(fd, F_BARRIERFSYNC) < 0 && fsync(fd) < 0)
+static inline int ls_accept(int lfd) { int c = accept(lfd, NULL, NULL); if (c >= 0) fcntl(c, F_SETFD, FD_CLOEXEC); return c; }
+#else
+#define LS_CLONE(s, d) link(s, d)
+#define LS_FSYNC(fd) (fsync(fd) < 0)
+static inline int ls_accept(int lfd) { return accept4(lfd, NULL, NULL, SOCK_CLOEXEC); }
+#endif
 int rename(const char *, const char *); extern char **environ;
 #define SA (struct sockaddr*)
 static inline lean_obj_res R(int64_t rc) { return lean_io_result_mk_ok(lean_box_uint64(rc < 0 ? ((1ULL << 63) | ((uint64_t)(uint32_t)errno << 32)) : ((uint64_t)rc & 0x7FFFFFFFFFFFFFFFULL))); }
@@ -26,22 +35,14 @@ LEAN_EXPORT lean_obj_res leansys_open_flock(b_lean_obj_arg path, uint8_t wr, uin
     int fd = open(lean_string_cstr(path), O_CLOEXEC | (wr ? (O_CREAT | O_RDWR | (wr == 2 ? O_APPEND : 0) | (wr == 4 ? O_TRUNC : 0)) : O_RDONLY), 0644);
     return R(fd >= 0 && ex && flock(fd, LOCK_EX | (nb ? LOCK_NB : 0)) < 0 ? fail_close(fd) : fd); }
 LEAN_EXPORT lean_obj_res leansys_fs_clone_or_link(b_lean_obj_arg src, b_lean_obj_arg dst, uint8_t is_ren) {
-    const char *s = lean_string_cstr(src), *d = lean_string_cstr(dst); if (is_ren) return R(rename(s, d)); unlink(d);
-#ifdef __APPLE__
-    if (clonefile(s, d, 0) == 0) return R(0);
-#endif
-    return R(link(s, d)); }
+    const char *s = lean_string_cstr(src), *d = lean_string_cstr(dst); return R(is_ren ? rename(s, d) : (unlink(d), LS_CLONE(s, d))); }
 LEAN_EXPORT lean_obj_res leansys_write_all(uint32_t fd, b_lean_obj_arg ba, size_t off, size_t len, uint8_t do_sync) {
     size_t sz = lean_sarray_size(ba); if (off > sz || len > sz - off) { errno = EINVAL; return R(-1); }
     for (const uint8_t *p = lean_sarray_cptr(ba) + off, *end = p + len; p < end;) {
         ssize_t w = send((int)fd, p, (size_t)(end - p), MSG_NOSIGNAL);
         if (w < 0 && (errno == ENOTSOCK || errno == EBADF || errno == EINVAL)) w = write((int)fd, p, (size_t)(end - p));
         if (w < 0) { if (errno == EINTR) continue; return R(-1); } p += (size_t)w; }
-#if defined(__APPLE__) && defined(F_BARRIERFSYNC)
-    return R((do_sync && fcntl((int)fd, F_BARRIERFSYNC) < 0 && fsync((int)fd) < 0) ? -1 : (int64_t)len); }
-#else
-    return R((do_sync && fsync((int)fd) < 0) ? -1 : (int64_t)len); }
-#endif
+    return R((do_sync && LS_FSYNC((int)fd)) ? -1 : (int64_t)len); }
 LEAN_EXPORT lean_obj_res leansys_pread_ba(uint32_t fd, uint64_t off, size_t max_len) {
     lean_object *ba = lean_alloc_sarray(1, 0, max_len);
     ssize_t n = (off == UINT64_MAX) ? read((int)fd, lean_sarray_cptr(ba), max_len) : pread((int)fd, lean_sarray_cptr(ba), max_len, (off_t)off);
@@ -65,9 +66,5 @@ LEAN_EXPORT lean_obj_res leansys_net_listen(b_lean_obj_arg host, uint16_t port, 
     if ((backlog == 0 ? connect(fd, SA &a, al) : (bind(fd, SA &a, al) | listen(fd, (int)backlog))) < 0) return R(fail_close(fd));
     getsockname(fd, SA &a, &al); return R(backlog == 0 ? fd : (((int64_t)ntohs(a.sin_port) << 32) | (uint32_t)fd)); }
 LEAN_EXPORT lean_obj_res leansys_net_accept_poll(uint32_t lfd, uint32_t timeout_ms) {
-    struct pollfd p = { .fd = (int)lfd, .events = POLLIN }; int r = poll(&p, 1, (int)timeout_ms); if (r <= 0) return R(r == 0 ? (errno = EAGAIN, -1) : -1);
-#ifdef __APPLE__
-    int c = accept((int)lfd, NULL, NULL); if (c >= 0) fcntl(c, F_SETFD, FD_CLOEXEC); return R(c); }
-#else
-    return R(accept4((int)lfd, NULL, NULL, SOCK_CLOEXEC)); }
-#endif
+    struct pollfd p = { .fd = (int)lfd, .events = POLLIN }; int r = poll(&p, 1, (int)timeout_ms);
+    return R(r <= 0 ? (r == 0 ? (errno = EAGAIN, -1) : -1) : ls_accept((int)lfd)); }
