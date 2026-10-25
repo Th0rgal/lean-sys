@@ -223,10 +223,15 @@ def runSelfTest : IO UInt32 := do
   let .ok sstLazy ← SstTable.openSstLazy sstPath
     | do IO.eprintln "[lean-sys-core] FAIL: SstTable.openSstLazy"; return 1
   let lazyAlpha ← SstTable.getLazyIO? sstLazy "alpha"
+  let lazyGamma ← SstTable.getLazyIO? sstLazy "gamma"
+  let lazyMiss ← SstTable.getLazyIO? sstLazy "nonexistent-key"
   if SstTable.getString? sstOpened "alpha" != some "value-alpha-1" ||
      SstTable.getString? sstOpened "gamma" != some "value-gamma-3" ||
      lazyAlpha.map String.fromUTF8! != some "value-alpha-1" ||
+     lazyGamma.map String.fromUTF8! != some "value-gamma-3" ||
+     lazyMiss.isSome ||
      sstLazy.rawBuf.size != 0 ||
+     sstLazy.entries != sstOpened.entries ||
      (SstTable.getString? sstOpened "nonexistent-key").isSome then
     IO.eprintln "[lean-sys-core] FAIL: SstTable Bloom/binary-search lookup mismatch"
     return 1

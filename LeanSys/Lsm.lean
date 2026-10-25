@@ -164,13 +164,64 @@ def getSlice? (tbl : SstTable) (key : String) : Option ByteSlice :=
 def getString? (tbl : SstTable) (key : String) : Option String :=
   (get? tbl key).map ByteSlice.toStringLossy
 
-/-- Open an SST file in zero-value-RAM mode (`rawBuf := ByteArray.empty`), retaining only the
-    verified index directory + Bloom filter mask so mobile/iOS callers under Jetsam limits never
-    hold value pages in dirty heap memory. -/
+/-- Open an SST file in true index-only lazy mode (`rawBuf := ByteArray.empty`, `0 B` resident value RAM).
+    Reads ONLY the 24-byte footer and the `[indexOff, footerOff)` directory slice via positional `preadByteArray`
+    (never calling `openSst` or reading `[0, indexOff)` value pages into memory), gated by `verifySstBlock`
+    and `verifyIosJetsamBudget`. -/
 def openSstLazy (sstPath : String) : IO (SysResult SstTable) := do
-  match ← openSst sstPath with
-  | .error e => pure (.error e)
-  | .ok tbl => pure (.ok { tbl with rawBuf := ByteArray.empty })
+  let fileLenOpt : Option Nat ← try
+    let m ← (System.FilePath.mk sstPath).metadata
+    pure (some m.byteSize.toNat)
+  catch _ =>
+    pure none
+  let some fileLen := fileLenOpt | return .error .enoent
+  if fileLen < 24 then
+    return .error .eio
+  let footerOff := fileLen - 24
+  withFd sstPath 0 fun fd => do
+    let footerBuf ← preadByteArray fd footerOff.toUInt64 24
+    if footerBuf.size != 24 then
+      return .error .eio
+    let magic := readUInt32LE footerBuf 0
+    let numEntries := readUInt32LE footerBuf 4
+    let indexOff := readUInt64LE footerBuf 8
+    let bloom := readUInt64LE footerBuf 16
+    if verifySstBlock magic numEntries indexOff footerOff.toUInt64 fileLen.toUInt64 bloom != 1 then
+      return .error .einval
+    let idxLen := footerOff - indexOff.toNat
+    let alignedIdxAlloc : UInt64 := (((idxLen + 24 + 16383) / 16384) * 16384).toUInt64
+    if verifyIosJetsamBudget 0 alignedIdxAlloc 268435456 16383 0 != 1 then
+      return .error .enospc
+    let idxBuf ← preadByteArray fd indexOff idxLen
+    if idxBuf.size != idxLen then
+      return .error .eio
+    let mut entries : Array SstIndexEntry := Array.mkEmpty numEntries.toNat
+    let mut p := 0
+    for _ in [0:numEntries.toNat] do
+      if p + 12 > idxLen then
+        return .error .eio
+      let kLen := (readUInt32LE idxBuf p).toNat
+      let vOff := (readUInt32LE idxBuf (p + 4)).toNat
+      let vLen := (readUInt32LE idxBuf (p + 8)).toNat
+      if p + 12 + kLen > idxLen || vOff + vLen > indexOff.toNat then
+        return .error .eio
+      match String.fromUTF8? (idxBuf.extract (p + 12) (p + 12 + kLen)) with
+      | none => return .error .eio
+      | some kStr =>
+        if h : entries.size > 0 then
+          let prev := entries[entries.size - 1]
+          let prevRelOff := prev.keyOff - indexOff.toNat
+          if compareKeyAt idxBuf prevRelOff prev.keyLen kStr.toUTF8 != .lt then
+            return .error .eio
+        entries := entries.push {
+          key := kStr
+          keyOff := indexOff.toNat + p + 12
+          keyLen := kLen
+          valOff := vOff
+          valLen := vLen
+        }
+      p := p + 12 + kLen
+    return .ok { path := sstPath, rawBuf := ByteArray.empty, bloomMask := bloom, entries := entries }
 
 /-- Lookup a value by `key` in `SstTable`, using in-memory `rawBuf` when resident or lazy `preadByteArray`
     when opened via `openSstLazy`. -/

@@ -36,6 +36,11 @@ if [ "$SHIM_LOC" -gt 65 ]; then
   echo "ERROR: c/lean_sys_shim.c has $SHIM_LOC lines (> 65 LOC cap)!" >&2
   exit 1
 fi
+SHIM_SEMIS="$(tr -cd ';' < c/lean_sys_shim.c | wc -c | tr -d ' ')"
+if [ "$SHIM_SEMIS" -gt 64 ]; then
+  echo "ERROR: c/lean_sys_shim.c has $SHIM_SEMIS semicolons (> 64 statement cap)!" >&2
+  exit 1
+fi
 if grep -rn '^import Lean\b' LeanSys/ LeanSys.lean; then
   echo "ERROR: Forbidden 'import Lean' found in LeanSys!" >&2
   exit 1
