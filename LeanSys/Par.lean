@@ -35,8 +35,12 @@ def partitionRange (totalLen minGrain maxWorkers : Nat) : Array ChunkSpan := Id.
         let lenB := (next - cur).toUInt64
         if verifyArenaDisjoint prev.startIdx.toUInt64 lenA cur.toUInt64 lenB totalLen.toUInt64 == 1 then
           chunks := chunks.push { startIdx := cur, endIdx := next }
+        else
+          return #[{ startIdx := 0, endIdx := totalLen }]
       else
         chunks := chunks.push { startIdx := cur, endIdx := next }
+    else
+      return #[{ startIdx := 0, endIdx := totalLen }]
     cur := next
   return chunks
 
