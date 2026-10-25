@@ -153,6 +153,21 @@ extern "C" {
         prev_digest: u64,
         block_hash: u64,
     ) -> u64;
+
+    pub fn leansys_verify_par_chunk(
+        chunk_start: u64,
+        chunk_end: u64,
+        total_len: u64,
+        min_grain: u64,
+    ) -> u8;
+
+    pub fn leansys_verify_arena_disjoint(
+        off_a: u64,
+        len_a: u64,
+        off_b: u64,
+        len_b: u64,
+        arena_cap: u64,
+    ) -> u8;
 }
 
 pub const WAL_MAGIC: u32 = 0x4C53_5953;
@@ -448,6 +463,27 @@ pub fn transcript_index(
     unsafe { leansys_transcript_index(turn_off, turn_len, buf_len, prev_digest, block_hash) }
 }
 
+#[inline]
+pub fn verify_par_chunk(
+    chunk_start: u64,
+    chunk_end: u64,
+    total_len: u64,
+    min_grain: u64,
+) -> bool {
+    unsafe { leansys_verify_par_chunk(chunk_start, chunk_end, total_len, min_grain) == 1 }
+}
+
+#[inline]
+pub fn verify_arena_disjoint(
+    off_a: u64,
+    len_a: u64,
+    off_b: u64,
+    len_b: u64,
+    arena_cap: u64,
+) -> bool {
+    unsafe { leansys_verify_arena_disjoint(off_a, len_a, off_b, len_b, arena_cap) == 1 }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -539,5 +575,11 @@ mod tests {
 
         assert_ne!(transcript_index(0, 32, 64, 0x1111, 0x2222), 0);
         assert_eq!(transcript_index(48, 32, 64, 0x1111, 0x2222), 0);
+
+        assert!(verify_par_chunk(0, 64, 256, 64));
+        assert!(!verify_par_chunk(0, 32, 256, 64));
+
+        assert!(verify_arena_disjoint(0, 128, 128, 128, 256));
+        assert!(!verify_arena_disjoint(0, 128, 64, 128, 256));
     }
 }

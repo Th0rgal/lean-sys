@@ -73,6 +73,8 @@ const LEANSYS_EXPORTS: &[&str] = &[
     "leansys_gfm_pipe_scan",
     "leansys_tag_scan",
     "leansys_transcript_index",
+    "leansys_verify_par_chunk",
+    "leansys_verify_arena_disjoint",
 ];
 
 fn build_lean_sys_cabi(root: &Path, out_dir: &Path) {
