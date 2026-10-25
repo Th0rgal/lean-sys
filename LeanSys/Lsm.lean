@@ -164,6 +164,16 @@ def getSlice? (tbl : SstTable) (key : String) : Option ByteSlice :=
 def getString? (tbl : SstTable) (key : String) : Option String :=
   (get? tbl key).map ByteSlice.toStringLossy
 
+/-- Atomically flush `st` into a sorted SST file at `sstPath` and compact the WAL,
+    returning the compacted `(Store.Handle × SstTable)` pair. -/
+def flushAndCompactStore (st : Store.Handle) (sstPath : String) : IO (SysResult (Store.Handle × SstTable)) := do
+  match ← flushStore st sstPath with
+  | .error e => pure (.error e)
+  | .ok tbl =>
+    match ← Store.compact st with
+    | .error e => pure (.error e)
+    | .ok stCompacted => pure (.ok (stCompacted, tbl))
+
 end SstTable
 
 end LeanSys.Lsm

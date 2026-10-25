@@ -39,10 +39,16 @@ def json (status : Nat) (jsonBody : String) : HttpResponse :=
 def toWireBytes (r : HttpResponse) : ByteArray :=
   let statusText := match r.status with
     | 200 => "OK"
+    | 201 => "Created"
+    | 204 => "No Content"
     | 400 => "Bad Request"
     | 401 => "Unauthorized"
+    | 403 => "Forbidden"
     | 404 => "Not Found"
+    | 405 => "Method Not Allowed"
+    | 408 => "Request Timeout"
     | 413 => "Payload Too Large"
+    | 500 => "Internal Server Error"
     | _   => "OK"
   let head :=
     s!"HTTP/1.1 {r.status} {statusText}\r\n" ++
@@ -52,6 +58,40 @@ def toWireBytes (r : HttpResponse) : ByteArray :=
   head.toUTF8 ++ r.body
 
 end HttpResponse
+
+/-- Declarative bounded HTTP/1.1 route table entry (`method`, `path`, `handler`). -/
+structure RouteEntry where
+  method  : String
+  path    : String
+  handler : HttpRequest → IO HttpResponse
+
+instance : Inhabited RouteEntry :=
+  ⟨{ method := "", path := "", handler := fun _ => pure (HttpResponse.json 404 "") }⟩
+
+/--
+  Dispatch an `HttpRequest` against a bounded static route table (`routes.size ≤ 64`),
+  gated by `leansys_verify_http_route_match`:
+  - Invokes the first matching `(method, path)` handler.
+  - Returns `405 Method Not Allowed` if `req.path` matches a route in `routes` but `req.method` does not.
+  - Returns `404 Not Found` if no route matches `req.path` (or `routes.size > 64`).
+-/
+def dispatchRoutes (routes : Array RouteEntry) (req : HttpRequest) : IO HttpResponse := do
+  let n := routes.size
+  if n > 64 then
+    return HttpResponse.json 404 "{\"ok\":false,\"error\":\"route_table_overflow\"}"
+  let mut pathMatched := false
+  for i in [0:n] do
+    let rt := routes[i]!
+    let mMatch : UInt8 := if rt.method == req.method then 1 else 0
+    let pMatch : UInt8 := if rt.path == req.path then 1 else 0
+    if pMatch == 1 then
+      pathMatched := true
+    if verifyHttpRouteMatch mMatch pMatch i.toUInt32 n.toUInt32 == 1 then
+      return (← rt.handler req)
+  if pathMatched then
+    return HttpResponse.json 405 "{\"ok\":false,\"error\":\"method_not_allowed\"}"
+  else
+    return HttpResponse.json 404 "{\"ok\":false,\"error\":\"not_found\"}"
 
 /-- Find the index of `\r\n\r\n` (`13, 10, 13, 10`) in `ba`, returning the byte offset of the body start. -/
 def findHeaderEnd? (ba : ByteArray) : Option Nat := Id.run do

@@ -978,18 +978,79 @@ def arenaDisjointMetaSpec : MetaGateSpec Unit ArenaDisjointCheck where
   inv _ := True
   gate _ a := verifyArenaDisjoint a.sliceA.1 a.sliceA.2 a.sliceB.1 a.sliceB.2 a.arenaCap == 1
   step _ _ := ()
-  safe _ a := (subsliceOk a.sliceA.1 a.sliceA.2 a.arenaCap &&
-               subsliceOk a.sliceB.1 a.sliceB.2 a.arenaCap &&
+  safe _ a := (a.sliceA.1 ≤ a.arenaCap && a.sliceA.2 ≤ a.arenaCap - a.sliceA.1 &&
+               a.sliceB.1 ≤ a.arenaCap && a.sliceB.2 ≤ a.arenaCap - a.sliceB.1 &&
                (a.sliceA.1 + a.sliceA.2 ≤ a.sliceB.1 || a.sliceB.1 + a.sliceB.2 ≤ a.sliceA.1))
   preserves_inv _ _ _ h := h
-  ensures_safe _ a h := by unfold verifyArenaDisjoint at h; split at h <;> simp_all
+  ensures_safe _ a h := by unfold verifyArenaDisjoint subsliceOk at h; split at h <;> simp_all
 
 /-- Corollary 26: `verifyArenaDisjoint` rejects out-of-bounds or overlapping scratch arena slices. -/
 theorem arena_disjoint_rejects_overlap (a : ArenaDisjointCheck)
-    (h_bad : (subsliceOk a.sliceA.1 a.sliceA.2 a.arenaCap &&
-              subsliceOk a.sliceB.1 a.sliceB.2 a.arenaCap &&
+    (h_bad : (a.sliceA.1 ≤ a.arenaCap && a.sliceA.2 ≤ a.arenaCap - a.sliceA.1 &&
+              a.sliceB.1 ≤ a.arenaCap && a.sliceB.2 ≤ a.arenaCap - a.sliceB.1 &&
               (a.sliceA.1 + a.sliceA.2 ≤ a.sliceB.1 || a.sliceB.1 + a.sliceB.2 ≤ a.sliceA.1)) = false) :
     (verifyArenaDisjoint a.sliceA.1 a.sliceA.2 a.sliceB.1 a.sliceB.2 a.arenaCap == 1) = false :=
   arenaDisjointMetaSpec.rejects_unsafe () a h_bad
+
+/--
+  Unboxed C-ABI Snapshot-Isolated LSM Visibility Verifier (`leansys_verify_snapshot_visibility`):
+  Certifies that an indexed SST entry with sequence `entrySeq` is visible at `maxSnapshotSeq`
+  (`entrySeq ≤ maxSnapshotSeq`) and is not a tombstone (`isTombstone == 0`).
+-/
+@[inline, export leansys_verify_snapshot_visibility]
+def verifySnapshotVisibility (entrySeq maxSnapshotSeq : UInt64) (isTombstone : UInt8) : UInt8 :=
+  if entrySeq ≤ maxSnapshotSeq && isTombstone == 0 then 1 else 0
+
+/-- Snapshot visibility check parameters (≤ 3 fields). -/
+structure SnapshotVisibilityCheck where
+  entrySeq       : UInt64
+  maxSnapshotSeq : UInt64
+  isTombstone    : UInt8
+  deriving Repr, DecidableEq
+
+/-- Layer II Bundle 27: Snapshot-isolated LSM range scan visibility gate (`leansys_verify_snapshot_visibility`). -/
+def snapshotVisibilityMetaSpec : MetaGateSpec Unit SnapshotVisibilityCheck where
+  inv _ := True
+  gate _ s := verifySnapshotVisibility s.entrySeq s.maxSnapshotSeq s.isTombstone == 1
+  step _ _ := ()
+  safe _ s := (s.entrySeq ≤ s.maxSnapshotSeq && s.isTombstone == 0)
+  preserves_inv _ _ _ h := h
+  ensures_safe _ s h := by unfold verifySnapshotVisibility at h; split at h <;> simp_all
+
+/-- Corollary 27: `verifySnapshotVisibility` rejects entries newer than `maxSnapshotSeq` or deleted by a tombstone. -/
+theorem snapshot_visibility_rejects_future_or_tombstone (s : SnapshotVisibilityCheck)
+    (h_bad : (s.entrySeq ≤ s.maxSnapshotSeq && s.isTombstone == 0) = false) :
+    (verifySnapshotVisibility s.entrySeq s.maxSnapshotSeq s.isTombstone == 1) = false :=
+  snapshotVisibilityMetaSpec.rejects_unsafe () s h_bad
+
+/--
+  Unboxed C-ABI Bounded HTTP/1.1 Static Route Table Match Verifier (`leansys_verify_http_route_match`):
+  Certifies that `methodMatch == 1`, `pathMatch == 1`, and `routeIdx < routeCount ≤ 64`.
+-/
+@[inline, export leansys_verify_http_route_match]
+def verifyHttpRouteMatch (methodMatch pathMatch : UInt8) (routeIdx routeCount : UInt32) : UInt8 :=
+  if methodMatch == 1 && pathMatch == 1 && routeIdx < routeCount && routeCount ≤ 64 then 1 else 0
+
+/-- Bounded HTTP/1.1 route table match parameters (≤ 3 fields). -/
+structure HttpRouteMatchCheck where
+  flags      : UInt8 × UInt8
+  routeIdx   : UInt32
+  routeCount : UInt32
+  deriving Repr, DecidableEq
+
+/-- Layer II Bundle 28: Bounded HTTP/1.1 static route dispatch gate (`leansys_verify_http_route_match`). -/
+def httpRouteMatchMetaSpec : MetaGateSpec Unit HttpRouteMatchCheck where
+  inv _ := True
+  gate _ r := verifyHttpRouteMatch r.flags.1 r.flags.2 r.routeIdx r.routeCount == 1
+  step _ _ := ()
+  safe _ r := (r.flags.1 == 1 && r.flags.2 == 1 && r.routeIdx < r.routeCount && r.routeCount ≤ 64)
+  preserves_inv _ _ _ h := h
+  ensures_safe _ r h := by unfold verifyHttpRouteMatch at h; split at h <;> simp_all
+
+/-- Corollary 28: `verifyHttpRouteMatch` rejects method/path mismatches or out-of-bounds route indices. -/
+theorem http_route_match_rejects_mismatch_or_oob (r : HttpRouteMatchCheck)
+    (h_bad : (r.flags.1 == 1 && r.flags.2 == 1 && r.routeIdx < r.routeCount && r.routeCount ≤ 64) = false) :
+    (verifyHttpRouteMatch r.flags.1 r.flags.2 r.routeIdx r.routeCount == 1) = false :=
+  httpRouteMatchMetaSpec.rejects_unsafe () r h_bad
 
 end LeanSys.Spec

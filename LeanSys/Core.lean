@@ -106,7 +106,15 @@ def runSelfTest : IO UInt32 := do
                         verifyParChunk 192 256 256 64 == 1
   let arenaDisjointGateOk := verifyArenaDisjoint 0 128 128 128 256 == 1 &&
                              verifyArenaDisjoint 0 128 64 128 256 == 0
-  if !(sbOk && wfOk && casGateOk && httpGateOk && tapeGateOk && ringGateOk && sstGateOk && pollGateOk && rlimGateOk && mixGateOk && ckGateOk && tokGateOk && logGateOk && rpcGateOk && admitGateOk && seqlockGateOk && procStatGateOk && sseGateOk && gfmGateOk && tagGateOk && trIdxGateOk && parChunkGateOk && arenaDisjointGateOk) then
+  let snapVisGateOk := verifySnapshotVisibility 2 5 0 == 1 &&
+                       verifySnapshotVisibility 6 5 0 == 0 &&
+                       verifySnapshotVisibility 2 5 1 == 0
+  let routeMatchGateOk := verifyHttpRouteMatch 1 1 0 4 == 1 &&
+                          verifyHttpRouteMatch 0 1 0 4 == 0 &&
+                          verifyHttpRouteMatch 1 0 0 4 == 0 &&
+                          verifyHttpRouteMatch 1 1 4 4 == 0 &&
+                          verifyHttpRouteMatch 1 1 0 65 == 0
+  if !(sbOk && wfOk && casGateOk && httpGateOk && tapeGateOk && ringGateOk && sstGateOk && pollGateOk && rlimGateOk && mixGateOk && ckGateOk && tokGateOk && logGateOk && rpcGateOk && admitGateOk && seqlockGateOk && procStatGateOk && sseGateOk && gfmGateOk && tagGateOk && trIdxGateOk && parChunkGateOk && arenaDisjointGateOk && snapVisGateOk && routeMatchGateOk) then
     IO.eprintln "[lean-sys-core] FAIL: C-ABI Spec gates check failed"
     return 1
 
@@ -187,18 +195,38 @@ def runSelfTest : IO UInt32 := do
   let ck1 : CompositeKey := { hi := 10, lo := 20, seq := 1 }
   let ck2 : CompositeKey := { hi := 10, lo := 20, seq := 2 }
   let ck3 : CompositeKey := { hi := 10, lo := 20, seq := 3 }
+  let ckTomb : CompositeKey := { hi := 10, lo := 20, seq := 4 }
   let .ok stTbl1 ← putComposite stCompacted ck1 (ByteSlice.ofString "ev-1") false
     | do IO.eprintln "[lean-sys-core] FAIL: putComposite 1"; return 1
   let .ok stTbl2 ← putComposite stTbl1 ck2 (ByteSlice.ofString "ev-2") false
     | do IO.eprintln "[lean-sys-core] FAIL: putComposite 2"; return 1
-  let .ok stTbl3 ← putComposite stTbl2 ck3 (ByteSlice.ofString "ev-3") true
+  let .ok stTbl3 ← putComposite stTbl2 ck3 (ByteSlice.ofString "ev-3") false
     | do IO.eprintln "[lean-sys-core] FAIL: putComposite 3"; return 1
+  let .ok stTbl4 ← putComposite stTbl3 ckTomb (ByteSlice.ofString "") true
+    | do IO.eprintln "[lean-sys-core] FAIL: putComposite tombstone"; return 1
   let sstTblPath := s!"{testDir}/table.sst"
-  let .ok sstTbl ← SstTable.flushStore stTbl3 sstTblPath
-    | do IO.eprintln "[lean-sys-core] FAIL: SstTable.flushStore table"; return 1
+  let .ok (stTblCompacted, sstTbl) ← SstTable.flushAndCompactStore stTbl4 sstTblPath
+    | do IO.eprintln "[lean-sys-core] FAIL: SstTable.flushAndCompactStore table"; return 1
   let scanRows := rangeScan sstTbl ck1 ck2 10
-  if scanRows.size != 2 || scanRows[0]!.2.toStringLossy != "ev-1" || scanRows[1]!.2.toStringLossy != "ev-2" then
-    IO.eprintln "[lean-sys-core] FAIL: Table.rangeScan mismatch"
+  let snapRows := rangeScanSnapshot sstTbl ck1 ckTomb 2 10
+  let snapRowsWithTomb := rangeScanSnapshot sstTbl ck1 ckTomb 10 10
+  if scanRows.size != 2 || scanRows[0]!.2.toStringLossy != "ev-1" || scanRows[1]!.2.toStringLossy != "ev-2" ||
+     snapRows.size != 2 || snapRowsWithTomb.size != 3 || getString? stTblCompacted "gamma" != some "value-gamma-3" then
+    IO.eprintln "[lean-sys-core] FAIL: Table.rangeScan / rangeScanSnapshot / flushAndCompactStore mismatch"
+    return 1
+
+  let routes : Array RouteEntry := #[
+    { method := "GET", path := "/v1/health", handler := fun _ => pure (HttpResponse.json 200 "{\"status\":\"ok\"}") },
+    { method := "POST", path := "/v1/items", handler := fun _ => pure (HttpResponse.json 201 "{\"created\":true}") }
+  ]
+  let dummySlice := ByteSlice.ofString ""
+  let rGet ← dispatchRoutes routes { method := "GET", path := "/v1/health", headers := #[], contentLength := 0, authBearer := none, bodySlice := dummySlice }
+  let rMethodErr ← dispatchRoutes routes { method := "POST", path := "/v1/health", headers := #[], contentLength := 0, authBearer := none, bodySlice := dummySlice }
+  let rNotFound ← dispatchRoutes routes { method := "GET", path := "/v1/unknown", headers := #[], contentLength := 0, authBearer := none, bodySlice := dummySlice }
+  let wire405 := String.fromUTF8! rMethodErr.toWireBytes
+  if rGet.status != 200 || rMethodErr.status != 405 || rNotFound.status != 404 ||
+     (wire405.splitOn "405 Method Not Allowed").length ≤ 1 then
+    IO.eprintln "[lean-sys-core] FAIL: dispatchRoutes / HttpResponse.toWireBytes mismatch"
     return 1
 
   let lease := mintLease "cur-secret" "babylon" "job:submit" 2000
