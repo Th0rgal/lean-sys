@@ -926,4 +926,70 @@ theorem transcript_index_rejects_empty_or_oob (x : TranscriptIndexCheck)
     (verifyTranscriptIndex x.bounds.1 x.bounds.2.1 x.bounds.2.2 x.prevDigest x.blockHash != 0) = false :=
   transcriptIndexMetaSpec.rejects_unsafe () x h_bad
 
+/--
+  Unboxed C-ABI Parallel 1D Chunk Partition Verifier (`leansys_verify_par_chunk`):
+  Certifies `chunkStart < chunkEnd ≤ totalLen` and grain bound `minGrain ≤ chunkEnd - chunkStart || chunkEnd == totalLen`.
+-/
+@[inline, export leansys_verify_par_chunk]
+def verifyParChunk (chunkStart chunkEnd totalLen minGrain : UInt64) : UInt8 :=
+  if chunkStart < chunkEnd && chunkEnd ≤ totalLen && (minGrain ≤ chunkEnd - chunkStart || chunkEnd == totalLen) then 1 else 0
+
+/-- Parallel 1D chunk partition check parameters (≤ 3 fields). -/
+structure ParChunkCheck where
+  span     : UInt64 × UInt64
+  totalLen : UInt64
+  minGrain : UInt64
+  deriving Repr, DecidableEq
+
+/-- Layer II Bundle 25: Parallel 1D chunk partition & grain gate (`leansys_verify_par_chunk`). -/
+def parChunkMetaSpec : MetaGateSpec Unit ParChunkCheck where
+  inv _ := True
+  gate _ c := verifyParChunk c.span.1 c.span.2 c.totalLen c.minGrain == 1
+  step _ _ := ()
+  safe _ c := (c.span.1 < c.span.2 && c.span.2 ≤ c.totalLen && (c.minGrain ≤ c.span.2 - c.span.1 || c.span.2 == c.totalLen))
+  preserves_inv _ _ _ h := h
+  ensures_safe _ c h := by unfold verifyParChunk at h; split at h <;> simp_all
+
+/-- Corollary 25: `verifyParChunk` rejects empty, out-of-range, or sub-grain non-tail parallel chunks. -/
+theorem par_chunk_rejects_invalid_bounds (c : ParChunkCheck)
+    (h_bad : (c.span.1 < c.span.2 && c.span.2 ≤ c.totalLen && (c.minGrain ≤ c.span.2 - c.span.1 || c.span.2 == c.totalLen)) = false) :
+    (verifyParChunk c.span.1 c.span.2 c.totalLen c.minGrain == 1) = false :=
+  parChunkMetaSpec.rejects_unsafe () c h_bad
+
+/--
+  Unboxed C-ABI Scratch Arena Disjoint Sub-Slice Verifier (`leansys_verify_arena_disjoint`):
+  Certifies that `[offA, offA + lenA)` and `[offB, offB + lenB)` both lie within `[0, arenaCap)`
+  without 64-bit overflow and do not alias (`offA + lenA ≤ offB || offB + lenB ≤ offA`).
+-/
+@[inline, export leansys_verify_arena_disjoint]
+def verifyArenaDisjoint (offA lenA offB lenB arenaCap : UInt64) : UInt8 :=
+  if subsliceOk offA lenA arenaCap && subsliceOk offB lenB arenaCap &&
+     (offA + lenA ≤ offB || offB + lenB ≤ offA) then 1 else 0
+
+/-- Scratch arena disjoint sub-slice check parameters (≤ 3 fields). -/
+structure ArenaDisjointCheck where
+  sliceA   : UInt64 × UInt64
+  sliceB   : UInt64 × UInt64
+  arenaCap : UInt64
+  deriving Repr, DecidableEq
+
+/-- Layer II Bundle 26: Scratch arena disjoint sub-slice gate (`leansys_verify_arena_disjoint`). -/
+def arenaDisjointMetaSpec : MetaGateSpec Unit ArenaDisjointCheck where
+  inv _ := True
+  gate _ a := verifyArenaDisjoint a.sliceA.1 a.sliceA.2 a.sliceB.1 a.sliceB.2 a.arenaCap == 1
+  step _ _ := ()
+  safe _ a := (subsliceOk a.sliceA.1 a.sliceA.2 a.arenaCap &&
+               subsliceOk a.sliceB.1 a.sliceB.2 a.arenaCap &&
+               (a.sliceA.1 + a.sliceA.2 ≤ a.sliceB.1 || a.sliceB.1 + a.sliceB.2 ≤ a.sliceA.1))
+  preserves_inv _ _ _ h := h
+  ensures_safe _ a h := by unfold verifyArenaDisjoint at h; split at h <;> simp_all
+
+/-- Corollary 26: `verifyArenaDisjoint` rejects out-of-bounds or overlapping scratch arena slices. -/
+theorem arena_disjoint_rejects_overlap (a : ArenaDisjointCheck)
+    (h_bad : (subsliceOk a.sliceA.1 a.sliceA.2 a.arenaCap &&
+              subsliceOk a.sliceB.1 a.sliceB.2 a.arenaCap &&
+              (a.sliceA.1 + a.sliceA.2 ≤ a.sliceB.1 || a.sliceB.1 + a.sliceB.2 ≤ a.sliceA.1)) = false) :
+    (verifyArenaDisjoint a.sliceA.1 a.sliceA.2 a.sliceB.1 a.sliceB.2 a.arenaCap == 1) = false :=
+  arenaDisjointMetaSpec.rejects_unsafe () a h_bad
+
 end LeanSys.Spec
