@@ -1124,7 +1124,7 @@ def dagWaveStepMetaSpec : MetaGateSpec Unit DagWaveStepCheck where
   preserves_inv _ _ _ h := h
   ensures_safe _ w h := by unfold verifyDagWaveStep subsliceOk at h; split at h <;> simp_all
 
-/-- Corollary 30: `verifyDagWaveStep` rejects waves with unresolved dependencies, empty wave size, task overflow, or invalid worker bounds. -/
+/-- Corollary 30: `verifyDagWaveStep` rejects waves with unresolved deps, empty wave, overflow, or bad worker bounds. -/
 theorem dag_wave_step_rejects_unready_or_overflow (w : DagWaveStepCheck)
     (h_bad : (w.wave.1 == 0 && 0 < w.wave.2 &&
               w.progress.1 ≤ w.progress.2 && w.wave.2 ≤ w.progress.2 - w.progress.1 &&
