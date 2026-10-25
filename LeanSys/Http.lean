@@ -72,13 +72,14 @@ instance : Inhabited RouteEntry :=
   Dispatch an `HttpRequest` against a bounded static route table (`routes.size ≤ 64`),
   gated by `leansys_verify_http_route_match`:
   - Invokes the first matching `(method, path)` handler.
+  - Returns `500 Internal Server Error` if `routes.size > 64`.
   - Returns `405 Method Not Allowed` if `req.path` matches a route in `routes` but `req.method` does not.
-  - Returns `404 Not Found` if no route matches `req.path` (or `routes.size > 64`).
+  - Returns `404 Not Found` if no route matches `req.path`.
 -/
 def dispatchRoutes (routes : Array RouteEntry) (req : HttpRequest) : IO HttpResponse := do
   let n := routes.size
   if n > 64 then
-    return HttpResponse.json 404 "{\"ok\":false,\"error\":\"route_table_overflow\"}"
+    return HttpResponse.json 500 "{\"ok\":false,\"error\":\"route_table_overflow\"}"
   let mut pathMatched := false
   for i in [0:n] do
     let rt := routes[i]!

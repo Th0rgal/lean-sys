@@ -196,23 +196,34 @@ def runSelfTest : IO UInt32 := do
   let ck2 : CompositeKey := { hi := 10, lo := 20, seq := 2 }
   let ck3 : CompositeKey := { hi := 10, lo := 20, seq := 3 }
   let ckTomb : CompositeKey := { hi := 10, lo := 20, seq := 4 }
+  let ckEmpty : CompositeKey := { hi := 10, lo := 21, seq := 1 }
+  let ckHi : CompositeKey := { hi := 10, lo := 25, seq := 99 }
   let .ok stTbl1 ← putComposite stCompacted ck1 (ByteSlice.ofString "ev-1") false
     | do IO.eprintln "[lean-sys-core] FAIL: putComposite 1"; return 1
   let .ok stTbl2 ← putComposite stTbl1 ck2 (ByteSlice.ofString "ev-2") false
     | do IO.eprintln "[lean-sys-core] FAIL: putComposite 2"; return 1
   let .ok stTbl3 ← putComposite stTbl2 ck3 (ByteSlice.ofString "ev-3") false
     | do IO.eprintln "[lean-sys-core] FAIL: putComposite 3"; return 1
-  let .ok stTbl4 ← putComposite stTbl3 ckTomb (ByteSlice.ofString "") true
-    | do IO.eprintln "[lean-sys-core] FAIL: putComposite tombstone"; return 1
+  let .ok stTbl4 ← deleteComposite stTbl3 ckTomb false
+    | do IO.eprintln "[lean-sys-core] FAIL: deleteComposite tombstone"; return 1
+  let .ok stTbl5 ← putComposite stTbl4 ckEmpty (ByteSlice.ofString "") true
+    | do IO.eprintln "[lean-sys-core] FAIL: putComposite empty string"; return 1
   let sstTblPath := s!"{testDir}/table.sst"
-  let .ok (stTblCompacted, sstTbl) ← SstTable.flushAndCompactStore stTbl4 sstTblPath
+  let .ok (stTblCompacted, sstTbl) ← SstTable.flushAndCompactStore stTbl5 sstTblPath
     | do IO.eprintln "[lean-sys-core] FAIL: SstTable.flushAndCompactStore table"; return 1
   let scanRows := rangeScan sstTbl ck1 ck2 10
-  let snapRows := rangeScanSnapshot sstTbl ck1 ckTomb 2 10
-  let snapRowsWithTomb := rangeScanSnapshot sstTbl ck1 ckTomb 10 10
+  let snapAt2 := rangeScanSnapshot sstTbl ck1 ckHi 2 10
+  let snapAt3 := rangeScanSnapshot sstTbl ck1 ckHi 3 10
+  let snapAt10 := rangeScanSnapshot sstTbl ck1 ckHi 10 10
+  let evUpTo2 := rangeScanUpTo sstTbl ck1 ckTomb 2 10
+  let evUpTo10 := rangeScanUpTo sstTbl ck1 ckTomb 10 10
   if scanRows.size != 2 || scanRows[0]!.2.toStringLossy != "ev-1" || scanRows[1]!.2.toStringLossy != "ev-2" ||
-     snapRows.size != 2 || snapRowsWithTomb.size != 3 || getString? stTblCompacted "gamma" != some "value-gamma-3" then
-    IO.eprintln "[lean-sys-core] FAIL: Table.rangeScan / rangeScanSnapshot / flushAndCompactStore mismatch"
+     snapAt2.size != 2 || snapAt2[0]!.2.toStringLossy != "ev-2" || snapAt2[1]!.2.toStringLossy != "" ||
+     snapAt3.size != 2 || snapAt3[0]!.2.toStringLossy != "ev-3" || snapAt3[1]!.2.toStringLossy != "" ||
+     snapAt10.size != 1 || snapAt10[0]!.2.toStringLossy != "" ||
+     evUpTo2.size != 2 || evUpTo10.size != 3 ||
+     getString? stTblCompacted "gamma" != some "value-gamma-3" then
+    IO.eprintln "[lean-sys-core] FAIL: Table.rangeScan / rangeScanSnapshot MVCC / flushAndCompactStore mismatch"
     return 1
 
   let routes : Array RouteEntry := #[
@@ -223,8 +234,9 @@ def runSelfTest : IO UInt32 := do
   let rGet ← dispatchRoutes routes { method := "GET", path := "/v1/health", headers := #[], contentLength := 0, authBearer := none, bodySlice := dummySlice }
   let rMethodErr ← dispatchRoutes routes { method := "POST", path := "/v1/health", headers := #[], contentLength := 0, authBearer := none, bodySlice := dummySlice }
   let rNotFound ← dispatchRoutes routes { method := "GET", path := "/v1/unknown", headers := #[], contentLength := 0, authBearer := none, bodySlice := dummySlice }
+  let rOverflow ← dispatchRoutes (Array.replicate 65 routes[0]!) { method := "GET", path := "/v1/health", headers := #[], contentLength := 0, authBearer := none, bodySlice := dummySlice }
   let wire405 := String.fromUTF8! rMethodErr.toWireBytes
-  if rGet.status != 200 || rMethodErr.status != 405 || rNotFound.status != 404 ||
+  if rGet.status != 200 || rMethodErr.status != 405 || rNotFound.status != 404 || rOverflow.status != 500 ||
      (wire405.splitOn "405 Method Not Allowed").length ≤ 1 then
     IO.eprintln "[lean-sys-core] FAIL: dispatchRoutes / HttpResponse.toWireBytes mismatch"
     return 1
@@ -304,7 +316,7 @@ def runSelfTest : IO UInt32 := do
       IO.eprintln s!"[lean-sys-core] FAIL: unexpected HTTP response: {respBody}"
       return 1
 
-  IO.println s!"\{ \"ok\": true, \"binary\": \"lean-sys-core\", \"c_abi_gates\": 17, \"wal_torn_recovery\": true, \"cas_hardlink\": true, \"sst_bloom\": true, \"table_range_scan\": true, \"auth_rotation\": true, \"proc_log\": true, \"proc_stat_scanner\": true, \"jsonrpc_2_0\": true, \"shm_ring\": true, \"mmap_seqlock\": true, \"jsonl_tape\": true, \"reactor_keepalive\": true, \"sandbox_rlimit\": true, \"pgid_reaper\": true, \"http_loopback_port\": {boundPort} }"
+  IO.println s!"\{ \"ok\": true, \"binary\": \"lean-sys-core\", \"c_abi_gates\": 25, \"wal_torn_recovery\": true, \"cas_hardlink\": true, \"sst_bloom\": true, \"table_range_scan\": true, \"auth_rotation\": true, \"proc_log\": true, \"proc_stat_scanner\": true, \"jsonrpc_2_0\": true, \"shm_ring\": true, \"mmap_seqlock\": true, \"jsonl_tape\": true, \"reactor_keepalive\": true, \"sandbox_rlimit\": true, \"pgid_reaper\": true, \"http_loopback_port\": {boundPort} }"
   return 0
 
 /-- Run deterministic micro-benchmarks for `autoresearch/sys_arena.py` and emit JSON metrics. -/
@@ -371,7 +383,7 @@ def main (args : List String) : IO UInt32 := do
   | ["bench"] | ["--bench"] => LeanSys.Core.runBench 4000
   | ["bench", nStr] | ["--bench", nStr] => LeanSys.Core.runBench (nStr.toNat?.getD 4000)
   | ["--c-abi"] =>
-    IO.println "{\"ok\":true,\"exports\":[\"leansys_verify_slice_bounds\",\"leansys_verify_wal_frame\",\"leansys_verify_cas_digest\",\"leansys_check_http_bounds\",\"leansys_verify_jsonl_tape\",\"leansys_verify_ring_cursor\",\"leansys_verify_sst_block\",\"leansys_verify_poll_interest\",\"leansys_verify_rlimit_budget\",\"leansys_mix64_word\",\"leansys_verify_composite_key_order\",\"leansys_verify_token_auth\",\"leansys_verify_log_window\",\"leansys_verify_jsonrpc_frame\",\"leansys_gate_admit\",\"leansys_verify_mmap_seqlock\",\"leansys_verify_proc_stat_fields\",\"leansys_sse_frame_scan\",\"leansys_gfm_pipe_scan\",\"leansys_tag_scan\",\"leansys_transcript_index\",\"leansys_verify_par_chunk\",\"leansys_verify_arena_disjoint\"]}"
+    IO.println "{\"ok\":true,\"exports\":[\"leansys_verify_slice_bounds\",\"leansys_verify_wal_frame\",\"leansys_verify_cas_digest\",\"leansys_check_http_bounds\",\"leansys_verify_jsonl_tape\",\"leansys_verify_ring_cursor\",\"leansys_verify_sst_block\",\"leansys_verify_poll_interest\",\"leansys_verify_rlimit_budget\",\"leansys_mix64_word\",\"leansys_verify_composite_key_order\",\"leansys_verify_token_auth\",\"leansys_verify_log_window\",\"leansys_verify_jsonrpc_frame\",\"leansys_gate_admit\",\"leansys_verify_mmap_seqlock\",\"leansys_verify_proc_stat_fields\",\"leansys_sse_frame_scan\",\"leansys_gfm_pipe_scan\",\"leansys_tag_scan\",\"leansys_transcript_index\",\"leansys_verify_par_chunk\",\"leansys_verify_arena_disjoint\",\"leansys_verify_snapshot_visibility\",\"leansys_verify_http_route_match\"]}"
     return 0
   | _ =>
     IO.println "usage: lean-sys-core [self-test | bench | --c-abi]"

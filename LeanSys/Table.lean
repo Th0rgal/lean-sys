@@ -60,18 +60,37 @@ def le (a b : CompositeKey) : Bool :=
 
 end CompositeKey
 
+/-- Explicit 5-byte binary tombstone sentinel (`0xFF 0x00 'D' 'E' 'L'`) so empty string values `""` (`len == 0`) remain distinct from deletions. -/
+def tombstoneMarker : ByteArray :=
+  ByteArray.mk #[0xFF, 0x00, 0x44, 0x45, 0x4C]
+
+/-- Check whether a `ByteSlice` carries the explicit `tombstoneMarker` sentinel. -/
+@[inline]
+def isTombstoneSlice (s : ByteSlice) : Bool :=
+  s.len == 5 && s.off + 5 ≤ s.ba.size &&
+  s.ba.get! s.off == 0xFF &&
+  s.ba.get! (s.off + 1) == 0x00 &&
+  s.ba.get! (s.off + 2) == 0x44 &&
+  s.ba.get! (s.off + 3) == 0x45 &&
+  s.ba.get! (s.off + 4) == 0x4C
+
 /-- Put a `(CompositeKey, payload)` record into a `LeanSys.Store.Handle`. -/
 @[inline]
 def putComposite (st : Store.Handle) (k : CompositeKey) (val : ByteSlice) (sync : Bool := false) : IO (SysResult Store.Handle) :=
   Store.put st (CompositeKey.encode k) val sync
+
+/-- Write an explicit MVCC deletion tombstone at `k` (`(hi, lo, seq)`) into a `LeanSys.Store.Handle`. -/
+@[inline]
+def deleteComposite (st : Store.Handle) (k : CompositeKey) (sync : Bool := false) : IO (SysResult Store.Handle) :=
+  Store.put st (CompositeKey.encode k) (ByteSlice.ofByteArray tombstoneMarker) sync
 
 /-- Point lookup of a `CompositeKey` in an `SstTable`. -/
 @[inline]
 def getComposite? (tbl : SstTable) (k : CompositeKey) : Option ByteSlice :=
   SstTable.get? tbl (CompositeKey.encode k)
 
-/-- Decode the 64-bit big-endian hex `seq` component from a 50-byte encoded `CompositeKey` (`HHHHHHHHHHHHHHHH:LLLLLLLLLLLLLLLL:SSSSSSSSSSSSSSSS`). -/
-def decodeSeq? (keyStr : String) : Option UInt64 := Id.run do
+/-- Decode the `(hi, lo)` 33-byte user-key prefix and 64-bit big-endian hex `seq` from a 50-byte encoded `CompositeKey`. -/
+def decodeUserKeyAndSeq? (keyStr : String) : Option (String × UInt64) := Id.run do
   let bytes := keyStr.toUTF8
   if bytes.size != 50 || bytes.get! 16 != 58 || bytes.get! 33 != 58 then
     return none
@@ -86,15 +105,76 @@ def decodeSeq? (keyStr : String) : Option UInt64 := Id.run do
     match nib? with
     | none => return none
     | some v => acc := (acc <<< 4) ||| v
-  return some acc
+  let userPrefix := String.fromUTF8! (bytes.extract 0 33)
+  return some (userPrefix, acc)
+
+/-- Decode the 64-bit big-endian hex `seq` component from a 50-byte encoded `CompositeKey` (`HHHHHHHHHHHHHHHH:LLLLLLLLLLLLLLLL:SSSSSSSSSSSSSSSS`). -/
+@[inline]
+def decodeSeq? (keyStr : String) : Option UInt64 :=
+  (decodeUserKeyAndSeq? keyStr).map Prod.snd
 
 /--
-  Snapshot-isolated prefix & range scan over `SstTable` between `[loKey, hiKey]` (inclusive)
+  MVCC snapshot-isolated range scan over `SstTable` between `[loKey, hiKey]` (inclusive)
   at snapshot sequence `maxSnapshotSeq`:
-  - Gated by `leansys_verify_composite_key_order` and `leansys_verify_snapshot_visibility`.
-  - Excludes entries with `seq > maxSnapshotSeq` and tombstones (`valLen == 0`).
+  - Groups contiguous versions sharing the same `(hi, lo)` user-key prefix (`HHHHHHHHHHHHHHHH:LLLLLLLLLLLLLLLL`).
+  - Selects the latest version with `entrySeq ≤ maxSnapshotSeq` for each `(hi, lo)` key.
+  - Gates final visibility via `leansys_verify_snapshot_visibility`: if the winning version at `≤ maxSnapshotSeq`
+    is a deletion tombstone (`isTombstoneSlice`), the entire `(hi, lo)` key is masked (hiding older versions `seq < tombSeq`).
+  - Empty string payloads (`""`, `len == 0`) are NOT tombstones and remain visible.
 -/
-def rangeScanSnapshot (tbl : SstTable) (loKey hiKey : CompositeKey) (maxSnapshotSeq : UInt64) (limit : Nat := 256)
+def rangeScanSnapshot (tbl : SstTable) (loKey hiKey : CompositeKey) (maxSnapshotSeq : UInt64) (limit : Nat := 256) : Array (String × ByteSlice) := Id.run do
+  if !CompositeKey.le loKey hiKey || limit == 0 then
+    return #[]
+  let loStr := CompositeKey.encode loKey
+  let hiStr := CompositeKey.encode hiKey
+  let es := tbl.entries
+  let mut l : Nat := 0
+  let mut r : Nat := es.size
+  while l < r do
+    let mid := (l + r) >>> 1
+    if es[mid]!.key < loStr then l := mid + 1 else r := mid
+  let mut out : Array (String × ByteSlice) := Array.mkEmpty (Nat.min limit 32)
+  let mut idx := l
+  while idx < es.size && out.size < limit do
+    let e0 := es[idx]!
+    if hiStr < e0.key then break
+    match decodeUserKeyAndSeq? e0.key with
+    | none =>
+      idx := idx + 1
+    | some (groupPrefix, _) =>
+      let mut bestKey : String := ""
+      let mut bestSlice : ByteSlice := ByteSlice.ofByteArray ByteArray.empty
+      let mut bestSeq : UInt64 := 0
+      let mut bestTomb : UInt8 := 1
+      let mut foundInSnap : Bool := false
+      while idx < es.size do
+        let e := es[idx]!
+        if hiStr < e.key then break
+        match decodeUserKeyAndSeq? e.key with
+        | none => break
+        | some (uPrefix, entrySeq) =>
+          if uPrefix != groupPrefix then break
+          if e.valOff + e.valLen ≤ tbl.rawBuf.size then
+            let sl : ByteSlice := { ba := tbl.rawBuf, off := e.valOff, len := e.valLen }
+            let isTomb : UInt8 := if isTombstoneSlice sl then 1 else 0
+            -- Check `entrySeq <= maxSnapshotSeq` via C-ABI gate (passing `isTombstone = 0` for candidate selection)
+            if verifySnapshotVisibility entrySeq maxSnapshotSeq 0 == 1 then
+              if !foundInSnap || bestSeq ≤ entrySeq then
+                bestKey := e.key
+                bestSlice := sl
+                bestSeq := entrySeq
+                bestTomb := isTomb
+                foundInSnap := true
+          idx := idx + 1
+      if foundInSnap && verifySnapshotVisibility bestSeq maxSnapshotSeq bestTomb == 1 then
+        out := out.push (bestKey, bestSlice)
+  return out
+
+/--
+  Bounded-sequence event stream scan over `SstTable` between `[loKey, hiKey]` (inclusive)
+  up to `maxSnapshotSeq` (emits every non-tombstone event entry with `seq ≤ maxSnapshotSeq`).
+-/
+def rangeScanUpTo (tbl : SstTable) (loKey hiKey : CompositeKey) (maxSnapshotSeq : UInt64) (limit : Nat := 256)
     (ignoreTombstones : Bool := true) : Array (String × ByteSlice) := Id.run do
   if !CompositeKey.le loKey hiKey || limit == 0 then
     return #[]
@@ -111,11 +191,12 @@ def rangeScanSnapshot (tbl : SstTable) (loKey hiKey : CompositeKey) (maxSnapshot
   while idx < es.size && out.size < limit do
     let e := es[idx]!
     if hiStr < e.key then break
-    let isTombstone : UInt8 := if ignoreTombstones && e.valLen == 0 then 1 else 0
-    if let some entrySeq := decodeSeq? e.key then
-      if verifySnapshotVisibility entrySeq maxSnapshotSeq isTombstone == 1 &&
-         e.valOff + e.valLen ≤ tbl.rawBuf.size then
-        out := out.push (e.key, { ba := tbl.rawBuf, off := e.valOff, len := e.valLen })
+    if e.valOff + e.valLen ≤ tbl.rawBuf.size then
+      let sl : ByteSlice := { ba := tbl.rawBuf, off := e.valOff, len := e.valLen }
+      let isTomb : UInt8 := if ignoreTombstones && isTombstoneSlice sl then 1 else 0
+      if let some entrySeq := decodeSeq? e.key then
+        if verifySnapshotVisibility entrySeq maxSnapshotSeq isTomb == 1 then
+          out := out.push (e.key, sl)
     idx := idx + 1
   return out
 
@@ -124,8 +205,25 @@ def rangeScanSnapshot (tbl : SstTable) (loKey hiKey : CompositeKey) (maxSnapshot
   returning up to `limit` matching `(keyStr, valueSlice)` pairs in ascending order.
   Gated by `leansys_verify_composite_key_order`.
 -/
-@[inline]
-def rangeScan (tbl : SstTable) (loKey hiKey : CompositeKey) (limit : Nat := 256) : Array (String × ByteSlice) :=
-  rangeScanSnapshot tbl loKey hiKey 0xFFFFFFFFFFFFFFFF limit false
+def rangeScan (tbl : SstTable) (loKey hiKey : CompositeKey) (limit : Nat := 256) : Array (String × ByteSlice) := Id.run do
+  if !CompositeKey.le loKey hiKey || limit == 0 then
+    return #[]
+  let loStr := CompositeKey.encode loKey
+  let hiStr := CompositeKey.encode hiKey
+  let es := tbl.entries
+  let mut l : Nat := 0
+  let mut r : Nat := es.size
+  while l < r do
+    let mid := (l + r) >>> 1
+    if es[mid]!.key < loStr then l := mid + 1 else r := mid
+  let mut out : Array (String × ByteSlice) := Array.mkEmpty (Nat.min limit 32)
+  let mut idx := l
+  while idx < es.size && out.size < limit do
+    let e := es[idx]!
+    if hiStr < e.key then break
+    if e.valOff + e.valLen ≤ tbl.rawBuf.size then
+      out := out.push (e.key, { ba := tbl.rawBuf, off := e.valOff, len := e.valLen })
+    idx := idx + 1
+  return out
 
 end LeanSys.Table
