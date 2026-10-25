@@ -324,7 +324,7 @@ def runSelfTest : IO UInt32 := do
   IO.println s!"\{ \"ok\": true, \"binary\": \"lean-sys-core\", \"c_abi_gates\": 26, \"wal_torn_recovery\": true, \"cas_hardlink\": true, \"sst_bloom\": true, \"table_range_scan\": true, \"auth_rotation\": true, \"proc_log\": true, \"proc_stat_scanner\": true, \"jsonrpc_2_0\": true, \"shm_ring\": true, \"mmap_seqlock\": true, \"jsonl_tape\": true, \"reactor_keepalive\": true, \"sandbox_rlimit\": true, \"pgid_reaper\": true, \"http_loopback_port\": {boundPort} }"
   return 0
 
-/-- Run deterministic micro-benchmarks for `autoresearch/sys_arena.py` and emit JSON metrics. -/
+/-- Run deterministic micro-benchmarks for `lean-sys-core bench` and emit JSON metrics. -/
 def runBench (iters : Nat := 2000) : IO UInt32 := do
   let ts ← IO.monoNanosNow
   let benchDir := s!"/dev/shm/lean-sys-bench-{ts}"
