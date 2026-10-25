@@ -46,7 +46,7 @@ theorem checkCounterexampleTriage_sound (x : CounterexampleTriageInput) :
         (x.hasMissingHypHint = false ∧ x.refDisagreesWithCandidate = true ∧ x.triageClass == 2) ∨
         (x.hasMissingHypHint = false ∧ x.refDisagreesWithCandidate = false ∧ x.triageClass == 3))) := by
   unfold checkCounterexampleTriage
-  simp [Bool.and_eq_true, Bool.or_eq_true, Bool.not_eq_true', and_assoc, or_assoc]
+  simp [Bool.and_eq_true, Bool.or_eq_true, and_assoc, or_assoc]
 
 def counterexampleTriageContractMetaSpec : MetaGateSpec CounterexampleTriageInput
     (fun x => x.hasViolation = true ∧
