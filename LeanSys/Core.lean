@@ -133,9 +133,23 @@ def runSelfTest : IO UInt32 := do
                       verifyIosJetsamBudget 134217728 65536 134217728 16383 0 == 0
   let workerGateOk := verifyWorkerBudget 4 6 24 4096 1 == 1 &&
                       verifyWorkerBudget 4 8 24 4096 1 == 0 &&
+                      verifyWorkerBudget 6 9 54 4096 2 == 1 &&
+                      verifyWorkerBudget 6 10 54 4096 2 == 0 &&
                       verifyWorkerBudget 4 8 24 4096 0 == 1 &&
                       verifyWorkerBudget 0 6 24 4096 1 == 0
-  if !(sbOk && wfOk && casGateOk && httpGateOk && tapeGateOk && ringGateOk && sstGateOk && pollGateOk && rlimGateOk && mixGateOk && ckGateOk && tokGateOk && logGateOk && rpcGateOk && admitGateOk && seqlockGateOk && procStatGateOk && sseGateOk && gfmGateOk && tagGateOk && trIdxGateOk && parChunkGateOk && arenaDisjointGateOk && snapVisGateOk && routeMatchGateOk && triageGateOk && dagWaveGateOk && jetsamGateOk && workerGateOk) then
+  let pageBufGateOk := verifyPageAlignedBuffer 0x10000 4096 16384 1048576 134217728 16383 == 1 &&
+                       verifyPageAlignedBuffer 0x11000 4096 4096 1048576 134217728 4095 == 1 &&
+                       verifyPageAlignedBuffer 0x11000 4096 16384 1048576 134217728 16383 == 0 &&
+                       verifyPageAlignedBuffer 0 4096 16384 1048576 134217728 16383 == 0 &&
+                       verifyPageAlignedBuffer 0x10000 4096 16384 1048576 134217728 8191 == 0
+  let isaGateOk := selectIsaVariant IsaLevel.tensorG3.hwcapMask IsaLevel.tensorG3.hwcapMask 2 3 == 2 &&
+                   selectIsaVariant IsaLevel.appleA15.hwcapMask IsaLevel.tensorG3.hwcapMask 2 3 == 0 &&
+                   verifyIsaSelection IsaLevel.tensorG3.hwcapMask IsaLevel.tensorG3.hwcapMask 2 3 == 1 &&
+                   verifyIsaSelection IsaLevel.appleA15.hwcapMask IsaLevel.tensorG3.hwcapMask 2 3 == 0 &&
+                   IsaLevel.arm64Baseline.le IsaLevel.appleA15 &&
+                   IsaLevel.appleA15.le IsaLevel.appleA16_A17 &&
+                   IsaLevel.appleA16_A17.le IsaLevel.tensorG3
+  if !(sbOk && wfOk && casGateOk && httpGateOk && tapeGateOk && ringGateOk && sstGateOk && pollGateOk && rlimGateOk && mixGateOk && ckGateOk && tokGateOk && logGateOk && rpcGateOk && admitGateOk && seqlockGateOk && procStatGateOk && sseGateOk && gfmGateOk && tagGateOk && trIdxGateOk && parChunkGateOk && arenaDisjointGateOk && snapVisGateOk && routeMatchGateOk && triageGateOk && dagWaveGateOk && jetsamGateOk && workerGateOk && pageBufGateOk && isaGateOk) then
     IO.eprintln "[lean-sys-core] FAIL: C-ABI Spec gates check failed"
     return 1
 
@@ -146,10 +160,13 @@ def runSelfTest : IO UInt32 := do
   let seqXor := seqChunks.foldl (fun acc c =>
     acc ^^^ xxh64Slice { ba := parBuf, off := c.startIdx, len := c.endIdx - c.startIdx } c.startIdx.toUInt64) (0 : UInt64)
   let waveOut ← parMapWave 4 #[10, 20, 30, 40, 50] (fun x => pure (x * 2))
-  let microOut ← parMapMicroChunks 4096 { maxWorkers := 6, microChunkFactor := 4, minGrain := 256, isMobileHetero := true }
+  let microOut ← parMapMicroChunks 4096 (WorkerBudget.ofTopology CoreTopology.appleA15 256)
     (fun c => pure (c.endIdx - c.startIdx))
   let microSum := microOut.foldl (· + ·) 0
-  if parXor == 0 || parXor != seqXor || seqChunks.size != 4 || waveOut != #[20, 40, 60, 80, 100] || microSum != 4096 then
+  let tensorOut ← parMapMicroChunks 4096 (WorkerBudget.ofTopology CoreTopology.tensorG3 256)
+    (fun c => pure (c.endIdx - c.startIdx))
+  let tensorSum := tensorOut.foldl (· + ·) 0
+  if parXor == 0 || parXor != seqXor || seqChunks.size != 4 || waveOut != #[20, 40, 60, 80, 100] || microSum != 4096 || tensorSum != 4096 then
     IO.eprintln "[lean-sys-core] FAIL: LeanSys.Par multi-threaded reduction or wave order mismatch"
     return 1
 
@@ -361,7 +378,7 @@ def runSelfTest : IO UInt32 := do
       IO.eprintln s!"[lean-sys-core] FAIL: unexpected HTTP response: {respBody}"
       return 1
 
-  IO.println s!"\{ \"ok\": true, \"binary\": \"lean-sys-core\", \"c_abi_gates\": 27, \"par_scheduler\": true, \"wal_torn_recovery\": true, \"cas_hardlink\": true, \"sst_bloom\": true, \"table_range_scan\": true, \"auth_rotation\": true, \"proc_log\": true, \"proc_stat_scanner\": true, \"jsonrpc_2_0\": true, \"shm_ring\": true, \"mmap_seqlock\": true, \"jsonl_tape\": true, \"reactor_keepalive\": true, \"sandbox_rlimit\": true, \"pgid_reaper\": true, \"http_loopback_port\": {boundPort} }"
+  IO.println s!"\{ \"ok\": true, \"binary\": \"lean-sys-core\", \"c_abi_gates\": 32, \"par_scheduler\": true, \"wal_torn_recovery\": true, \"cas_hardlink\": true, \"sst_bloom\": true, \"table_range_scan\": true, \"auth_rotation\": true, \"proc_log\": true, \"proc_stat_scanner\": true, \"jsonrpc_2_0\": true, \"shm_ring\": true, \"mmap_seqlock\": true, \"jsonl_tape\": true, \"reactor_keepalive\": true, \"sandbox_rlimit\": true, \"pgid_reaper\": true, \"http_loopback_port\": {boundPort} }"
   return 0
 
 /-- Run deterministic micro-benchmarks for `lean-sys-core bench` and emit JSON metrics. -/

@@ -60,4 +60,4 @@ if [ -n "$DUP_EXPORTS" ]; then
   echo "ERROR: Duplicate C-ABI @[export] symbols found in LeanSys: $DUP_EXPORTS" >&2
   exit 1
 fi
-echo "[lean-sys] ALL 5 CI GATES PASSED (37/37 tight specs, 27 C-ABI exports, c/lean_sys_shim.c=${SHIM_LOC} LOC, TCB_CLEAN)"
+echo "[lean-sys] ALL 5 CI GATES PASSED (42/42 tight specs, 32 C-ABI exports, c/lean_sys_shim.c=${SHIM_LOC} LOC, TCB_CLEAN)"

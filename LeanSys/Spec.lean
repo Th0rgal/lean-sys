@@ -1173,41 +1173,144 @@ theorem ios_jetsam_budget_rejects_overflow_or_excess (j : IosJetsamBudgetCheck)
   iosJetsamBudgetMetaSpec.rejects_unsafe () j h_bad
 
 /--
-  Unboxed C-ABI Bounded Worker Pool & Asymmetric P/E-Core Micro-Chunk Gate (`leansys_verify_worker_budget`):
+  Unboxed C-ABI Bounded Worker Pool & Asymmetric Multi-Cluster Micro-Chunk Gate (`leansys_verify_worker_budget`):
   Certifies that `0 < activeWorkers ≤ maxWorkers ≤ 64`, `0 < totalLen`, `activeWorkers ≤ microChunks ≤ maxWorkers * 8`,
-  and on mobile heterogeneous SoCs (`isMobileHetero == 1`, e.g. Apple A15 2P+4E), `maxWorkers ≤ 6`.
+  and enforces cluster-specific core caps (`topologyKind == 0` SMP `≤ 64`, `topologyKind == 1` 2-tier P+E `≤ 6` e.g. Apple A15–A18,
+  `topologyKind == 2` 3-tier Prime+Mid+Little `≤ 9` e.g. Google Tensor G3 / Pixel 8).
 -/
 @[inline, export leansys_verify_worker_budget]
 def verifyWorkerBudget (activeWorkers maxWorkers microChunks totalLen : UInt64)
-    (isMobileHetero : UInt8) : UInt8 :=
+    (topologyKind : UInt8) : UInt8 :=
   if 0 < activeWorkers && activeWorkers ≤ maxWorkers && maxWorkers ≤ 64 &&
      0 < totalLen && activeWorkers ≤ microChunks && microChunks ≤ maxWorkers * 8 &&
-     isMobileHetero ≤ 1 && (isMobileHetero == 0 || maxWorkers ≤ 6) then 1 else 0
+     topologyKind ≤ 2 && (topologyKind != 1 || maxWorkers ≤ 6) &&
+     (topologyKind != 2 || maxWorkers ≤ 9) then 1 else 0
 
-/-- Bounded worker pool & P/E micro-chunk check parameters (≤ 3 fields). -/
+/-- Bounded worker pool & multi-cluster micro-chunk check parameters (≤ 3 fields). -/
 structure WorkerBudgetCheck where
   workers        : UInt64 × UInt64
   chunksAndTotal : UInt64 × UInt64
-  isMobileHetero : UInt8
+  topologyKind   : UInt8
   deriving Repr, DecidableEq
 
-/-- Layer II Bundle 32: Bounded worker pool & P/E micro-chunk admission gate (`leansys_verify_worker_budget`). -/
+/-- Layer II Bundle 32: Bounded worker pool & multi-cluster micro-chunk admission gate (`leansys_verify_worker_budget`). -/
 def workerBudgetMetaSpec : MetaGateSpec Unit WorkerBudgetCheck where
   inv _ := True
-  gate _ b := verifyWorkerBudget b.workers.1 b.workers.2 b.chunksAndTotal.1 b.chunksAndTotal.2 b.isMobileHetero == 1
+  gate _ b := verifyWorkerBudget b.workers.1 b.workers.2 b.chunksAndTotal.1 b.chunksAndTotal.2 b.topologyKind == 1
   step _ _ := ()
   safe _ b := (0 < b.workers.1 && b.workers.1 ≤ b.workers.2 && b.workers.2 ≤ 64 &&
                0 < b.chunksAndTotal.2 && b.workers.1 ≤ b.chunksAndTotal.1 && b.chunksAndTotal.1 ≤ b.workers.2 * 8 &&
-               b.isMobileHetero ≤ 1 && (b.isMobileHetero == 0 || b.workers.2 ≤ 6))
+               b.topologyKind ≤ 2 && (b.topologyKind != 1 || b.workers.2 ≤ 6) &&
+               (b.topologyKind != 2 || b.workers.2 ≤ 9))
   preserves_inv _ _ _ h := h
   ensures_safe _ b h := by unfold verifyWorkerBudget at h; split at h <;> simp_all
 
-/-- Corollary 32: `verifyWorkerBudget` rejects unbounded worker pools, empty work, excessive micro-chunks, or >6 mobile threads. -/
+/-- Corollary 32: `verifyWorkerBudget` rejects unbounded worker pools, empty work, or core cap violations. -/
 theorem worker_budget_rejects_unbounded_or_overflow (b : WorkerBudgetCheck)
     (h_bad : (0 < b.workers.1 && b.workers.1 ≤ b.workers.2 && b.workers.2 ≤ 64 &&
               0 < b.chunksAndTotal.2 && b.workers.1 ≤ b.chunksAndTotal.1 && b.chunksAndTotal.1 ≤ b.workers.2 * 8 &&
-              b.isMobileHetero ≤ 1 && (b.isMobileHetero == 0 || b.workers.2 ≤ 6)) = false) :
-    (verifyWorkerBudget b.workers.1 b.workers.2 b.chunksAndTotal.1 b.chunksAndTotal.2 b.isMobileHetero == 1) = false :=
+              b.topologyKind ≤ 2 && (b.topologyKind != 1 || b.workers.2 ≤ 6) &&
+              (b.topologyKind != 2 || b.workers.2 ≤ 9)) = false) :
+    (verifyWorkerBudget b.workers.1 b.workers.2 b.chunksAndTotal.1 b.chunksAndTotal.2 b.topologyKind == 1) = false :=
   workerBudgetMetaSpec.rejects_unsafe () b h_bad
+
+/--
+  Unboxed C-ABI Page-Aligned Buffer Geometry & Memory Budget Gate (`leansys_verify_page_aligned_buffer`):
+  Certifies that `addr > 0`, `0 < allocBytes ≤ capacityBytes`, `pageAlignMask` is an exact 4 KiB (`4095`)
+  or 16 KiB (`16383`) OS page mask, both `addr` and `capacityBytes` are multiples of `pageAlignMask + 1`
+  (`((addr ||| capacityBytes) &&& pageAlignMask) == 0`), and `dirtyRssBytes + capacityBytes ≤ maxBudgetBytes`
+  without 64-bit unsigned overflow.
+-/
+@[inline, export leansys_verify_page_aligned_buffer]
+def verifyPageAlignedBuffer (addr allocBytes capacityBytes dirtyRssBytes maxBudgetBytes pageAlignMask : UInt64) : UInt8 :=
+  if 0 < addr && 0 < allocBytes && allocBytes ≤ capacityBytes &&
+     (pageAlignMask == 4095 || pageAlignMask == 16383) &&
+     ((addr ||| capacityBytes) &&& pageAlignMask) == 0 &&
+     subsliceOk dirtyRssBytes capacityBytes maxBudgetBytes then 1 else 0
+
+/-- Page-aligned buffer geometry & memory budget check parameters (≤ 3 fields). -/
+structure PageAlignedBufferCheck where
+  addrAndAlloc  : UInt64 × UInt64
+  capAndDirty   : UInt64 × UInt64
+  budgetAndMask : UInt64 × UInt64
+  deriving Repr, DecidableEq
+
+/-- Layer II Bundle 33: Page-aligned buffer geometry & memory budget gate (`leansys_verify_page_aligned_buffer`). -/
+def pageAlignedBufferMetaSpec : MetaGateSpec Unit PageAlignedBufferCheck where
+  inv _ := True
+  gate _ p :=
+    verifyPageAlignedBuffer p.addrAndAlloc.1 p.addrAndAlloc.2
+      p.capAndDirty.1 p.capAndDirty.2 p.budgetAndMask.1 p.budgetAndMask.2 == 1
+  step _ _ := ()
+  safe _ p := (0 < p.addrAndAlloc.1 && 0 < p.addrAndAlloc.2 && p.addrAndAlloc.2 ≤ p.capAndDirty.1 &&
+               (p.budgetAndMask.2 == 4095 || p.budgetAndMask.2 == 16383) &&
+               ((p.addrAndAlloc.1 ||| p.capAndDirty.1) &&& p.budgetAndMask.2) == 0 &&
+               p.capAndDirty.2 ≤ p.budgetAndMask.1 && p.capAndDirty.1 ≤ p.budgetAndMask.1 - p.capAndDirty.2)
+  preserves_inv _ _ _ h := h
+  ensures_safe _ p h := by unfold verifyPageAlignedBuffer subsliceOk at h; split at h <;> simp_all
+
+/-- Corollary 33: `verifyPageAlignedBuffer` rejects null pointers, unaligned 4K/16K geometry, or budget overflow. -/
+theorem page_aligned_buffer_rejects_unaligned_or_overflow (p : PageAlignedBufferCheck)
+    (h_bad : (0 < p.addrAndAlloc.1 && 0 < p.addrAndAlloc.2 && p.addrAndAlloc.2 ≤ p.capAndDirty.1 &&
+              (p.budgetAndMask.2 == 4095 || p.budgetAndMask.2 == 16383) &&
+              ((p.addrAndAlloc.1 ||| p.capAndDirty.1) &&& p.budgetAndMask.2) == 0 &&
+              p.capAndDirty.2 ≤ p.budgetAndMask.1 && p.capAndDirty.1 ≤ p.budgetAndMask.1 - p.capAndDirty.2) = false) :
+    (verifyPageAlignedBuffer p.addrAndAlloc.1 p.addrAndAlloc.2
+      p.capAndDirty.1 p.capAndDirty.2 p.budgetAndMask.1 p.budgetAndMask.2 == 1) = false :=
+  pageAlignedBufferMetaSpec.rejects_unsafe () p h_bad
+
+/--
+  Unboxed C-ABI Capability-Checked Runtime ISA Variant Selector (`leansys_select_isa`):
+  Returns `requestedVariantId` if and only if `0 < requestedVariantId ≤ maxVariantId ≤ 16`
+  and every capability bit in `requiredMask` is present in `detectedHwCaps`
+  (`(detectedHwCaps &&& requiredMask) == requiredMask`); otherwise deterministically falls back
+  to variant `0` (the guaranteed compile-time baseline).
+-/
+@[inline, export leansys_select_isa]
+def selectIsaVariant (detectedHwCaps requiredMask : UInt64)
+    (requestedVariantId maxVariantId : UInt8) : UInt8 :=
+  if 0 < requestedVariantId && requestedVariantId ≤ maxVariantId && maxVariantId ≤ 16 &&
+     (detectedHwCaps &&& requiredMask) == requiredMask then requestedVariantId else 0
+
+/--
+  Unboxed C-ABI Runtime ISA Selection Gate (`leansys_verify_isa_selection`):
+  Certifies that `selectedVariantId ≤ maxVariantId ≤ 16` and that any non-baseline variant
+  (`selectedVariantId != 0`) has its `requiredMask` fully supported by `detectedHwCaps`.
+-/
+@[inline, export leansys_verify_isa_selection]
+def verifyIsaSelection (detectedHwCaps requiredMask : UInt64)
+    (selectedVariantId maxVariantId : UInt8) : UInt8 :=
+  if selectedVariantId ≤ maxVariantId && maxVariantId ≤ 16 &&
+     (selectedVariantId == 0 || (detectedHwCaps &&& requiredMask) == requiredMask) then 1 else 0
+
+/-- Runtime ISA variant selection check parameters (≤ 3 fields). -/
+structure IsaSelectionCheck where
+  capsAndReq : UInt64 × UInt64
+  selAndMax  : UInt8 × UInt8
+  deriving Repr, DecidableEq
+
+/-- Layer II Bundle 34: Capability-checked runtime ISA selection gate (`leansys_verify_isa_selection`). -/
+def isaSelectionMetaSpec : MetaGateSpec Unit IsaSelectionCheck where
+  inv _ := True
+  gate _ s := verifyIsaSelection s.capsAndReq.1 s.capsAndReq.2 s.selAndMax.1 s.selAndMax.2 == 1
+  step _ _ := ()
+  safe _ s := (s.selAndMax.1 ≤ s.selAndMax.2 && s.selAndMax.2 ≤ 16 &&
+               (s.selAndMax.1 == 0 || (s.capsAndReq.1 &&& s.capsAndReq.2) == s.capsAndReq.2))
+  preserves_inv _ _ _ h := h
+  ensures_safe _ s h := by unfold verifyIsaSelection at h; split at h <;> simp_all
+
+/-- Corollary 34a: `verifyIsaSelection` rejects out-of-range variant IDs or non-baseline variants missing required hardware capabilities. -/
+theorem isa_selection_rejects_unsupported_or_oob (s : IsaSelectionCheck)
+    (h_bad : (s.selAndMax.1 ≤ s.selAndMax.2 && s.selAndMax.2 ≤ 16 &&
+              (s.selAndMax.1 == 0 || (s.capsAndReq.1 &&& s.capsAndReq.2) == s.capsAndReq.2)) = false) :
+    (verifyIsaSelection s.capsAndReq.1 s.capsAndReq.2 s.selAndMax.1 s.selAndMax.2 == 1) = false :=
+  isaSelectionMetaSpec.rejects_unsafe () s h_bad
+
+/-- Corollary 34b: `selectIsaVariant` always produces an ISA variant admitted by `verifyIsaSelection` whenever `maxVar ≤ 16`. -/
+theorem select_isa_variant_always_admitted (detectedHwCaps requiredMask : UInt64)
+    (reqVar maxVar : UInt8) (hMax : (maxVar ≤ 16) = true) :
+    verifyIsaSelection detectedHwCaps requiredMask (selectIsaVariant detectedHwCaps requiredMask reqVar maxVar) maxVar = 1 := by
+  unfold verifyIsaSelection selectIsaVariant
+  split <;> simp_all
 
 end LeanSys.Spec

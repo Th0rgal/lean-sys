@@ -27,6 +27,10 @@ namespace Par
   abbrev verifyParChunk := LeanSys.Spec.verifyParChunk
   abbrev verifyArenaDisjoint := LeanSys.Spec.verifyArenaDisjoint
   abbrev verifyDagWaveStep := LeanSys.Spec.verifyDagWaveStep
+  abbrev verifyWorkerBudget := LeanSys.Spec.verifyWorkerBudget
+  abbrev verifyPageAlignedBuffer := LeanSys.Spec.verifyPageAlignedBuffer
+  abbrev selectIsaVariant := LeanSys.Spec.selectIsaVariant
+  abbrev verifyIsaSelection := LeanSys.Spec.verifyIsaSelection
 end Par
 
 /-! ## Core pure zero-copy slices, hashes, codecs, and C-ABI verification gates (`LeanSys.Core`) -/
