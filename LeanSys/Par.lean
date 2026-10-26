@@ -129,6 +129,119 @@ theorem meet_le_right (a b : IsaLevel) : (a.meet b).le b = true := by
   rw [ArmBase.rank_ofRank_min_le_right]
   simp only [bool_and_imp_right, Bool.and_self]
 
+theorem bool_wellFormed_meet_step (s1 v1 m1 r4_1 r5_1 s2 v2 m2 r4_2 r5_2 : Bool)
+    (h1 : ((!s1 || v1) && (!v1 || r4_1) && (!m1 || r5_1)) = true)
+    (h2 : ((!s2 || v2) && (!v2 || r4_2) && (!m2 || r5_2)) = true) :
+    ((!(s1 && s2) || (v1 && v2)) &&
+     (!(v1 && v2) || (r4_1 && r4_2)) &&
+     (!(m1 && m2) || (r5_1 && r5_2))) = true := by
+  cases s1 <;> cases v1 <;> cases m1 <;> cases r4_1 <;> cases r5_1 <;>
+  cases s2 <;> cases v2 <;> cases m2 <;> cases r4_2 <;> cases r5_2 <;>
+  revert h1 h2 <;> decide
+
+theorem bool_wellFormed_join_step (s1 v1 m1 r4_1 r5_1 s2 v2 m2 r4_2 r5_2 : Bool)
+    (h1 : ((!s1 || v1) && (!v1 || r4_1) && (!m1 || r5_1)) = true)
+    (h2 : ((!s2 || v2) && (!v2 || r4_2) && (!m2 || r5_2)) = true) :
+    ((!(s1 || s2) || (v1 || v2)) &&
+     (!(v1 || v2) || (r4_1 || r4_2)) &&
+     (!(m1 || m2) || (r5_1 || r5_2))) = true := by
+  cases s1 <;> cases v1 <;> cases m1 <;> cases r4_1 <;> cases r5_1 <;>
+  cases s2 <;> cases v2 <;> cases m2 <;> cases r4_2 <;> cases r5_2 <;>
+  revert h1 h2 <;> decide
+
+theorem ArmBase.min_rank_ge_4 (x y : ArmBase) :
+    decide (4 ≤ (ArmBase.ofRank (Nat.min x.rank y.rank)).rank) =
+    (decide (4 ≤ x.rank) && decide (4 ≤ y.rank)) := by
+  cases x <;> cases y <;> rfl
+
+theorem ArmBase.min_rank_ge_5 (x y : ArmBase) :
+    decide (5 ≤ (ArmBase.ofRank (Nat.min x.rank y.rank)).rank) =
+    (decide (5 ≤ x.rank) && decide (5 ≤ y.rank)) := by
+  cases x <;> cases y <;> rfl
+
+theorem ArmBase.max_rank_ge_4 (x y : ArmBase) :
+    decide (4 ≤ (ArmBase.ofRank (Nat.max x.rank y.rank)).rank) =
+    (decide (4 ≤ x.rank) || decide (4 ≤ y.rank)) := by
+  cases x <;> cases y <;> rfl
+
+theorem ArmBase.max_rank_ge_5 (x y : ArmBase) :
+    decide (5 ≤ (ArmBase.ofRank (Nat.max x.rank y.rank)).rank) =
+    (decide (5 ≤ x.rank) || decide (5 ≤ y.rank)) := by
+  cases x <;> cases y <;> rfl
+
+/-- `meet` preserves architectural well-formedness (`sveBitperm → sve2`, `sve2 → base ≥ v9_0`, `sme2 → base ≥ v9_2`). -/
+theorem meet_wellFormed (a b : IsaLevel) (ha : a.wellFormed = true) (hb : b.wellFormed = true) :
+    (a.meet b).wellFormed = true := by
+  unfold wellFormed meet at *
+  dsimp only
+  rw [ArmBase.min_rank_ge_4, ArmBase.min_rank_ge_5]
+  exact bool_wellFormed_meet_step
+    a.sveBitperm a.sve2 a.sme2 (decide (4 ≤ a.base.rank)) (decide (5 ≤ a.base.rank))
+    b.sveBitperm b.sve2 b.sme2 (decide (4 ≤ b.base.rank)) (decide (5 ≤ b.base.rank)) ha hb
+
+/-- `join` preserves architectural well-formedness (`sveBitperm → sve2`, `sve2 → base ≥ v9_0`, `sme2 → base ≥ v9_2`). -/
+theorem join_wellFormed (a b : IsaLevel) (ha : a.wellFormed = true) (hb : b.wellFormed = true) :
+    (a.join b).wellFormed = true := by
+  unfold wellFormed join at *
+  dsimp only
+  rw [ArmBase.max_rank_ge_4, ArmBase.max_rank_ge_5]
+  exact bool_wellFormed_join_step
+    a.sveBitperm a.sve2 a.sme2 (decide (4 ≤ a.base.rank)) (decide (5 ≤ a.base.rank))
+    b.sveBitperm b.sve2 b.sme2 (decide (4 ≤ b.base.rank)) (decide (5 ≤ b.base.rank)) ha hb
+
+/-- Construct a well-formed `IsaLevel` from Linux AArch64 `AT_HWCAP` (`hwcap`) and `AT_HWCAP2` (`hwcap2`) bitmasks:
+    - `hwcap`: bit 1 (`ASIMD`/`neon`), bit 8 (`ATOMICS`/`lse`), bit 10 (`ASIMDHP`/`fp16`), bit 17 (`SHA3`), bit 20 (`ASIMDDP`/`dotprod`)
+    - `hwcap2`: bit 1 (`SVE2`), bit 4 (`SVEBITPERM`), bit 13 (`I8MM`), bit 14 (`BF16`), bit 37 (`SME2`) -/
+def ofLinuxHwcap (hwcap hwcap2 : UInt64) : IsaLevel :=
+  let hasNeon    := (hwcap &&& ((1 : UInt64) <<< 1)) != 0
+  let hasLse     := (hwcap &&& ((1 : UInt64) <<< 8)) != 0
+  let hasFp16    := (hwcap &&& ((1 : UInt64) <<< 10)) != 0
+  let hasSha3    := (hwcap &&& ((1 : UInt64) <<< 17)) != 0
+  let hasDotprod := (hwcap &&& ((1 : UInt64) <<< 20)) != 0
+  let hasSve2    := (hwcap2 &&& ((1 : UInt64) <<< 1)) != 0
+  let hasBitperm := hasSve2 && ((hwcap2 &&& ((1 : UInt64) <<< 4)) != 0)
+  let hasI8mm    := (hwcap2 &&& ((1 : UInt64) <<< 13)) != 0
+  let hasBf16    := (hwcap2 &&& ((1 : UInt64) <<< 14)) != 0
+  let hasSme2    := (hwcap2 &&& ((1 : UInt64) <<< 37)) != 0
+  let base : ArmBase :=
+    if hasSme2 then .v9_2
+    else if hasSve2 then .v9_0
+    else if hasI8mm || hasBf16 then .v8_6
+    else if hasSha3 then .v8_5
+    else if hasDotprod || hasLse || hasFp16 then .v8_2
+    else .v8_0
+  { base := base, neon := hasNeon, fp16 := hasFp16, dotprod := hasDotprod,
+    i8mm := hasI8mm, bf16 := hasBf16, sve2 := hasSve2, sveBitperm := hasBitperm,
+    sme2 := hasSme2, lse := hasLse, sha3 := hasSha3 }
+
+theorem ofLinuxHwcap_wellFormed_aux (sme2 sve2 bitperm i8mm bf16 sha3 dp lse fp16 : Bool) :
+    let b : ArmBase :=
+      if sme2 then .v9_2
+      else if sve2 then .v9_0
+      else if i8mm || bf16 then .v8_6
+      else if sha3 then .v8_5
+      else if dp || lse || fp16 then .v8_2
+      else .v8_0
+    ((!(sve2 && bitperm) || sve2) && (!sve2 || decide (4 ≤ b.rank)) && (!sme2 || decide (5 ≤ b.rank))) = true := by
+  cases sme2 <;> cases sve2 <;> cases bitperm <;>
+  cases i8mm <;> cases bf16 <;> cases sha3 <;> cases dp <;> cases lse <;> cases fp16 <;> rfl
+
+/-- `ofLinuxHwcap` always returns an architecturally well-formed `IsaLevel`. -/
+theorem ofLinuxHwcap_wellFormed (hwcap hwcap2 : UInt64) :
+    (ofLinuxHwcap hwcap hwcap2).wellFormed = true := by
+  unfold ofLinuxHwcap wellFormed
+  dsimp only
+  exact ofLinuxHwcap_wellFormed_aux
+    ((hwcap2 &&& ((1 : UInt64) <<< 37)) != 0)
+    ((hwcap2 &&& ((1 : UInt64) <<< 1)) != 0)
+    ((hwcap2 &&& ((1 : UInt64) <<< 4)) != 0)
+    ((hwcap2 &&& ((1 : UInt64) <<< 13)) != 0)
+    ((hwcap2 &&& ((1 : UInt64) <<< 14)) != 0)
+    ((hwcap &&& ((1 : UInt64) <<< 17)) != 0)
+    ((hwcap &&& ((1 : UInt64) <<< 20)) != 0)
+    ((hwcap &&& ((1 : UInt64) <<< 8)) != 0)
+    ((hwcap &&& ((1 : UInt64) <<< 10)) != 0)
+
 /-- Portable ARMv8.2-A baseline (`+neon,+fp16,+dotprod,+lse`). -/
 def arm64Baseline : IsaLevel :=
   { base := .v8_2, neon := true, fp16 := true, dotprod := true, lse := true }
@@ -151,6 +264,22 @@ def appleM4_A18 : IsaLevel :=
   { base := .v9_2, neon := true, fp16 := true, dotprod := true, i8mm := true, bf16 := true,
     sme2 := true, lse := true, sha3 := true }
 
+/-- All canonical `IsaLevel` presets satisfy `wellFormed`. -/
+theorem presets_wellFormed :
+    arm64Baseline.wellFormed = true ∧
+    appleA15.wellFormed = true ∧
+    appleA16_A17.wellFormed = true ∧
+    tensorG3.wellFormed = true ∧
+    appleM4_A18.wellFormed = true := by decide
+
+/-- All canonical `IsaLevel` preset bitmasks match `isaVariantRequiredMask 0..4`. -/
+theorem preset_masks_match_table :
+    arm64Baseline.hwcapMask = isaVariantRequiredMask 0 ∧
+    appleA15.hwcapMask = isaVariantRequiredMask 1 ∧
+    appleA16_A17.hwcapMask = isaVariantRequiredMask 2 ∧
+    tensorG3.hwcapMask = isaVariantRequiredMask 3 ∧
+    appleM4_A18.hwcapMask = isaVariantRequiredMask 4 := by decide
+
 end IsaLevel
 
 /-- A homogeneous cluster of CPU cores with relative per-core performance weight (`1000 = 1.0x` Little core). -/
@@ -169,6 +298,19 @@ def totalCores (t : CoreTopology) : Nat :=
 
 def totalWeight (t : CoreTopology) : Nat :=
   t.foldl (fun acc c => acc + c.cores * c.relPerf) 0
+
+def maxClusterPerf (t : CoreTopology) : Nat :=
+  t.foldl (fun acc c => Nat.max acc c.relPerf) 1000
+
+/-- Compute micro-chunk oversubscription factor (`2..8`) from cluster weight asymmetry
+    (`maxClusterPerf` vs mean core weight `totalWeight / totalCores`) and tier count (`2` for SMP, `4` for A15, `6` for Tensor G3). -/
+def weightedChunkFactor (t : CoreTopology) : Nat :=
+  let cores := Nat.max 1 (totalCores t)
+  let meanWeight := Nat.max 1 (totalWeight t / cores)
+  let maxPerf := maxClusterPerf t
+  let tierBonus := Nat.min 3 (t.length - 1)
+  let raw := (maxPerf * 2 + meanWeight / 2) / meanWeight + tierBonus
+  Nat.min 8 (Nat.max 2 raw)
 
 /-- Classify topology into C-ABI `topologyKind` (`0 = SMP ≤ 64`, `1 = 2-tier 2P+4E ≤ 6`, `2 = 3-tier 1+4+4 ≤ 9`). -/
 def topologyKind (t : CoreTopology) : UInt8 :=
@@ -190,21 +332,25 @@ def tensorG3 : CoreTopology :=
 
 end CoreTopology
 
-/-- Bounded worker pool & micro-chunk configuration parameterized by cluster topology. -/
+/-- Bounded worker pool & micro-chunk configuration parameterized by cluster topology (`topologyKind`: `0 = SMP`, `1 = 2P+4E`, `2 = 1+4+4`). -/
 structure WorkerBudget where
   maxWorkers       : Nat   := 6
   microChunkFactor : Nat   := 4
   minGrain         : Nat   := 64
-  isMobileHetero   : Bool  := false
   topologyKind     : UInt8 := 0
   deriving Repr, DecidableEq, Inhabited
 
-/-- Construct a `WorkerBudget` calibrated to a `CoreTopology` (`factor = 2` for SMP, `4` for 2-tier P+E, `6` for 3-tier Prime+Mid+Little). -/
+/-- Derived predicate: true iff `topologyKind > 0` (asymmetric mobile multi-cluster topology). -/
+@[inline]
+def WorkerBudget.isMobileHetero (b : WorkerBudget) : Bool :=
+  b.topologyKind > 0
+
+/-- Construct a `WorkerBudget` calibrated to a `CoreTopology` via `CoreTopology.weightedChunkFactor` (`factor = 2` for SMP, `4` for 2-tier P+E, `6` for 3-tier Prime+Mid+Little). -/
 def WorkerBudget.ofTopology (t : CoreTopology) (minGrain : Nat := 64) : WorkerBudget :=
   let kind := CoreTopology.topologyKind t
   let cores := Nat.max 1 (CoreTopology.totalCores t)
-  let factor := if kind == 2 then 6 else if kind == 1 then 4 else 2
-  { maxWorkers := cores, microChunkFactor := factor, minGrain := minGrain, isMobileHetero := kind > 0, topologyKind := kind }
+  let factor := CoreTopology.weightedChunkFactor t
+  { maxWorkers := cores, microChunkFactor := factor, minGrain := minGrain, topologyKind := kind }
 
 /-- Closed-form remainder-balanced partition of `[0, totalLen)` into `k = min totalLen numChunks`
     disjoint chunks where chunk `i` has length `totalLen / k + (if i < totalLen % k then 1 else 0)`,
@@ -296,7 +442,7 @@ def parMapMicroChunks [Inhabited α] (totalLen : Nat) (budget : WorkerBudget := 
     (f : ChunkSpan → IO α) : IO (Array α) := do
   if totalLen == 0 then
     return #[]
-  let kind : UInt8 := if budget.topologyKind > 0 && budget.topologyKind ≤ 2 then budget.topologyKind else if budget.isMobileHetero then 1 else 0
+  let kind : UInt8 := if budget.topologyKind ≤ 2 then budget.topologyKind else 0
   let capW : Nat := if kind == 1 then 6 else if kind == 2 then 9 else 64
   let maxW := Nat.min capW (Nat.max 1 budget.maxWorkers)
   let factor := Nat.min 8 (Nat.max 1 budget.microChunkFactor)

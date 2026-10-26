@@ -142,13 +142,24 @@ def runSelfTest : IO UInt32 := do
                        verifyPageAlignedBuffer 0x11000 4096 16384 1048576 134217728 16383 == 0 &&
                        verifyPageAlignedBuffer 0 4096 16384 1048576 134217728 16383 == 0 &&
                        verifyPageAlignedBuffer 0x10000 4096 16384 1048576 134217728 8191 == 0
-  let isaGateOk := selectIsaVariant IsaLevel.tensorG3.hwcapMask IsaLevel.tensorG3.hwcapMask 2 3 == 2 &&
-                   selectIsaVariant IsaLevel.appleA15.hwcapMask IsaLevel.tensorG3.hwcapMask 2 3 == 0 &&
-                   verifyIsaSelection IsaLevel.tensorG3.hwcapMask IsaLevel.tensorG3.hwcapMask 2 3 == 1 &&
-                   verifyIsaSelection IsaLevel.appleA15.hwcapMask IsaLevel.tensorG3.hwcapMask 2 3 == 0 &&
+  let isaGateOk := selectIsaVariant IsaLevel.tensorG3.hwcapMask IsaLevel.tensorG3.hwcapMask 3 3 == 3 &&
+                   selectIsaVariant IsaLevel.appleA15.hwcapMask IsaLevel.tensorG3.hwcapMask 3 3 == 0 &&
+                   selectIsaVariant IsaLevel.tensorG3.hwcapMask 0 3 3 == 0 &&
+                   verifyIsaSelection IsaLevel.tensorG3.hwcapMask IsaLevel.tensorG3.hwcapMask 3 3 == 1 &&
+                   verifyIsaSelection IsaLevel.appleA15.hwcapMask IsaLevel.tensorG3.hwcapMask 3 3 == 0 &&
+                   verifyIsaSelection IsaLevel.tensorG3.hwcapMask 0 3 3 == 0 &&
+                   verifyIsaSelection IsaLevel.tensorG3.hwcapMask IsaLevel.arm64Baseline.hwcapMask 3 3 == 0 &&
                    IsaLevel.arm64Baseline.le IsaLevel.appleA15 &&
                    IsaLevel.appleA15.le IsaLevel.appleA16_A17 &&
-                   IsaLevel.appleA16_A17.le IsaLevel.tensorG3
+                   IsaLevel.appleA16_A17.le IsaLevel.tensorG3 &&
+                   (IsaLevel.ofLinuxHwcap 0x120502 0x6012).wellFormed &&
+                   (IsaLevel.ofLinuxHwcap 0x120502 0x6012).hwcapMask == IsaLevel.tensorG3.hwcapMask &&
+                   (WorkerBudget.ofTopology (CoreTopology.uniformSmp 4)).microChunkFactor == 2 &&
+                   !(WorkerBudget.ofTopology (CoreTopology.uniformSmp 4)).isMobileHetero &&
+                   (WorkerBudget.ofTopology CoreTopology.appleA15).microChunkFactor == 4 &&
+                   (WorkerBudget.ofTopology CoreTopology.appleA15).isMobileHetero &&
+                   (WorkerBudget.ofTopology CoreTopology.tensorG3).microChunkFactor == 6 &&
+                   (WorkerBudget.ofTopology CoreTopology.tensorG3).isMobileHetero
   if !(sbOk && wfOk && casGateOk && httpGateOk && tapeGateOk && ringGateOk && sstGateOk && pollGateOk && rlimGateOk && mixGateOk && ckGateOk && tokGateOk && logGateOk && rpcGateOk && admitGateOk && seqlockGateOk && procStatGateOk && sseGateOk && gfmGateOk && tagGateOk && trIdxGateOk && parChunkGateOk && arenaDisjointGateOk && snapVisGateOk && routeMatchGateOk && triageGateOk && dagWaveGateOk && jetsamGateOk && workerGateOk && pageBufGateOk && isaGateOk) then
     IO.eprintln "[lean-sys-core] FAIL: C-ABI Spec gates check failed"
     return 1
@@ -445,7 +456,7 @@ def main (args : List String) : IO UInt32 := do
   | ["bench"] | ["--bench"] => LeanSys.Core.runBench 4000
   | ["bench", nStr] | ["--bench", nStr] => LeanSys.Core.runBench (nStr.toNat?.getD 4000)
   | ["--c-abi"] =>
-    IO.println "{\"ok\":true,\"exports\":[\"leansys_verify_slice_bounds\",\"leansys_verify_wal_frame\",\"leansys_verify_cas_digest\",\"leansys_check_http_bounds\",\"leansys_verify_jsonl_tape\",\"leansys_verify_ring_cursor\",\"leansys_verify_sst_block\",\"leansys_verify_poll_interest\",\"leansys_verify_rlimit_budget\",\"leansys_mix64_word\",\"leansys_verify_composite_key_order\",\"leansys_verify_token_auth\",\"leansys_verify_log_window\",\"leansys_verify_jsonrpc_frame\",\"leansys_gate_admit\",\"leansys_verify_mmap_seqlock\",\"leansys_verify_proc_stat_fields\",\"leansys_sse_frame_scan\",\"leansys_gfm_pipe_scan\",\"leansys_tag_scan\",\"leansys_transcript_index\",\"leansys_verify_par_chunk\",\"leansys_verify_arena_disjoint\",\"leansys_verify_snapshot_visibility\",\"leansys_verify_http_route_match\"]}"
+    IO.println "{\"ok\":true,\"exports\":[\"leansys_verify_slice_bounds\",\"leansys_verify_wal_frame\",\"leansys_verify_cas_digest\",\"leansys_check_http_bounds\",\"leansys_verify_jsonl_tape\",\"leansys_verify_ring_cursor\",\"leansys_verify_sst_block\",\"leansys_verify_poll_interest\",\"leansys_verify_rlimit_budget\",\"leansys_mix64_word\",\"leansys_verify_composite_key_order\",\"leansys_verify_token_auth\",\"leansys_verify_log_window\",\"leansys_verify_jsonrpc_frame\",\"leansys_gate_admit\",\"leansys_verify_mmap_seqlock\",\"leansys_verify_proc_stat_fields\",\"leansys_sse_frame_scan\",\"leansys_gfm_pipe_scan\",\"leansys_tag_scan\",\"leansys_transcript_index\",\"leansys_verify_par_chunk\",\"leansys_verify_arena_disjoint\",\"leansys_verify_snapshot_visibility\",\"leansys_verify_http_route_match\",\"leansys_verify_counterexample_triage\",\"leansys_verify_dag_wave_step\",\"leansys_verify_ios_jetsam_budget\",\"leansys_verify_worker_budget\",\"leansys_verify_page_aligned_buffer\",\"leansys_select_isa\",\"leansys_verify_isa_selection\"]}"
     return 0
   | _ =>
     IO.println "usage: lean-sys-core [self-test | bench | --c-abi]"

@@ -1260,8 +1260,26 @@ theorem page_aligned_buffer_rejects_unaligned_or_overflow (p : PageAlignedBuffer
   pageAlignedBufferMetaSpec.rejects_unsafe () p h_bad
 
 /--
+  Canonical capability bitmask required by each runtime ISA variant ID (`0..4`):
+  - `0` (`arm64Baseline`, ARMv8.2-A): `neon (bit 0) | fp16 (bit 1) | dotprod (bit 2) | lse (bit 8)` = `0x107`
+  - `1` (`appleA15`, ARMv8.5-A): `0x107 | sha3 (bit 9)` = `0x307`
+  - `2` (`appleA16_A17`, ARMv8.6-A): `0x307 | i8mm (bit 3) | bf16 (bit 4)` = `0x31F`
+  - `3` (`tensorG3`, ARMv9.0-A + SVE2): `0x31F | sve2 (bit 5) | sveBitperm (bit 6)` = `0x37F`
+  - `4` (`appleM4_A18`, ARMv9.2-A + SME2): `0x31F | sme2 (bit 7)` = `0x39F`
+-/
+@[inline]
+def isaVariantRequiredMask (variantId : UInt8) : UInt64 :=
+  if variantId == 0 then 0x107
+  else if variantId == 1 then 0x307
+  else if variantId == 2 then 0x31F
+  else if variantId == 3 then 0x37F
+  else if variantId == 4 then 0x39F
+  else 0xFFFFFFFFFFFFFFFF
+
+/--
   Unboxed C-ABI Capability-Checked Runtime ISA Variant Selector (`leansys_select_isa`):
-  Returns `requestedVariantId` if and only if `0 < requestedVariantId ≤ maxVariantId ≤ 16`
+  Returns `requestedVariantId` if and only if `0 < requestedVariantId ≤ maxVariantId ≤ 4`,
+  `requiredMask == isaVariantRequiredMask requestedVariantId` (rejecting forged masks),
   and every capability bit in `requiredMask` is present in `detectedHwCaps`
   (`(detectedHwCaps &&& requiredMask) == requiredMask`); otherwise deterministically falls back
   to variant `0` (the guaranteed compile-time baseline).
@@ -1269,18 +1287,21 @@ theorem page_aligned_buffer_rejects_unaligned_or_overflow (p : PageAlignedBuffer
 @[inline, export leansys_select_isa]
 def selectIsaVariant (detectedHwCaps requiredMask : UInt64)
     (requestedVariantId maxVariantId : UInt8) : UInt8 :=
-  if 0 < requestedVariantId && requestedVariantId ≤ maxVariantId && maxVariantId ≤ 16 &&
+  if 0 < requestedVariantId && requestedVariantId ≤ maxVariantId && maxVariantId ≤ 4 &&
+     requiredMask == isaVariantRequiredMask requestedVariantId &&
      (detectedHwCaps &&& requiredMask) == requiredMask then requestedVariantId else 0
 
 /--
   Unboxed C-ABI Runtime ISA Selection Gate (`leansys_verify_isa_selection`):
-  Certifies that `selectedVariantId ≤ maxVariantId ≤ 16` and that any non-baseline variant
-  (`selectedVariantId != 0`) has its `requiredMask` fully supported by `detectedHwCaps`.
+  Certifies that `selectedVariantId ≤ maxVariantId ≤ 4`, `requiredMask == isaVariantRequiredMask selectedVariantId`,
+  and any non-baseline variant (`selectedVariantId != 0`) has its canonical `requiredMask`
+  fully supported by `detectedHwCaps`.
 -/
 @[inline, export leansys_verify_isa_selection]
 def verifyIsaSelection (detectedHwCaps requiredMask : UInt64)
     (selectedVariantId maxVariantId : UInt8) : UInt8 :=
-  if selectedVariantId ≤ maxVariantId && maxVariantId ≤ 16 &&
+  if selectedVariantId ≤ maxVariantId && maxVariantId ≤ 4 &&
+     requiredMask == isaVariantRequiredMask selectedVariantId &&
      (selectedVariantId == 0 || (detectedHwCaps &&& requiredMask) == requiredMask) then 1 else 0
 
 /-- Runtime ISA variant selection check parameters (≤ 3 fields). -/
@@ -1294,23 +1315,38 @@ def isaSelectionMetaSpec : MetaGateSpec Unit IsaSelectionCheck where
   inv _ := True
   gate _ s := verifyIsaSelection s.capsAndReq.1 s.capsAndReq.2 s.selAndMax.1 s.selAndMax.2 == 1
   step _ _ := ()
-  safe _ s := (s.selAndMax.1 ≤ s.selAndMax.2 && s.selAndMax.2 ≤ 16 &&
+  safe _ s := (s.selAndMax.1 ≤ s.selAndMax.2 && s.selAndMax.2 ≤ 4 &&
+               s.capsAndReq.2 == isaVariantRequiredMask s.selAndMax.1 &&
                (s.selAndMax.1 == 0 || (s.capsAndReq.1 &&& s.capsAndReq.2) == s.capsAndReq.2))
   preserves_inv _ _ _ h := h
-  ensures_safe _ s h := by unfold verifyIsaSelection at h; split at h <;> simp_all
+  ensures_safe _ s h := by
+    unfold verifyIsaSelection at h
+    split at h
+    · rename_i hCond
+      exact hCond
+    · contradiction
 
-/-- Corollary 34a: `verifyIsaSelection` rejects out-of-range variant IDs or non-baseline variants missing required hardware capabilities. -/
+/-- Corollary 34a: `verifyIsaSelection` rejects forged masks, out-of-range variant IDs, or unsupported hardware capabilities. -/
 theorem isa_selection_rejects_unsupported_or_oob (s : IsaSelectionCheck)
-    (h_bad : (s.selAndMax.1 ≤ s.selAndMax.2 && s.selAndMax.2 ≤ 16 &&
+    (h_bad : (s.selAndMax.1 ≤ s.selAndMax.2 && s.selAndMax.2 ≤ 4 &&
+              s.capsAndReq.2 == isaVariantRequiredMask s.selAndMax.1 &&
               (s.selAndMax.1 == 0 || (s.capsAndReq.1 &&& s.capsAndReq.2) == s.capsAndReq.2)) = false) :
     (verifyIsaSelection s.capsAndReq.1 s.capsAndReq.2 s.selAndMax.1 s.selAndMax.2 == 1) = false :=
   isaSelectionMetaSpec.rejects_unsafe () s h_bad
 
-/-- Corollary 34b: `selectIsaVariant` always produces an ISA variant admitted by `verifyIsaSelection` whenever `maxVar ≤ 16`. -/
+/-- Corollary 34b: `selectIsaVariant` always produces a variant ID whose canonical mask is admitted by `verifyIsaSelection`. -/
 theorem select_isa_variant_always_admitted (detectedHwCaps requiredMask : UInt64)
-    (reqVar maxVar : UInt8) (hMax : (maxVar ≤ 16) = true) :
-    verifyIsaSelection detectedHwCaps requiredMask (selectIsaVariant detectedHwCaps requiredMask reqVar maxVar) maxVar = 1 := by
+    (reqVar maxVar : UInt8) (hMax : (maxVar ≤ 4) = true) :
+    let sel := selectIsaVariant detectedHwCaps requiredMask reqVar maxVar
+    verifyIsaSelection detectedHwCaps (isaVariantRequiredMask sel) sel maxVar = 1 := by
+  dsimp only
   unfold verifyIsaSelection selectIsaVariant
-  split <;> simp_all
+  split
+  · rename_i hCond
+    simp only [Bool.and_eq_true, beq_iff_eq] at hCond
+    rcases hCond with ⟨⟨⟨_, hLe⟩, hMask⟩, hCaps⟩
+    subst hMask
+    simp_all [isaVariantRequiredMask]
+  · simp_all [isaVariantRequiredMask]
 
 end LeanSys.Spec
