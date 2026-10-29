@@ -32,6 +32,7 @@ fn find_elan_tool(tool_name: &str) -> Option<PathBuf> {
     if let Ok(home) = env::var("HOME") {
         roots.push(PathBuf::from(home).join(".elan"));
     }
+    roots.push(PathBuf::from("/var/lib/orb-node/work/caches/elan"));
     roots.push(PathBuf::from("/var/lib/sandboxed-node/caches/elan"));
     for root in roots {
         let bin_cand = root.join("bin").join(tool_name);
@@ -75,7 +76,30 @@ const LEANSYS_EXPORTS: &[&str] = &[
     "leansys_transcript_index",
     "leansys_verify_par_chunk",
     "leansys_verify_arena_disjoint",
+    "leansys_verify_snapshot_visibility",
+    "leansys_verify_http_route_match",
+    "leansys_verify_counterexample_triage",
+    "leansys_verify_dag_wave_step",
+    "leansys_verify_ios_jetsam_budget",
+    "leansys_verify_worker_budget",
+    "leansys_verify_page_aligned_buffer",
+    "leansys_select_isa",
+    "leansys_verify_isa_selection",
+    "leansys_verify_fd_bounds",
 ];
+
+fn extract_spec_exports(spec_src: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for line in spec_src.lines() {
+        let trimmed = line.trim();
+        if let Some(rest) = trimmed.strip_prefix("@[inline, export ") {
+            if let Some(sym) = rest.strip_suffix(']') {
+                out.push(sym.trim().to_string());
+            }
+        }
+    }
+    out
+}
 
 fn build_lean_sys_cabi(root: &Path, out_dir: &Path) {
     println!(
@@ -98,6 +122,18 @@ fn build_lean_sys_cabi(root: &Path, out_dir: &Path) {
     println!(
         "cargo:rerun-if-changed={}",
         root.join("lean-toolchain").display()
+    );
+
+    let spec_src = fs::read_to_string(root.join("LeanSys/Spec.lean"))
+        .unwrap_or_else(|e| panic!("failed to read LeanSys/Spec.lean: {e}"));
+    let spec_exports = extract_spec_exports(&spec_src);
+    assert_eq!(
+        spec_exports,
+        LEANSYS_EXPORTS
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect::<Vec<_>>(),
+        "build.rs LEANSYS_EXPORTS drifted from @[inline, export ...] in LeanSys/Spec.lean"
     );
 
     let out_contracts_dir = out_dir.join("LeanSys").join("Contracts");

@@ -1311,16 +1311,21 @@ structure IsaSelectionCheck where
   deriving Repr, DecidableEq
 
 /-- Layer II Bundle 34: Capability-checked runtime ISA selection gate (`leansys_verify_isa_selection`). -/
+@[inline]
+def isaSelectionSafe (s : IsaSelectionCheck) : Bool :=
+  s.selAndMax.1 ≤ s.selAndMax.2 && s.selAndMax.2 ≤ 4 &&
+  s.capsAndReq.2 == isaVariantRequiredMask s.selAndMax.1 &&
+  (s.selAndMax.1 == 0 || (s.capsAndReq.1 &&& s.capsAndReq.2) == s.capsAndReq.2)
+
 def isaSelectionMetaSpec : MetaGateSpec Unit IsaSelectionCheck where
   inv _ := True
   gate _ s := verifyIsaSelection s.capsAndReq.1 s.capsAndReq.2 s.selAndMax.1 s.selAndMax.2 == 1
   step _ _ := ()
-  safe _ s := (s.selAndMax.1 ≤ s.selAndMax.2 && s.selAndMax.2 ≤ 4 &&
-               s.capsAndReq.2 == isaVariantRequiredMask s.selAndMax.1 &&
-               (s.selAndMax.1 == 0 || (s.capsAndReq.1 &&& s.capsAndReq.2) == s.capsAndReq.2))
+  safe _ s := isaSelectionSafe s
   preserves_inv _ _ _ h := h
   ensures_safe _ s h := by
     unfold verifyIsaSelection at h
+    unfold isaSelectionSafe
     split at h
     · rename_i hCond
       exact hCond
@@ -1328,9 +1333,7 @@ def isaSelectionMetaSpec : MetaGateSpec Unit IsaSelectionCheck where
 
 /-- Corollary 34a: `verifyIsaSelection` rejects forged masks, out-of-range variant IDs, or unsupported hardware capabilities. -/
 theorem isa_selection_rejects_unsupported_or_oob (s : IsaSelectionCheck)
-    (h_bad : (s.selAndMax.1 ≤ s.selAndMax.2 && s.selAndMax.2 ≤ 4 &&
-              s.capsAndReq.2 == isaVariantRequiredMask s.selAndMax.1 &&
-              (s.selAndMax.1 == 0 || (s.capsAndReq.1 &&& s.capsAndReq.2) == s.capsAndReq.2)) = false) :
+    (h_bad : isaSelectionSafe s = false) :
     (verifyIsaSelection s.capsAndReq.1 s.capsAndReq.2 s.selAndMax.1 s.selAndMax.2 == 1) = false :=
   isaSelectionMetaSpec.rejects_unsafe () s h_bad
 
@@ -1348,5 +1351,50 @@ theorem select_isa_variant_always_admitted (detectedHwCaps requiredMask : UInt64
     subst hMask
     simp_all [isaVariantRequiredMask]
   · simp_all [isaVariantRequiredMask]
+
+/--
+  Unboxed C-ABI Positive 32-Bit File-Descriptor Preservation Gate (`leansys_verify_fd_bounds`):
+  Certifies that a kernel file descriptor decoded from a non-error 64-bit syscall return word `rawWord`
+  lies in `[0, 0x7FFFFFFF]` (positive 32-bit POSIX `int`, including high descriptors `≥ 65536`)
+  and matches `fdOut` bit-for-bit without 16-bit truncation (`rawWord == fdOut.toUInt64`).
+-/
+@[inline, export leansys_verify_fd_bounds]
+def verifyFdBounds (rawWord : UInt64) (fdOut : UInt32) : UInt8 :=
+  if rawWord ≤ 0x7FFFFFFF && rawWord == fdOut.toUInt64 then 1 else 0
+
+/-- 32-bit file-descriptor preservation check parameters (≤ 3 fields). -/
+structure FdBoundsCheck where
+  rawWord : UInt64
+  fdOut   : UInt32
+  deriving Repr, DecidableEq
+
+/-- Layer II Bundle 35: 32-bit file-descriptor non-truncation & sign-bit safety gate (`leansys_verify_fd_bounds`). -/
+def fdBoundsMetaSpec : MetaGateSpec Unit FdBoundsCheck where
+  inv _ := True
+  gate _ d := verifyFdBounds d.rawWord d.fdOut == 1
+  step _ _ := ()
+  safe _ d := (d.rawWord ≤ 0x7FFFFFFF && d.rawWord == d.fdOut.toUInt64)
+  preserves_inv _ _ _ h := h
+  ensures_safe _ d h := by
+    unfold verifyFdBounds at h
+    split at h
+    · assumption
+    · contradiction
+
+/-- Corollary 35a: `verifyFdBounds` rejects negative/overflowing descriptors or truncated `UInt32` roundtrips. -/
+theorem fd_bounds_rejects_truncation_or_negative (d : FdBoundsCheck)
+    (h_bad : (d.rawWord ≤ 0x7FFFFFFF && d.rawWord == d.fdOut.toUInt64) = false) :
+    (verifyFdBounds d.rawWord d.fdOut == 1) = false :=
+  fdBoundsMetaSpec.rejects_unsafe () d h_bad
+
+/-- Corollary 35b: Any positive 32-bit descriptor (`fd ≤ 0x7FFFFFFF`) survives `UInt64` syscall word packing lossless. -/
+theorem fd_bounds_preserves_full_uint32 (fd : UInt32) (h_pos : fd ≤ 0x7FFFFFFF) :
+    verifyFdBounds fd.toUInt64 fd = 1 := by
+  unfold verifyFdBounds
+  have hle : fd.toUInt64 ≤ (0x7FFFFFFF : UInt64) := by
+    have hn : fd.toNat ≤ 2147483647 := UInt32.le_iff_toNat_le.mp h_pos
+    apply UInt64.le_iff_toNat_le.mpr
+    simpa [UInt32.toNat_toUInt64] using hn
+  simp [hle]
 
 end LeanSys.Spec
