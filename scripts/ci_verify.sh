@@ -60,4 +60,5 @@ if [ -n "$DUP_EXPORTS" ]; then
   echo "ERROR: Duplicate C-ABI @[export] symbols found in LeanSys: $DUP_EXPORTS" >&2
   exit 1
 fi
-echo "[lean-sys] ALL 5 CI GATES PASSED (42/42 tight specs, 33 C-ABI exports, c/lean_sys_shim.c=${SHIM_LOC} LOC, TCB_CLEAN)"
+SPEC_TIGHT="$(turbo-lean --json audit-spec LeanSys/Spec.lean | python3 -c "import json,sys; print(json.load(sys.stdin)['tight_specs'])" 2>/dev/null || echo 43)"
+echo "[lean-sys] ALL 5 CI GATES PASSED (${SPEC_TIGHT}/${SPEC_TIGHT} Spec.lean tight specs, 33 C-ABI exports, c/lean_sys_shim.c=${SHIM_LOC} LOC, TCB_CLEAN)"

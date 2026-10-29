@@ -45,7 +45,7 @@ private def writeCircularShared (fd : Fd) (cap : Nat) (cursor : UInt64) (data : 
   match ← fstatSize fd with
   | .error e => return .error e
   | .ok fsz =>
-    if fsz < (24 + cap).toUInt64 then
+    if cap.toUInt64.toNat != cap || verifySliceBounds 24 cap.toUInt64 fsz != 1 then
       return .error .einval
     let pos := (cursor.toNat) % cap
     let firstLen := Nat.min data.size (cap - pos)
@@ -68,7 +68,7 @@ private def readCircularShared (fd : Fd) (cap : Nat) (cursor : UInt64) (len : Na
   match ← fstatSize fd with
   | .error e => return .error e
   | .ok fsz =>
-    if fsz < (24 + cap).toUInt64 then
+    if cap.toUInt64.toNat != cap || verifySliceBounds 24 cap.toUInt64 fsz != 1 then
       return .error .einval
     let pos := (cursor.toNat) % cap
     let firstLen := Nat.min len (cap - pos)
@@ -90,7 +90,7 @@ private def readHeaderFd (fd : Fd) : IO (SysResult (UInt32 × UInt64 × UInt64))
   match ← fstatSize fd with
   | .error e => pure (.error e)
   | .ok fsz =>
-    if fsz < 24 then
+    if verifySliceBounds 0 24 fsz != 1 then
       pure (.error .einval)
     else
       let hdr ← mmapReadShared fd 0 24
@@ -101,7 +101,7 @@ private def readHeaderFd (fd : Fd) : IO (SysResult (UInt32 × UInt64 × UInt64))
         let cap := readUInt32LE hdr 4
         let head := readUInt64LE hdr 8
         let tail := readUInt64LE hdr 16
-        if magic != ringMagic || cap < 64 || fsz < (24 + cap.toUInt64) then
+        if magic != ringMagic || cap < 64 || verifySliceBounds 24 cap.toUInt64 fsz != 1 then
           pure (.error .einval)
         else if verifyRingCursor head tail cap.toUInt64 0 != 1 then
           pure (.error .einval)

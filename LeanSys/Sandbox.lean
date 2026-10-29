@@ -117,7 +117,10 @@ def runSandboxedGroup (quota : SandboxQuota) (cmd : String) (args : Array String
   runGroupInternal quota none cmd args observedRssBytes observedPipeBytes
 
 /-- Run `cmd` with `args` inside both a monitored `-pgid` quota group AND kernel Linux Landlock path confinement (`policy`).
-    Fails closed (`.error .eopnotsupp` on non-Landlock kernels/OSes; `.error .enoent`/`.eacces` if policy rule setup fails). -/
+    Fails closed (`.error .eopnotsupp` on non-Landlock kernels/OSes; `.error .eacces` if policy rule setup fails).
+    The child reports a pre-`execve` Landlock setup failure as exit status `126`, so a confined command that itself
+    exits `126` (e.g. a shell "not executable" error) is also reported as `.error .eacces`; this conservative mapping
+    never reports an unconfined run as `landlockEnforced := true`. -/
 def runLandlockedGroup (quota : SandboxQuota) (policy : LandlockPolicy) (cmd : String) (args : Array String)
     (observedRssBytes : UInt64 := 0) (observedPipeBytes : UInt64 := 0) : IO (SysResult SandboxResult) :=
   runGroupInternal quota (some policy) cmd args observedRssBytes observedPipeBytes

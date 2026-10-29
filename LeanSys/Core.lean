@@ -37,6 +37,72 @@ open LeanSys.Reactor
 open LeanSys.Sandbox
 open LeanSys.Par
 
+/-- Regression checks for HTTP field-name/value validation, duplicate framing/auth headers,
+    strict status lines, panic-free body decoding, and fail-closed invalid IPv4 hosts. -/
+def selfTestHttpHardening : IO UInt32 := do
+  let hdrCase (hdrs : String) : ByteArray := s!"GET /v1/h HTTP/1.1\r\nHost: localhost\r\n{hdrs}\r\n".toUTF8
+  let errOf (r : Except String HttpRequest) : String := match r with | .error e => e | .ok _ => "accepted"
+  let dupSameCl := "POST /v1/test HTTP/1.1\r\nHost: localhost\r\nContent-Length: 4\r\nContent-Length: 4\r\n\r\ntest".toUTF8
+  let hdrRejects := #[
+    (errOf (parseRequest dupSameCl), "conflicting_content_length"),
+    (errOf (parseRequest (hdrCase "Authorization: Bearer a\r\nAuthorization: Bearer b\r\n")), "duplicate_authorization"),
+    (errOf (parseRequest (hdrCase "Bad(Name): x\r\n")), "invalid_header_name"),
+    (errOf (parseRequest (hdrCase "X Name: x\r\n")), "invalid_header_name"),
+    (errOf (parseRequest (hdrCase "X-Name\u0001: x\r\n")), "invalid_header_value"),
+    (errOf (parseRequest (hdrCase "X-Val: a\rContent-Length: 9\r\n")), "invalid_header_value"),
+    (errOf (parseRequest (hdrCase "X-Val: a\u007Fb\r\n")), "invalid_header_value")
+  ]
+  for (got, want) in hdrRejects do
+    if got != want then
+      IO.eprintln s!"[lean-sys-core] FAIL: HTTP header validation expected {want}, got {got}"
+      return 1
+  if (parseRequest (hdrCase "X-Ok_Token.v1~: a\tb\r\n")).isOk != true ||
+     !isValidStatusLine "HTTP/1.1 200 OK" || !isValidStatusLine "HTTP/1.0 404" ||
+     isValidStatusLine "HTTP/1.1 2x0 OK" || isValidStatusLine "HTTP/1.1 2000 OK" then
+    IO.eprintln "[lean-sys-core] FAIL: valid token header / status-line check mismatch"
+    return 1
+  match decodeResponseBody (ByteArray.mk #[0x7B, 0xFF, 0xFE, 0x7D]), decodeResponseBody "{}".toUTF8 with
+  | .error .einval, .ok "{}" => pure ()
+  | _, _ =>
+    IO.eprintln "[lean-sys-core] FAIL: decodeResponseBody did not reject invalid UTF-8 without panicking"
+    return 1
+  -- Invalid IPv4 literals fail closed with `EINVAL` instead of silently binding `0.0.0.0`
+  match ← tcpListen "not-an-ip" 0 16, ← tcpConnect "999.1.1.1" 1 with
+  | .error .einval, .error .einval => pure ()
+  | r1, r2 =>
+    (match r1 with | .ok (fd, _) => discard <| closeFd fd | .error _ => pure ())
+    (match r2 with | .ok fd => discard <| closeFd fd | .error _ => pure ())
+    IO.eprintln "[lean-sys-core] FAIL: tcpListen/tcpConnect accepted an invalid IPv4 host"
+    return 1
+  return 0
+
+/-- Regression checks that raw `MAP_SHARED` reads/writes past the backing-file extent fail closed (no `SIGBUS`). -/
+def selfTestMmapBounds (testDir : String) : IO UInt32 := do
+  -- Raw `MAP_SHARED` primitives: out-of-extent offsets fail closed (no `SIGBUS`), in-extent round-trips succeed
+  let mmapProbePath := s!"{testDir}/mmap_probe.bin"
+  IO.FS.writeBinFile mmapProbePath (ByteArray.mk (Array.replicate 32 0))
+  let .ok mmapProbeOk ← withFd mmapProbePath 5 (fun fd => do
+      let inRange ← mmapWriteShared fd 28 "abcd".toUTF8
+      let pastEnd ← mmapWriteShared fd 30 "abcd".toUTF8
+      let farOff ← mmapWriteShared fd 4096 "x".toUTF8
+      let wrapWrite ← mmapWriteShared fd 0xFFFFFFFFFFFFFFFE "abcd".toUTF8
+      let oobEmpty ← mmapWriteShared fd 4096 ByteArray.empty
+      let rdIn ← mmapReadShared fd 28 4
+      let rdPast ← mmapReadShared fd 30 4
+      let rdTagWrap ← mmapReadShared fd (1 <<< 62) 4
+      let rdRawWrap ← rawPreadBa fd.raw (((2 : UInt64) <<< 62) ||| 0x3FFFFFFFFFFFFFFE) 4
+      let ok := match inRange, pastEnd, farOff, wrapWrite, oobEmpty with
+        | .ok 4, .error .einval, .error .einval, .error .einval, .error .einval =>
+          rdIn == "abcd".toUTF8 && rdPast.isEmpty && rdTagWrap.isEmpty && rdRawWrap.isEmpty
+        | _, _, _, _, _ => false
+      pure (.ok ok))
+    | do IO.eprintln "[lean-sys-core] FAIL: mmap probe open"; return 1
+  if !mmapProbeOk then
+    IO.eprintln "[lean-sys-core] FAIL: mmapWriteShared/mmapReadShared did not fail closed past file extent"
+    return 1
+  return 0
+
+set_option maxRecDepth 1024 in
 /-- Run the complete `lean-sys-core self-test` suite across all 10 C-ABI gates and 8 runtime modules. -/
 def runSelfTest : IO UInt32 := do
   -- 1. All 10 C-ABI Spec Gates
@@ -274,9 +340,10 @@ def runSelfTest : IO UInt32 := do
   let .ok stCor1 ← putString stCor0 "k1" "val-one-valid" false | do return 1
   let .ok stCor2 ← putString stCor1 "k2" "val-two-to-corrupt" false | do return 1
   let .ok stCor3 ← putString stCor2 "k3" "val-three-valid" true | do return 1
-  -- Flip a payload byte inside the middle frame (`k2`) without updating checksum
+  -- Flip a value byte inside the middle frame (`k2`) without updating checksum
+  -- (frame `k1` spans `[0, f1)`; `k2` value bytes start at `f1 + 16 + 4 + 2`)
   let walRaw ← IO.FS.readBinFile stCor3.walPath
-  let flipIdx := 34
+  let flipIdx := (encodeWalKVFrame "k1" (ByteSlice.ofString "val-one-valid")).size + 22
   let corruptedWal := walRaw.set! flipIdx (walRaw.get! flipIdx ^^^ 0xFF)
   IO.FS.writeBinFile stCor3.walPath corruptedWal
   match ← openStore corruptDir with
@@ -435,7 +502,9 @@ def runSelfTest : IO UInt32 := do
      !validateLease lease "new-secret" (some "cur-secret") "babylon" "job:submit" 1500 ||
      validateLease forgedLease "cur-secret" none "babylon" "job:submit" 1500 ||
      validateLease lease "wrong-secret" none "babylon" "job:submit" 1500 ||
-     validateLease lease "new-secret" (some "cur-secret") "babylon" "job:submit" 2500 then
+     validateLease lease "new-secret" (some "cur-secret") "babylon" "job:submit" 2500 ||
+     validateLease lease "" (some "cur-secret") "babylon" "job:submit" 1500 ||
+     validateLease (mintLease "" "babylon" "job:submit" 2000) "" none "babylon" "job:submit" 1500 then
     IO.eprintln "[lean-sys-core] FAIL: Auth RFC 4231 HMAC-SHA256 / token rotation / lease validation mismatch"
     return 1
 
@@ -475,6 +544,7 @@ def runSelfTest : IO UInt32 := do
   | _, _, _, _, _, _ =>
     IO.eprintln "[lean-sys-core] FAIL: ShmRing empty/short/truncated backing file did not fail closed with EINVAL"
     return 1
+  if (← selfTestMmapBounds testDir) != 0 then return 1
   let ringPath := s!"{testDir}/ipc.ring"
   let .ok ring ← ShmRing.init ringPath 128 | do IO.eprintln "[lean-sys-core] FAIL: ShmRing.init"; return 1
   let .ok () ← ShmRing.push ring (ByteSlice.ofString "ring-msg-1") | do IO.eprintln "[lean-sys-core] FAIL: ShmRing.push 1"; return 1
@@ -571,7 +641,7 @@ def runSelfTest : IO UInt32 := do
   if (parseRequest smuggleTe).isOk || (parseRequest smuggleDupCl).isOk || (parseRequest smuggleNegCl).isOk then
     IO.eprintln "[lean-sys-core] FAIL: HTTP smuggling / conflicting or negative Content-Length was not rejected"
     return 1
-
+  if (← selfTestHttpHardening) != 0 then return 1
   let .ok (listenFd, boundPort) ← tcpListen "127.0.0.1" 0 16
     | do IO.eprintln "[lean-sys-core] FAIL: tcpListen ephemeral"; return 1
   let rCfg : ReactorConfig := { maxConns := 64, maxKeepAliveReq := 8, maxIdleMs := 3000, expectedBearer? := some "secret-cap-token" }

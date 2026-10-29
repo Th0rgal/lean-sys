@@ -4,7 +4,8 @@
   - Zero-copy header & body parser over `ByteSlice` (`maxHeaders ≤ 32`, `maxHeaderBytes ≤ 32 KiB`, `maxBody ≤ 4 MiB`)
   - Gated by `LeanSys.Spec.checkHttpBounds` (`leansys_check_http_bounds`) and constant-time bearer auth (`LeanSys.Auth.ctEqString`)
   - Rejects HTTP request smuggling vectors: any `Transfer-Encoding` header, negative/non-digit `Content-Length`,
-    or conflicting multiple `Content-Length` headers (`400 Bad Request`)
+    any repeated `Content-Length` or `Authorization` header, non-`token` field names, and control bytes
+    in field lines (`400 Bad Request`)
   - Looped `pollReadable` + `readStreamChunk` framing (`readHttpRequestStream`) handles arbitrarily fragmented
     byte-by-byte / slow-loris headers and bodies under wall-clock timeout and returns pipelined trailing bytes
     for keep-alive sessions without silent message drops
@@ -152,15 +153,42 @@ def asciiEqIgnoreCase (a b : String) : Bool := Id.run do
     if la != lb then return false
   return true
 
+/-- RFC 9110 §5.6.2 `tchar`: `!#$%&'*+-.^_`|~`, `DIGIT`, `ALPHA`. -/
+@[inline]
+def isHttpTokenByte (b : UInt8) : Bool :=
+  (48 ≤ b && b ≤ 57) || (65 ≤ b && b ≤ 90) || (97 ≤ b && b ≤ 122) ||
+  b == 33 || b == 35 || b == 36 || b == 37 || b == 38 || b == 39 || b == 42 || b == 43 ||
+  b == 45 || b == 46 || b == 94 || b == 95 || b == 96 || b == 124 || b == 126
+
+/-- `true` iff `s` is a non-empty RFC 9110 `token` (valid HTTP field name). -/
+def isHttpToken (s : String) : Bool := Id.run do
+  let b := s.toUTF8
+  if b.isEmpty then return false
+  for i in [0:b.size] do
+    if !isHttpTokenByte (b.get! i) then return false
+  return true
+
+/-- `true` iff `s` contains a control byte forbidden in an HTTP field line (`0x00..0x1F` except `HTAB`, or `0x7F`),
+    including bare `CR`/`LF` that downstream parsers may treat as line terminators. -/
+def hasHttpFieldControlByte (s : String) : Bool := Id.run do
+  let b := s.toUTF8
+  for i in [0:b.size] do
+    let c := b.get! i
+    if (c < 32 && c != 9) || c == 127 then return true
+  return false
+
 /-- Inspect raw header lines for framing validity before/during body reads:
     - Rejects `Transfer-Encoding` (`unsupported_transfer_encoding`)
     - Rejects non-digit/negative `Content-Length` (`invalid_content_length`)
-    - Rejects conflicting multiple `Content-Length` headers (`conflicting_content_length`)
+    - Rejects any repeated `Content-Length` header, identical or not (`conflicting_content_length`)
+    - Rejects repeated `Authorization` headers (`duplicate_authorization`)
+    - Rejects non-`token` field names (`invalid_header_name`) and control bytes in field lines (`invalid_header_value`)
     - Enforces `headers.size ≤ 32` (`too_many_headers`) and `contentLen ≤ 4194304` (`payload_too_large`). -/
 private def parseValidatedHeaders (hdrLines : List String) :
     Except String (Array (String × String) × Option Nat × Option String) := Id.run do
   let mut headers : Array (String × String) := #[]
   let mut seenContentLen : Option Nat := none
+  let mut seenAuthorization := false
   let mut authBearer : Option String := none
   for ln in hdrLines do
     if !ln.isEmpty then
@@ -168,11 +196,13 @@ private def parseValidatedHeaders (hdrLines : List String) :
       let b0 := if lnBytes.size > 0 then lnBytes.get! 0 else 0
       if b0 == 32 || b0 == 9 then
         return .error "obs_fold_header_rejected"
+      if hasHttpFieldControlByte ln then
+        return .error "invalid_header_value"
       match ln.splitOn ":" with
       | [] | [_] =>
         return .error "malformed_header_line"
       | k :: rest =>
-        if k.isEmpty || (k.splitOn " ").length > 1 || (k.splitOn "\t").length > 1 then
+        if !isHttpToken k then
           return .error "invalid_header_name"
         let kTrim := k.trimAscii.toString
         let vTrim := (String.intercalate ":" rest).trimAscii.toString
@@ -188,12 +218,13 @@ private def parseValidatedHeaders (hdrLines : List String) :
           | some parsedLen =>
             if parsedLen > maxHttpBodyBytes then
               return .error "payload_too_large"
-            match seenContentLen with
-            | none => seenContentLen := some parsedLen
-            | some prevLen =>
-              if prevLen != parsedLen then
-                return .error "conflicting_content_length"
+            if seenContentLen.isSome then
+              return .error "conflicting_content_length"
+            seenContentLen := some parsedLen
         else if asciiEqIgnoreCase kTrim "authorization" then
+          if seenAuthorization then
+            return .error "duplicate_authorization"
+          seenAuthorization := true
           if vTrim.startsWith "Bearer " then
             authBearer := some (vTrim.drop 7).trimAscii.toString
   return .ok (headers, seenContentLen, authBearer)
@@ -381,11 +412,25 @@ def serveLoop (listenFd : Fd) (maxRequests : Nat := 0) (timeoutMs : UInt32 := 20
     | .error _ =>
       if maxRequests > 0 then break
 
+/-- Strict HTTP/1.x status line check: `HTTP/1.1 ` or `HTTP/1.0 `, a 3-digit status code, then end or `SP`. -/
+def isValidStatusLine (line : String) : Bool :=
+  let b := line.toUTF8
+  let isDigit (i : Nat) : Bool := let c := b.get! i; 48 ≤ c && c ≤ 57
+  (line.startsWith "HTTP/1.1 " || line.startsWith "HTTP/1.0 ") && b.size ≥ 12 &&
+    isDigit 9 && isDigit 10 && isDigit 11 && (b.size == 12 || b.get! 12 == 32)
+
+/-- Panic-free UTF-8 decoding of a framed response body (`.error .einval` on invalid UTF-8). -/
+def decodeResponseBody (bodyBytes : ByteArray) : SysResult String :=
+  match String.fromUTF8? bodyBytes with
+  | some s => .ok s
+  | none => .error .einval
+
 /-- Perform an HTTP/1.1 client request to `host:port`, looping `pollReadable` + `readStreamChunk`
     until `\r\n\r\n` and all declared `Content-Length` response body bytes arrive (or clean EOF when
     no `Content-Length` is declared). Fails closed on deadline expiry (`.error .eagain`), socket poll
-    errors, malformed response framing/headers (`.error .einval`), or premature EOF before headers or
-    declared `Content-Length` (`.error .eio`). -/
+    errors, malformed status line/response framing/headers or non-UTF-8 body (`.error .einval`), an
+    undeclared-length body exceeding `maxHttpBodyBytes` (`.error .einval`), or premature EOF before headers
+    or declared `Content-Length` (`.error .eio`). Never panics on untrusted response bytes. -/
 def httpClientRequest (host : String) (port : UInt16) (method : String) (path : String)
     (body : ByteSlice) (bearerToken? : Option String := none) (timeoutMs : UInt32 := 3000) :
     IO (SysResult String) := do
@@ -422,6 +467,10 @@ def httpClientRequest (host : String) (port : UInt16) (method : String) (path : 
           if hdrEnd?.isNone && respBuf.size > maxHttpHeaderBytes + 4 then
             ioErr? := some .einval
             break
+          if let some bStart := hdrEnd? then
+            if targetTotal.isNone && respBuf.size - bStart > maxHttpBodyBytes then
+              ioErr? := some .einval
+              break
           let now ← IO.monoNanosNow
           let elapsedMs := (now - t0) / 1000000
           if elapsedMs >= budgetMs then
@@ -448,7 +497,7 @@ def httpClientRequest (host : String) (port : UInt16) (method : String) (path : 
                       match headStr.splitOn "\r\n" with
                       | [] => ioErr? := some .einval
                       | statusLine :: hdrLines =>
-                        if !(statusLine.startsWith "HTTP/1.1 " || statusLine.startsWith "HTTP/1.0 ") then
+                        if !isValidStatusLine statusLine then
                           ioErr? := some .einval
                         else
                           match parseValidatedHeaders hdrLines with
@@ -468,14 +517,12 @@ def httpClientRequest (host : String) (port : UInt16) (method : String) (path : 
               if respBuf.size < tot then
                 pure (.error .eio)
               else
-                let bodyBytes := respBuf.extract bStart tot
-                pure (.ok (String.fromUTF8! bodyBytes))
+                pure (decodeResponseBody (respBuf.extract bStart tot))
             | none =>
               if respBuf.size - bStart > maxHttpBodyBytes then
                 pure (.error .einval)
               else
-                let bodyBytes := respBuf.extract bStart respBuf.size
-                pure (.ok (String.fromUTF8! bodyBytes))
+                pure (decodeResponseBody (respBuf.extract bStart respBuf.size))
     finally
       discard <| closeFd fd
 

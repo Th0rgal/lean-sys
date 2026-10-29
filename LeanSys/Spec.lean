@@ -198,6 +198,37 @@ theorem slice_bounds_rejects_overflow (b : SliceBounds)
     checkSliceBounds b = false :=
   sliceBoundsMetaSpec.rejects_unsafe () b h_bad
 
+/-- Unboxed 64-bit slice & backing-file extent check parameters (≤ 3 fields). -/
+structure SliceExtent64Check where
+  off : UInt64
+  len : UInt64
+  cap : UInt64
+  deriving Repr, DecidableEq
+
+/-- Layer II Bundle 1b: 64-bit C-ABI slice & `mmap` backing-file extent gate (`leansys_verify_slice_bounds`). -/
+def verifySliceBoundsMetaSpec : MetaGateSpec Unit SliceExtent64Check where
+  inv _ := True
+  gate _ s := verifySliceBounds s.off s.len s.cap == 1
+  step _ _ := ()
+  safe _ s := decide (s.off.toNat + s.len.toNat ≤ s.cap.toNat)
+  preserves_inv _ _ _ h := h
+  ensures_safe _ s h := by
+    unfold verifySliceBounds at h
+    split at h
+    · next hc =>
+      simp only [Bool.and_eq_true, decide_eq_true_eq] at hc ⊢
+      have hle := UInt64.le_iff_toNat_le.mp hc.1
+      have hlen := UInt64.le_iff_toNat_le.mp hc.2
+      rw [UInt64.toNat_sub_of_le _ _ hc.1] at hlen
+      omega
+    · contradiction
+
+/-- Corollary 1b: `verifySliceBounds` rejects any 64-bit wraparound or slice/file-extent overrun (`off + len > cap`). -/
+theorem verify_slice_bounds_rejects_extent_or_overflow (s : SliceExtent64Check)
+    (h_bad : decide (s.off.toNat + s.len.toNat ≤ s.cap.toNat) = false) :
+    (verifySliceBounds s.off s.len s.cap == 1) = false :=
+  verifySliceBoundsMetaSpec.rejects_unsafe () s h_bad
+
 /-- Layer II Bundle 2: WAL frame header & FNV-1a checksum gate. -/
 def walFrameMetaSpec : MetaGateSpec UInt64 WalFrameCheck where
   inv _ := True

@@ -294,6 +294,9 @@ def mintLease (secret nodeId scope : String) (expiresAt : UInt64) : ScopedLease 
   Validate a `ScopedLease` against `(expectedNode, expectedScope, nowEpoch)` and non-empty `secret`
   (with optional `previousSecret?`) using constant-time 256-bit HMAC-SHA256 comparison (`ctEqString`),
   gated by `leansys_verify_token_auth`.
+  An empty current `secret` fails closed even when `previousSecret?` would match: rotation always installs a
+  non-empty new secret, and clearing it must revoke (never silently fall back to) the previous secret,
+  mirroring `verifyRotatedBearer`.
 -/
 def validateLease (lease : ScopedLease) (secret : String) (previousSecret? : Option String)
     (expectedNode expectedScope : String) (nowEpoch : UInt64) : Bool :=

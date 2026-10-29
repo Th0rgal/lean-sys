@@ -244,9 +244,10 @@ def probeLandlockAbi : IO (SysResult UInt32) := do
   | .ok v => pure (.ok v.toUInt32)
   | .error e => pure (.error e)
 
-/-- Bracketed file-descriptor scope: guarantees `closeFd` runs even if `k` throws an IO exception. -/
-def withFd (path : String) (mode : UInt8) (k : Fd → IO (SysResult α)) : IO (SysResult α) := do
-  match ← openFd path mode with
+/-- Bracketed file-descriptor scope: guarantees `closeFd` runs even if `k` throws an IO exception.
+    Pass `exclusive := 2` with a creating `mode` to add `O_EXCL` (fails with `.eexist` on any existing path, including symlinks). -/
+def withFd (path : String) (mode : UInt8) (k : Fd → IO (SysResult α)) (exclusive : UInt8 := 0) : IO (SysResult α) := do
+  match ← openFd path mode exclusive with
   | .error e => pure (.error e)
   | .ok fd =>
     try
@@ -278,14 +279,20 @@ def ftruncateFd (fd : Fd) (sizeBytes : Nat) : IO (SysResult Unit) := do
 
 /-- Write `ba` at byte offset `offset` into a `MAP_SHARED` `mmap(2)` mapping of `fd` (`mode = 2` in `leansys_write_all`). -/
 def mmapWriteShared (fd : Fd) (offset : Nat) (ba : ByteArray) : IO (SysResult Nat) := do
+  if offset.toUSize.toNat != offset || ba.size.toUSize.toNat != ba.size ||
+     Spec.verifySliceBounds offset.toUInt64 ba.size.toUInt64 (~~~(0 : USize)).toUInt64 != 1 then
+    return .error .einval
   let w ← rawWriteAll fd.raw ba offset.toUSize ba.size.toUSize 2
   match decodePackedWord w with
   | .ok n => pure (.ok n.toNat)
   | .error e => pure (.error e)
 
 /-- Read `len` bytes starting at `offset` from a `MAP_SHARED` `mmap(2)` mapping of `fd` (`off | (2 << 62)` in `leansys_pread_ba`). -/
-def mmapReadShared (fd : Fd) (offset : Nat) (len : Nat) : IO ByteArray :=
-  let taggedOff : UInt64 := ((2 : UInt64) <<< 62) ||| (offset.toUInt64 &&& 0x3FFFFFFFFFFFFFFF)
+def mmapReadShared (fd : Fd) (offset : Nat) (len : Nat) : IO ByteArray := do
+  if offset.toUSize.toNat != offset || len.toUSize.toNat != len ||
+     Spec.verifySliceBounds offset.toUInt64 len.toUInt64 0x3FFFFFFFFFFFFFFF != 1 then
+    return ByteArray.empty
+  let taggedOff : UInt64 := ((2 : UInt64) <<< 62) ||| offset.toUInt64
   rawPreadBa fd.raw taggedOff len.toUSize
 
 /-- Write an entire `ByteSlice` to `fd` (retrying on `EINTR` and optionally calling `fsync`). -/
