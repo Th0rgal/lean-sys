@@ -4,7 +4,7 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
 
-export PATH="/var/lib/sandboxed-node/caches/elan/toolchains/leanprover--lean4---v4.35.0/bin:/var/lib/sandboxed-node/.elan/toolchains/leanprover--lean4---v4.35.0/bin:$HOME/.elan/bin:$PATH"
+export PATH="/var/lib/orb-node/work/caches/elan/toolchains/leanprover--lean4---v4.35.0/bin:/var/lib/orb-node/work/caches/elan/bin:/var/lib/sandboxed-node/caches/elan/toolchains/leanprover--lean4---v4.35.0/bin:/var/lib/sandboxed-node/.elan/toolchains/leanprover--lean4---v4.35.0/bin:$HOME/.elan/bin:/usr/local/cargo/bin:/opt/orb/bin:$PATH"
 
 if [[ "${1:-}" == "--sync-docs" ]]; then
   python3 scripts/sync_docs_inventory.py
@@ -14,7 +14,7 @@ python3 scripts/sync_docs_inventory.py --check
 echo "[1/5] Building lean-sys (supportInterpreter := false, libleanrt.a only)..."
 lake build
 
-echo "[2/5] Running lean-sys-core self-test (17 C-ABI gates + WAL/CAS/SST/Table/Auth/ProcLog/JsonRpc/ShmRing/Codec/Reactor/Sandbox)..."
+echo "[2/5] Running lean-sys-core self-test (33 C-ABI gates + WAL/CAS/SST/Table/Auth/ProcLog/JsonRpc/ShmRing/Codec/Reactor/Sandbox)..."
 ./.lake/build/bin/lean-sys-core self-test
 
 echo "[3/5] Running lean-sys-core bench..."
@@ -60,4 +60,4 @@ if [ -n "$DUP_EXPORTS" ]; then
   echo "ERROR: Duplicate C-ABI @[export] symbols found in LeanSys: $DUP_EXPORTS" >&2
   exit 1
 fi
-echo "[lean-sys] ALL 5 CI GATES PASSED (42/42 tight specs, 32 C-ABI exports, c/lean_sys_shim.c=${SHIM_LOC} LOC, TCB_CLEAN)"
+echo "[lean-sys] ALL 5 CI GATES PASSED (42/42 tight specs, 33 C-ABI exports, c/lean_sys_shim.c=${SHIM_LOC} LOC, TCB_CLEAN)"

@@ -4,8 +4,8 @@
 
 `lean-sys` is the **Verified Systems, Storage, and Wire Runtime Foundation** (`0 import Lean`, `0 sorryAx`, `libleanrt.a`-only) for the Lean 4 verification, native compilation, and orchestration stack:
 
-- **`lean-sys` (`Th0rgal/lean-sys` — Verified POSIX, Crash-Atomic WAL/CAS, Composite-Key Table, Token Auth, Sliding-Window Log & HTTP/JSON-RPC Runtime)**:
-  Provides <!-- inventory:leansys_cabi -->32<!-- /inventory:leansys_cabi --> unboxed C-ABI safety gates (`LeanSys/Spec.lean` + `LeanSys/Gate.lean`), a leaf-only C shim (`c/lean_sys_shim.c`, `<!-- inventory:leansys_shim_loc -->63<!-- /inventory:leansys_shim_loc --> LOC ≤ 65 LOC`), zero-copy borrowed `ByteSlice` views, bracketed POSIX descriptors (`Fd`, `DirLock`, `ChildGroup` `-pgid` reaper), a crash-atomic append-only WAL + hardlinked CAS (`LeanSys/Store.lean`), composite-key range & secondary-index tables (`LeanSys/Table.lean`), token-rotation/revocation/expiry auth (`LeanSys/Auth.lean`), sliding-window stdout/stderr tail log rings (`LeanSys/ProcLog.lean`), zero-copy JSON-RPC 2.0 envelope codecs (`LeanSys/JsonRpc.lean`), and a zero-copy bounded HTTP/1.1 engine (`LeanSys/Http.lean`).
+- **`lean-sys` (`Th0rgal/lean-sys` — Verified POSIX, Streaming Crash-Atomic WAL, Immutable `0444` CAS, Composite-Key Table, HMAC-SHA256 Auth, Sliding-Window Log & HTTP/JSON-RPC Runtime)**:
+  Provides <!-- inventory:leansys_cabi -->33<!-- /inventory:leansys_cabi --> unboxed C-ABI safety gates (`LeanSys/Spec.lean` + `LeanSys/Gate.lean`), a leaf-only C shim (`c/lean_sys_shim.c`, `<!-- inventory:leansys_shim_loc -->63<!-- /inventory:leansys_shim_loc --> LOC ≤ 65 LOC`), zero-copy borrowed `ByteSlice` views, bracketed 32-bit POSIX descriptors (`Fd`, `DirLock`, `ChildGroup` `-pgid` reaper + Linux Landlock enforcement), a streaming crash-atomic append-only WAL + immutable `0444` CAS (`LeanSys/Store.lean`), composite-key range & secondary-index tables (`LeanSys/Table.lean`), pure-Lean HMAC-SHA256 lease + token-rotation/revocation/expiry auth (`LeanSys/Auth.lean`), sliding-window stdout/stderr tail log rings (`LeanSys/ProcLog.lean`), zero-copy JSON-RPC 2.0 envelope codecs (`LeanSys/JsonRpc.lean`), circular `MAP_SHARED` `mmap(2)` IPC rings (`LeanSys/Mmap.lean`), and a streaming/pipelined bounded HTTP/1.1 engine (`LeanSys/Http.lean`, `LeanSys/Reactor.lean`).
 - **`turbo-lean` (`Th0rgal/turbo-lean` — Incremental Verification, `LeanNative` Compiler, Zygote Elaboration & Spec Auditor)**:
   Unifies the incremental verification oracle (`TurboLean`) and the verified `LNIR` native/SIMD/GPU/TPU compiler (`LeanNative`). Links `lean-sys` C-ABI gates (`leansys_verify_*`, `leansys_check_http_bounds`, `leansys_gate_admit`, `leansys_mix64_word`, `leansys_verify_counterexample_triage`) into `TurboLean/ShmIpc.lean` and `crates/turbo-lean/src/c_abi.rs`, while `LeanNative` remains focused on pure numeric/tensor/ISA codegen and relies on `lean-sys` whenever compiled native Lean 4 programs interact with the OS (storage, IPC, networking, or process sandboxing).
 - **`orb` (`Th0rgal/sandboxed.sh` — Formal Orchestration & Node Lifecycle Kernel)**:
@@ -44,25 +44,25 @@ Wire / Disk I/O ──► Stage 0: Unboxed C-ABI Bounds & Auth Gate (`LeanSys/Sp
    Every feature addition or optimization must preserve or shrink the C shim footprint (`<!-- inventory:leansys_shim_loc -->63<!-- /inventory:leansys_shim_loc --> LOC ≤ 65 LOC`) and generalize Layer I combinators in `LeanSys/Spec.lean` rather than accreting ad-hoc parsers or unsafe FFI glue.
 
 7. **Doc & Context Ratchet (`--sync-docs`)**:
-   Any commit that changes theorems, tight specs, or C-ABI exports must keep `README.md` and `AGENTS.md` aligned with the verified inventory (<!-- inventory:leansys_summary -->42/42 tight specs (40 in Spec.lean + 2 in Hash.lean + 2 in Gate.lean, 32 C-ABI exports, c/lean_sys_shim.c=63 LOC, 0 sorryAx)<!-- /inventory:leansys_summary -->). `./scripts/ci_verify.sh --sync-docs` enforces that check.
+   Any commit that changes theorems, tight specs, or C-ABI exports must keep `README.md` and `AGENTS.md` aligned with the verified inventory (<!-- inventory:leansys_summary -->44/44 tight specs (42 in Spec.lean + 2 in Hash.lean + 2 in Gate.lean, 33 C-ABI exports, c/lean_sys_shim.c=63 LOC, 0 sorryAx)<!-- /inventory:leansys_summary -->). `./scripts/ci_verify.sh --sync-docs` enforces that check.
 
 ---
 
 ## 3. Repository Layout & Verification Entrypoints
 
-- **Formal Systems Specifications & <!-- inventory:leansys_cabi -->32<!-- /inventory:leansys_cabi --> C-ABI Gates**: [`LeanSys/Spec.lean`](LeanSys/Spec.lean), [`LeanSys/Gate.lean`](LeanSys/Gate.lean), [`LeanSys/Contracts/MetaGate.lean`](LeanSys/Contracts/MetaGate.lean), [`LeanSys/Contracts/SpeculativeGate.lean`](LeanSys/Contracts/SpeculativeGate.lean) (`<!-- inventory:leansys_total_tight -->42<!-- /inventory:leansys_total_tight -->/<!-- inventory:leansys_total_tight -->42<!-- /inventory:leansys_total_tight --> non_vacuous_and_tight`, `<!-- inventory:leansys_cabi -->32<!-- /inventory:leansys_cabi -->` C-ABI exports)
+- **Formal Systems Specifications & <!-- inventory:leansys_cabi -->33<!-- /inventory:leansys_cabi --> C-ABI Gates**: [`LeanSys/Spec.lean`](LeanSys/Spec.lean), [`LeanSys/Gate.lean`](LeanSys/Gate.lean), [`LeanSys/Contracts/MetaGate.lean`](LeanSys/Contracts/MetaGate.lean), [`LeanSys/Contracts/SpeculativeGate.lean`](LeanSys/Contracts/SpeculativeGate.lean) (`<!-- inventory:leansys_total_tight -->44<!-- /inventory:leansys_total_tight -->/<!-- inventory:leansys_total_tight -->44<!-- /inventory:leansys_total_tight --> non_vacuous_and_tight`, `<!-- inventory:leansys_cabi -->33<!-- /inventory:leansys_cabi -->` C-ABI exports)
 - **64-Bit Word-Strided Hash (`xxh64Slice`) & 3-Probe Bloom Filter**: [`LeanSys/Hash.lean`](LeanSys/Hash.lean) (`or_and_self`, `bloom_no_false_negative`)
 - **Zero-Copy JSON/JSONL Tape Indexer (`JsonTape`)**: [`LeanSys/Codec.lean`](LeanSys/Codec.lean)
 - **Leaf POSIX C Shim (`<!-- inventory:leansys_shim_loc -->63<!-- /inventory:leansys_shim_loc --> LOC`) & Typed FFI**: [`c/lean_sys_shim.c`](c/lean_sys_shim.c), [`LeanSys/Posix.lean`](LeanSys/Posix.lean)
-- **Crash-Atomic WAL (`putBatch` Group-Commit) & Hardlinked CAS**: [`LeanSys/Store.lean`](LeanSys/Store.lean)
+- **Streaming Crash-Atomic WAL (`putBatch` Group-Commit) & Immutable `0444` CAS**: [`LeanSys/Store.lean`](LeanSys/Store.lean)
 - **Composite-Key Range Scans & Secondary Index Table (`IndexedTable`)**: [`LeanSys/Table.lean`](LeanSys/Table.lean)
-- **Token Rotation, Revocation Generation & Expiry Auth (`TokenVerifier`)**: [`LeanSys/Auth.lean`](LeanSys/Auth.lean)
+- **HMAC-SHA256 Lease, Token Rotation, Revocation Generation & Expiry Auth (`TokenVerifier`)**: [`LeanSys/Auth.lean`](LeanSys/Auth.lean)
 - **Bounded Sliding-Window Process Tail Log (`SlidingLogRing`)**: [`LeanSys/ProcLog.lean`](LeanSys/ProcLog.lean)
 - **Zero-Copy JSON-RPC 2.0 Envelope Validator & Codec (`JsonRpc`)**: [`LeanSys/JsonRpc.lean`](LeanSys/JsonRpc.lean)
 - **Sorted-String Table (`SstTable`) & 64-Bit Bloom Engine**: [`LeanSys/Lsm.lean`](LeanSys/Lsm.lean)
-- **Shared-Memory `/dev/shm` SPSC Ring Buffer (`ShmRing`)**: [`LeanSys/Mmap.lean`](LeanSys/Mmap.lean)
-- **Zero-Copy Bounded HTTP/1.1 Engine & Keep-Alive Poll Reactor**: [`LeanSys/Http.lean`](LeanSys/Http.lean), [`LeanSys/Reactor.lean`](LeanSys/Reactor.lean)
-- **Process-Group Quota Sandbox (`-pgid` Reaper & `rlimit` Gate)**: [`LeanSys/Sandbox.lean`](LeanSys/Sandbox.lean)
+- **Circular `MAP_SHARED` `mmap(2)` SPSC Ring Buffer (`ShmRing`)**: [`LeanSys/Mmap.lean`](LeanSys/Mmap.lean)
+- **Streaming/Pipelined Bounded HTTP/1.1 Engine & Keep-Alive Poll Reactor**: [`LeanSys/Http.lean`](LeanSys/Http.lean), [`LeanSys/Reactor.lean`](LeanSys/Reactor.lean)
+- **Process-Group Quota & Linux Landlock Sandbox (`-pgid` Reaper & `rlimit` Gate)**: [`LeanSys/Sandbox.lean`](LeanSys/Sandbox.lean)
 - **Standalone Native Self-Test & Benchmark Binary**: [`LeanSys/Core.lean`](LeanSys/Core.lean) (`./.lake/build/bin/lean-sys-core [self-test|bench]`)
 - **CI Verification & Inventory Ratchet**: [`scripts/ci_verify.sh`](scripts/ci_verify.sh), [`scripts/sync_docs_inventory.py`](scripts/sync_docs_inventory.py)
 

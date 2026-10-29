@@ -1,8 +1,10 @@
 /-
-  LeanSys.Reactor: Non-Blocking Poll Reactor & HTTP/1.1 Keep-Alive Multiplexer
+  LeanSys.Reactor: Non-Blocking Poll Reactor & Pipelined HTTP/1.1 Keep-Alive Multiplexer
   (`0 import Lean`, `0 sorryAx`)
   - Gated by `LeanSys.Spec.verifyPollInterest` (`leansys_verify_poll_interest`)
-  - Supports multi-request HTTP/1.1 Keep-Alive connection reuse and admission control
+  - Supports multi-request HTTP/1.1 Keep-Alive connection reuse, pipelined carryover buffering
+    across consecutive requests on the same socket, and explicit error responses (`400`/`401`/`413`/`431`)
+    before closing malformed or unauthorized sessions.
 -/
 import LeanSys.Spec
 import LeanSys.Posix
@@ -23,13 +25,7 @@ structure ReactorConfig where
 
 /-- Serialize an `HttpResponse` with configurable `Connection: keep-alive` or `close`. -/
 def toKeepAliveWireBytes (r : HttpResponse) (keepAlive : Bool) : ByteArray :=
-  let statusText := match r.status with
-    | 200 => "OK"
-    | 400 => "Bad Request"
-    | 401 => "Unauthorized"
-    | 404 => "Not Found"
-    | 413 => "Payload Too Large"
-    | _   => "OK"
+  let statusText := HttpResponse.reasonPhrase r.status
   let connHdr := if keepAlive then "keep-alive" else "close"
   let head :=
     s!"HTTP/1.1 {r.status} {statusText}\r\n" ++
@@ -38,19 +34,26 @@ def toKeepAliveWireBytes (r : HttpResponse) (keepAlive : Bool) : ByteArray :=
     s!"Connection: {connHdr}\r\n\r\n"
   head.toUTF8 ++ r.body
 
-/-- Serve a keep-alive HTTP/1.1 session on `clientFd`, gated on every request by `leansys_verify_poll_interest`. -/
+/-- Serve a keep-alive HTTP/1.1 session on `clientFd`, preserving pipelined `carry` bytes across requests
+    and gating every request via `leansys_verify_poll_interest`. -/
 def serveKeepAliveSession (cfg : ReactorConfig) (activeConns : UInt32) (clientFd : Fd)
     (handler : HttpRequest → IO HttpResponse) : IO Nat := do
   let mut reqsServed : Nat := 0
+  let mut carry := ByteArray.empty
   try
     let mut keepGoing := true
     while keepGoing do
       if verifyPollInterest activeConns cfg.maxConns reqsServed.toUInt32 cfg.maxKeepAliveReq 0 cfg.maxIdleMs != 1 then
         break
-      match ← readHttpRequestFromFd clientFd cfg.expectedBearer? with
-      | .error _ =>
+      match ← readHttpRequestStream clientFd carry cfg.expectedBearer? cfg.maxIdleMs with
+      | .error errMsg =>
+        if errMsg != "empty_socket_read" then
+          let code := statusForParseError errMsg
+          let errResp := HttpResponse.json code s!"\{\"ok\":false,\"error\":\"{errMsg}\"}"
+          discard <| writeAll clientFd (toKeepAliveWireBytes errResp false) false
         keepGoing := false
-      | .ok req =>
+      | .ok (req, nextCarry) =>
+        carry := nextCarry
         reqsServed := reqsServed + 1
         let wantsClose := req.headers.any (fun (k, v) =>
           asciiEqIgnoreCase k "connection" && asciiEqIgnoreCase v "close")

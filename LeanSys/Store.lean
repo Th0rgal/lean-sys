@@ -1,11 +1,15 @@
 /-
-  LeanSys.Store: Crash-Atomic Append-Only WAL, In-Memory KV Index, and Hardlinked CAS
+  LeanSys.Store: Crash-Atomic Append-Only WAL, In-Memory KV Index, and Immutable CAS
   (`0 import Lean`, `0 sorryAx`)
   - 16-byte WAL frame header: `magic : UInt32 := 0x4C535953 ("LSYS")`, `payloadLen : UInt32`,
-    `fnv1a64 : UInt64`, followed by `payload : ByteArray` (`keyLen : UInt32` + `key` + `val`).
-  - Every `Store.open` replays frames through `leansys_verify_wal_frame`, truncating torn tails.
+    `xxh64(payload) : UInt64`, followed by `payload : ByteArray` (`keyLen : UInt32` + `key` + `val`).
+  - Streaming bounded-memory `pread` WAL replay (`replayWalFd`) handles logs arbitrarily larger than 64 MiB:
+    truncates incomplete EOF torn tails, while failing closed (`.error .eio`) on mid-log corruption
+    or invalid headers/checksums where full frame bytes were written.
   - Atomic compaction (`Store.compact`) writes a fresh WAL to `.tmp`, `fsync`s, and atomically `rename`s.
-  - Content-Addressable Store (`Store.casPut`, `Store.casMaterialize`) with path-traversal gate.
+  - Content-Addressable Store (`Store.casPut`, `Store.casMaterialize`) seals CAS blobs read-only (`0444`)
+    and materializes independent writable (`0644`) copies verified via `leansys_verify_cas_digest`,
+    preventing post-materialization caller writes from corrupting CAS objects.
 -/
 import LeanSys.Spec
 import LeanSys.Posix
@@ -74,22 +78,28 @@ def uint64ToHex16 (v : UInt64) : String := Id.run do
     out := out.push (hexChars.get! nib)
   return String.fromUTF8! out
 
-/-- Parse a 16-character hex string back into `UInt64` (returns `0` if empty or invalid). -/
-def hexToUInt64 (s : String) : UInt64 := Id.run do
+/-- Parse a exact 16-character hex string into `Option UInt64`. -/
+def parseHex16? (s : String) : Option UInt64 := Id.run do
   let bytes := s.trimAscii.toString.toUTF8
-  if bytes.isEmpty then return 0
+  if bytes.size != 16 then return none
   let mut acc : UInt64 := 0
-  for i in [0:bytes.size] do
+  for i in [0:16] do
     let c := bytes.get! i
-    let d : UInt64 :=
-      if 48 ≤ c && c ≤ 57 then (c - 48).toUInt64
-      else if 97 ≤ c && c ≤ 102 then (c - 97 + 10).toUInt64
-      else if 65 ≤ c && c ≤ 70 then (c - 65 + 10).toUInt64
-      else 0
-    acc := (acc <<< 4) ||| d
-  return acc
+    if 48 ≤ c && c ≤ 57 then
+      acc := (acc <<< 4) ||| (c - 48).toUInt64
+    else if 97 ≤ c && c ≤ 102 then
+      acc := (acc <<< 4) ||| (c - 97 + 10).toUInt64
+    else if 65 ≤ c && c ≤ 70 then
+      acc := (acc <<< 4) ||| (c - 65 + 10).toUInt64
+    else
+      return none
+  return some acc
 
-/-! ## WAL Frame Encoding & Verified Decoding (`leansys_verify_wal_frame`) -/
+/-- Parse a 16-character hex string back into `UInt64` (returns `0` if empty or invalid). -/
+def hexToUInt64 (s : String) : UInt64 :=
+  (parseHex16? s).getD 0
+
+/-! ## WAL Frame Encoding & Verified Streaming Decoding (`leansys_verify_wal_frame`) -/
 
 /-- Append one `(key, value)` WAL frame directly into `out` (single buffer, no intermediate payload copy).
     Layout: `magic : UInt32`, `payloadLen : UInt32`, `xxh64(payload) : UInt64`, `keyLen : UInt32`, `key`, `val`. -/
@@ -115,6 +125,59 @@ def encodeWalKVFrame (key : String) (val : ByteSlice) : ByteArray :=
   let kb := key.toUTF8
   encodeFrame (ByteArray.emptyWithCapacity (20 + kb.size + val.len)) kb val
 
+/-- Outcome of inspecting a single WAL frame at `offset`. -/
+inductive WalFrameStep where
+  | ok (key : String) (val : ByteSlice) (nextOffset : Nat)
+  | needMore
+  | tornTail
+  | corrupt
+  deriving Inhabited
+
+/-- Classify and decode one WAL frame at `offset` in `buf` (`isFinalChunk = true` when `buf` reaches file EOF).
+    - Incomplete trailing header or payload at EOF (`isFinalChunk = true`) with valid header bounds -> `.tornTail`
+    - Invalid magic, oversized/sub-4-byte `payloadLen`, checksum mismatch with full bytes present,
+      bad `keyLen`, or invalid UTF-8 key -> `.corrupt` (fail-closed)
+    - Incomplete frame before EOF (`isFinalChunk = false`) -> `.needMore` -/
+def stepWalFrameAt (buf : ByteArray) (offset : Nat) (isFinalChunk : Bool) : WalFrameStep :=
+  let rem := buf.size - offset
+  if rem == 0 then
+    .needMore
+  else if rem < 16 then
+    if isFinalChunk then
+      let prefixOk := Id.run do
+        let magicBytes : Array UInt8 := #[0x53, 0x59, 0x53, 0x4C]
+        let nCheck := Nat.min rem 4
+        for i in [0:nCheck] do
+          if buf.get! (offset + i) != magicBytes[i]! then
+            return false
+        return true
+      if prefixOk then .tornTail else .corrupt
+    else
+      .needMore
+  else
+    let magic := readUInt32LE buf offset
+    let payloadLen := readUInt32LE buf (offset + 4)
+    let pLenNat := payloadLen.toNat
+    if magic != walMagic || payloadLen < 4 || payloadLen > walMaxPayload then
+      .corrupt
+    else if rem < 16 + pLenNat then
+      if isFinalChunk then .tornTail else .needMore
+    else
+      let expectedHash := readUInt64LE buf (offset + 8)
+      let pOff := offset + 16
+      let computed := xxh64Slice { ba := buf, off := pOff, len := pLenNat }
+      if verifyWalFrame magic payloadLen pLenNat.toUInt64 expectedHash computed != 1 then
+        .corrupt
+      else
+        let keyLen := (readUInt32LE buf pOff).toNat
+        if 4 + keyLen > pLenNat then
+          .corrupt
+        else
+          match String.fromUTF8? (buf.extract (pOff + 4) (pOff + 4 + keyLen)) with
+          | none => .corrupt
+          | some key =>
+            .ok key { ba := buf, off := pOff + 4 + keyLen, len := pLenNat - 4 - keyLen } (pOff + pLenNat)
+
 /-- Verify the WAL frame at `offset` via `Spec.verifyWalFrame`, hashing the payload in place.
     Returns `(payloadOff, payloadLen, keyLen)` on success. -/
 @[inline]
@@ -137,26 +200,112 @@ def decodeWalFrameAt (buf : ByteArray) (offset : Nat) : Option (String × ByteSl
   let key ← String.fromUTF8? (buf.extract (pOff + 4) (pOff + 4 + keyLen))
   some (key, { ba := buf, off := pOff + 4 + keyLen, len := avail - 4 - keyLen }, pOff + avail)
 
-/-- Replay all valid prefix frames from a raw WAL buffer, stopping cleanly at any torn tail. -/
-def replayWalBuffer (buf : ByteArray) : Std.HashMap String ByteArray × Nat × Bool := Id.run do
+/-- Pure in-memory WAL buffer replay with fail-closed mid-buffer corruption detection.
+    Returns `.ok (kv, validFrames, hadTornTail, validPrefixBytes)` or `.error .eio` on corrupt frames. -/
+def replayWalBufferChecked (buf : ByteArray) : SysResult (Std.HashMap String ByteArray × Nat × Bool × Nat) := Id.run do
   let mut kv : Std.HashMap String ByteArray := {}
   let mut offset : Nat := 0
   let mut validFrames : Nat := 0
   let mut hadTornTail : Bool := false
   while offset < buf.size do
-    match decodeWalFrameAt buf offset with
-    | some (k, vSlice, nextOff) =>
+    match stepWalFrameAt buf offset true with
+    | .ok k vSlice nextOff =>
       kv := kv.insert k vSlice.toByteArray
       offset := nextOff
       validFrames := validFrames + 1
-    | none =>
+    | .tornTail =>
       hadTornTail := true
       break
-  return (kv, validFrames, hadTornTail)
+    | .corrupt =>
+      return .error .eio
+    | .needMore =>
+      break
+  return .ok (kv, validFrames, hadTornTail, offset)
+
+/-- Legacy pure helper: replay valid prefix frames from a raw WAL buffer. -/
+def replayWalBuffer (buf : ByteArray) : Std.HashMap String ByteArray × Nat × Bool :=
+  match replayWalBufferChecked buf with
+  | .ok (kv, frames, torn, _) => (kv, frames, torn)
+  | .error _ => ({}, 0, true)
+
+/-- Default streaming `pread` window size for WAL replay (4 MiB; dynamically grows up to 16 MiB + 16 B for max frames). -/
+@[inline] def defaultWalChunkBytes : Nat := 4194304
+
+/-- Stream-replay a WAL file descriptor across known byte extent `fileSize` using bounded `readChunk` windows.
+    - Truncates an incomplete EOF torn tail cleanly (`hadTornTail = true`, returning `validPrefixBytes`).
+    - Fails closed with `.error .eio` on any premature empty read before `fileSize` (`fileOff < fileSize`),
+      corrupt mid-log frame, bad magic, or payload checksum mismatch (never misclassifying a transient
+      read error as an EOF torn tail that would truncate committed frames). -/
+def replayWalReader (fileSize : UInt64) (readChunk : UInt64 → Nat → IO ByteArray)
+    (chunkBytes : Nat := defaultWalChunkBytes) :
+    IO (SysResult (Std.HashMap String ByteArray × Nat × Bool × UInt64)) := do
+  if fileSize == 0 then
+    return .ok ({}, 0, false, 0)
+  let stepChunk := Nat.max 65536 chunkBytes
+  let mut kv : Std.HashMap String ByteArray := {}
+  let mut validFrames : Nat := 0
+  let mut fileOff : UInt64 := 0
+  let mut carry := ByteArray.empty
+  let mut hadTornTail := false
+  let mut validPrefixBytes : UInt64 := 0
+  let mut atEof := false
+  while !atEof || carry.size > 0 do
+    if !atEof && carry.size < 16 + walMaxPayload.toNat then
+      if fileOff >= fileSize then
+        atEof := true
+      else
+        let remFile := (fileSize - fileOff).toNat
+        let toRead := Nat.min remFile stepChunk
+        let chunk ← readChunk fileOff toRead
+        if chunk.isEmpty then
+          return .error .eio
+        else
+          fileOff := fileOff + chunk.size.toUInt64
+          if fileOff >= fileSize then
+            atEof := true
+          carry := if carry.isEmpty then chunk else carry ++ chunk
+    let mut localOff : Nat := 0
+    let mut needMoreData := false
+    while localOff < carry.size && !needMoreData && !hadTornTail do
+      match stepWalFrameAt carry localOff atEof with
+      | .ok k vSlice nextOff =>
+        let consumed := nextOff - localOff
+        kv := kv.insert k vSlice.toByteArray
+        localOff := nextOff
+        validFrames := validFrames + 1
+        validPrefixBytes := validPrefixBytes + consumed.toUInt64
+      | .needMore =>
+        if atEof then
+          hadTornTail := true
+        else
+          needMoreData := true
+      | .tornTail =>
+        hadTornTail := true
+      | .corrupt =>
+        return .error .eio
+    if hadTornTail then
+      break
+    if localOff > 0 then
+      carry := if localOff >= carry.size then ByteArray.empty else carry.extract localOff carry.size
+    if atEof && carry.isEmpty then
+      break
+    if needMoreData && !atEof && carry.size >= 16 + walMaxPayload.toNat then
+      return .error .eio
+  return .ok (kv, validFrames, hadTornTail, validPrefixBytes)
+
+/-- Stream-replay a WAL file descriptor of arbitrary size (`> 64 MiB` supported) using bounded `pread` windows.
+    - Truncates an incomplete EOF torn tail cleanly (`hadTornTail = true`, returning `validPrefixBytes`).
+    - Fails closed with `.error .eio` on any premature empty read before `fstatSize` or mid-log frame corruption. -/
+def replayWalFd (fd : Fd) (chunkBytes : Nat := defaultWalChunkBytes) :
+    IO (SysResult (Std.HashMap String ByteArray × Nat × Bool × UInt64)) := do
+  match ← fstatSize fd with
+  | .error e => return .error e
+  | .ok fileSize =>
+    replayWalReader fileSize (preadByteArray fd) chunkBytes
 
 /-! ## Persistent Store Handle (`LeanSys.Store.Handle`) -/
 
-/-- Persistent WAL + Hardlinked CAS Store state. -/
+/-- Persistent WAL + Immutable CAS Store state. -/
 structure Handle where
   rootDir     : String
   walPath     : String
@@ -175,40 +324,49 @@ def ensureStoreDirs (rootDir : String) : IO ( String × String × String ) := do
   let lockPath := (pRoot / "state.lock").toString
   return (walPath, lockPath, pCas.toString)
 
-/-- Open a `LeanSys.Store` at `rootDir`, replaying committed WAL frames and truncating any torn tail. -/
-def openStore (rootDir : String) : IO (SysResult Handle) := do
+/-- Open a `LeanSys.Store` at `rootDir` using streaming `pread` WAL replay (`chunkBytes` window):
+    - Supports WAL files arbitrarily larger than 64 MiB.
+    - Truncates incomplete EOF torn tails in place via `ftruncate` + `fsync`.
+    - Fails closed (`.error .eio`) on mid-log frame corruption. -/
+def openStoreWithChunk (rootDir : String) (chunkBytes : Nat := defaultWalChunkBytes) : IO (SysResult Handle) := do
   let (walPath, lockPath, casDir) ← ensureStoreDirs rootDir
   withDirLock lockPath false fun _ => do
     match ← openFd walPath 1 with
     | .error e => pure (.error e)
     | .ok fd =>
-      let rawBuf ← try
-        preadByteArray fd 0 67108864
+      let replayRes ← try
+        replayWalFd fd chunkBytes
       finally
         discard <| closeFd fd
-      let (kv, framesCount, hadTornTail) := replayWalBuffer rawBuf
-      let h : Handle := {
-        rootDir := rootDir
-        walPath := walPath
-        lockPath := lockPath
-        casDir := casDir
-        kv := kv
-        framesCount := framesCount
-        tornCleaned := hadTornTail
-      }
-      if hadTornTail then
-        let tmpPath := walPath ++ ".recover.tmp"
-        let mut cleanBytes := ByteArray.empty
-        for (k, v) in kv.toList do
-          cleanBytes := cleanBytes ++ encodeWalKVFrame k (ByteSlice.ofByteArray v)
-        match ← withFd tmpPath 4 (fun wfd => writeAll wfd cleanBytes true) with
-        | .error e => pure (.error e)
-        | .ok _ =>
-          match ← atomicRename tmpPath walPath with
+      match replayRes with
+      | .error e => pure (.error e)
+      | .ok (kv, framesCount, hadTornTail, validPrefixBytes) =>
+        let h : Handle := {
+          rootDir := rootDir
+          walPath := walPath
+          lockPath := lockPath
+          casDir := casDir
+          kv := kv
+          framesCount := framesCount
+          tornCleaned := hadTornTail
+        }
+        if hadTornTail then
+          match ← withFd walPath 5 (fun wfd => do
+            match ← ftruncateFd wfd validPrefixBytes.toNat with
+            | .error e => pure (.error e)
+            | .ok () =>
+              match ← writeAll wfd ByteArray.empty true with
+              | .error e => pure (.error e)
+              | .ok _ => pure (.ok ())) with
           | .error e => pure (.error e)
           | .ok () => pure (.ok h)
-      else
-        pure (.ok h)
+        else
+          pure (.ok h)
+
+/-- Open a `LeanSys.Store` at `rootDir`, replaying committed WAL frames and truncating any EOF torn tail. -/
+@[inline]
+def openStore (rootDir : String) : IO (SysResult Handle) :=
+  openStoreWithChunk rootDir defaultWalChunkBytes
 
 /-- Append a `(key, val)` frame to the WAL with `O_APPEND` + `fsync` under `flock(LOCK_EX)`. -/
 def put (h : Handle) (key : String) (val : ByteSlice) (doSync : Bool := true) : IO (SysResult Handle) := do
@@ -275,7 +433,7 @@ def compact (h : Handle) : IO (SysResult Handle) := do
       | .ok () =>
         pure (.ok { h with framesCount := count })
 
-/-! ## Content-Addressable Storage (`casPut` / `casMaterialize`) -/
+/-! ## Immutable Content-Addressable Storage (`casPut` / `casGet` / `casMaterialize`) -/
 
 /-- Check if a CAS digest string contains any path separator or traversal character (`/` or `\`). -/
 def hasPathTraversal (s : String) : UInt8 := Id.run do
@@ -287,42 +445,79 @@ def hasPathTraversal (s : String) : UInt8 := Id.run do
   if (s.splitOn "..").length > 1 then return (1 : UInt8)
   return (0 : UInt8)
 
-/-- Write a `ByteSlice` into the content-addressable store, gated by `leansys_verify_cas_digest`.
-    Returns the 16-char hex digest key. -/
-def casPut (h : Handle) (payload : ByteSlice) : IO (SysResult String) := do
-  let digest := xxh64Slice payload
-  let hexKey := uint64ToHex16 digest
-  if verifyCasDigest digest digest (hasPathTraversal hexKey) != 1 then
+/-- Read and digest-verify an entire CAS blob from `casPath` using exact `fstatSize`. -/
+private def readVerifiedCasBlob (casPath : String) (expectedDigest : UInt64) (pathSep : UInt8) :
+    IO (SysResult ByteArray) := do
+  if pathSep != 0 || expectedDigest == 0 then
     return .error .einval
-  let dstPath := (System.FilePath.mk h.casDir / hexKey).toString
-  if ← (System.FilePath.mk dstPath).pathExists then
-    return .ok hexKey
-  let tmpPath := dstPath ++ ".tmp"
-  match ← withFd tmpPath 4 (fun fd => writeSliceAll fd payload true) with
-  | .error e => pure (.error e)
-  | .ok _ =>
-    match ← atomicRename tmpPath dstPath with
-    | .error e => pure (.error e)
-    | .ok () => pure (.ok hexKey)
-
-/-- Materialize a CAS object identified by `hexKey` to `targetPath` via zero-copy POSIX hardlink (`link(2)`),
-    verifying digest integrity through `leansys_verify_cas_digest`. -/
-def casMaterialize (h : Handle) (hexKey : String) (targetPath : String) : IO (SysResult Unit) := do
-  let cleanKey := match hexKey.splitOn ":" with
-    | [_, rest] => rest
-    | _ => hexKey
-  let expectedDigest := hexToUInt64 cleanKey
-  let pathSep := hasPathTraversal cleanKey
-  let casPath := (System.FilePath.mk h.casDir / cleanKey).toString
   match ← withFd casPath 0 (fun fd => do
-    let bytes ← preadByteArray fd 0 67108864
-    pure (.ok bytes)) with
+    match ← fstatSize fd with
+    | .error e => pure (.error e)
+    | .ok sz =>
+      let bytes ← preadByteArray fd 0 sz.toNat
+      if bytes.size != sz.toNat then
+        pure (.error .eio)
+      else
+        pure (.ok bytes)) with
   | .error e => pure (.error e)
   | .ok bytes =>
     let computedDigest := xxh64Slice (ByteSlice.ofByteArray bytes)
     if verifyCasDigest expectedDigest computedDigest pathSep != 1 then
       pure (.error .einval)
     else
-      hardLinkReplace casPath targetPath
+      pure (.ok bytes)
+
+/-- Write a `ByteSlice` into the content-addressable store, gated by `leansys_verify_cas_digest`.
+    Seals the stored blob read-only (`chmod 0444`) before atomic `rename` and verifies existing blobs
+    before deduplicating. Returns the 16-char hex digest key. -/
+def casPut (h : Handle) (payload : ByteSlice) : IO (SysResult String) := do
+  let digest := xxh64Slice payload
+  let hexKey := uint64ToHex16 digest
+  let pathSep := hasPathTraversal hexKey
+  if verifyCasDigest digest digest pathSep != 1 then
+    return .error .einval
+  let dstPath := (System.FilePath.mk h.casDir / hexKey).toString
+  if ← (System.FilePath.mk dstPath).pathExists then
+    match ← readVerifiedCasBlob dstPath digest pathSep with
+    | .ok _ =>
+      discard <| chmodReadOnly dstPath
+      return .ok hexKey
+    | .error _ =>
+      pure ()
+  let nonce ← IO.monoNanosNow
+  let tmpPath := s!"{dstPath}.{nonce}.tmp"
+  match ← withFd tmpPath 4 (fun fd => writeSliceAll fd payload true) with
+  | .error e => pure (.error e)
+  | .ok _ =>
+    match ← chmodReadOnly tmpPath with
+    | .error e => pure (.error e)
+    | .ok () =>
+      match ← atomicRename tmpPath dstPath with
+      | .error e => pure (.error e)
+      | .ok () => pure (.ok hexKey)
+
+/-- Read and verify a CAS object by `hexKey` into memory via `leansys_verify_cas_digest`. -/
+def casGet (h : Handle) (hexKey : String) : IO (SysResult ByteArray) := do
+  let cleanKey := match hexKey.splitOn ":" with
+    | [_, rest] => rest
+    | _ => hexKey
+  let pathSep := hasPathTraversal cleanKey
+  let some expectedDigest := parseHex16? cleanKey
+    | return .error .einval
+  let casPath := (System.FilePath.mk h.casDir / cleanKey).toString
+  readVerifiedCasBlob casPath expectedDigest pathSep
+
+/-- Materialize a CAS object identified by `hexKey` to `targetPath` as an independent writable (`0644`) file
+    via atomic temp-write + `fsync` + `rename`, after verifying digest integrity through `leansys_verify_cas_digest`.
+    Mutating `targetPath` never mutates the read-only (`0444`) CAS blob. -/
+def casMaterialize (h : Handle) (hexKey : String) (targetPath : String) : IO (SysResult Unit) := do
+  match ← casGet h hexKey with
+  | .error e => pure (.error e)
+  | .ok bytes =>
+    let nonce ← IO.monoNanosNow
+    let tmpTarget := s!"{targetPath}.{nonce}.cas.tmp"
+    match ← withFd tmpTarget 4 (fun fd => writeAll fd bytes true) with
+    | .error e => pure (.error e)
+    | .ok _ => atomicRename tmpTarget targetPath
 
 end LeanSys.Store

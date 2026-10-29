@@ -1,4 +1,4 @@
-//! Zero-dependency typed Rust bindings to the 17 formally verified unboxed C-ABI
+//! Zero-dependency typed Rust bindings to all 33 formally verified unboxed C-ABI
 //! safety gates in `LeanSys/Spec.lean` (`0 import Lean`, `0 sorryAx`).
 
 extern "C" {
@@ -168,6 +168,76 @@ extern "C" {
         len_b: u64,
         arena_cap: u64,
     ) -> u8;
+
+    pub fn leansys_verify_snapshot_visibility(
+        entry_seq: u64,
+        max_snapshot_seq: u64,
+        is_tombstone: u8,
+    ) -> u8;
+
+    pub fn leansys_verify_http_route_match(
+        method_match: u8,
+        path_match: u8,
+        route_idx: u32,
+        route_count: u32,
+    ) -> u8;
+
+    pub fn leansys_verify_counterexample_triage(
+        has_violation: u8,
+        has_missing_hyp_hint: u8,
+        ref_disagrees_with_candidate: u8,
+        triage_class: u8,
+    ) -> u8;
+
+    pub fn leansys_verify_dag_wave_step(
+        in_degree_sum: u64,
+        wave_size: u64,
+        completed_tasks: u64,
+        total_tasks: u64,
+        active_workers: u64,
+        max_workers: u64,
+    ) -> u8;
+
+    pub fn leansys_verify_ios_jetsam_budget(
+        dirty_rss_bytes: u64,
+        alloc_bytes: u64,
+        max_jetsam_bytes: u64,
+        page_align_mask: u64,
+        is_app_extension: u8,
+    ) -> u8;
+
+    pub fn leansys_verify_worker_budget(
+        active_workers: u64,
+        max_workers: u64,
+        micro_chunks: u64,
+        total_len: u64,
+        topology_kind: u8,
+    ) -> u8;
+
+    pub fn leansys_verify_page_aligned_buffer(
+        addr: u64,
+        alloc_bytes: u64,
+        capacity_bytes: u64,
+        dirty_rss_bytes: u64,
+        max_budget_bytes: u64,
+        page_align_mask: u64,
+    ) -> u8;
+
+    pub fn leansys_select_isa(
+        detected_hw_caps: u64,
+        required_mask: u64,
+        requested_variant_id: u8,
+        max_variant_id: u8,
+    ) -> u8;
+
+    pub fn leansys_verify_isa_selection(
+        detected_hw_caps: u64,
+        required_mask: u64,
+        selected_variant_id: u8,
+        max_variant_id: u8,
+    ) -> u8;
+
+    pub fn leansys_verify_fd_bounds(raw_word: u64, fd_out: u32) -> u8;
 }
 
 pub const WAL_MAGIC: u32 = 0x4C53_5953;
@@ -484,12 +554,172 @@ pub fn verify_arena_disjoint(
     unsafe { leansys_verify_arena_disjoint(off_a, len_a, off_b, len_b, arena_cap) == 1 }
 }
 
+#[inline]
+pub fn verify_snapshot_visibility(entry_seq: u64, max_snapshot_seq: u64, is_tombstone: bool) -> bool {
+    unsafe {
+        leansys_verify_snapshot_visibility(entry_seq, max_snapshot_seq, u8::from(is_tombstone)) == 1
+    }
+}
+
+#[inline]
+pub fn verify_http_route_match(
+    method_match: bool,
+    path_match: bool,
+    route_idx: u32,
+    route_count: u32,
+) -> bool {
+    unsafe {
+        leansys_verify_http_route_match(
+            u8::from(method_match),
+            u8::from(path_match),
+            route_idx,
+            route_count,
+        ) == 1
+    }
+}
+
+#[inline]
+pub fn verify_counterexample_triage(
+    has_violation: bool,
+    has_missing_hyp_hint: bool,
+    ref_disagrees_with_candidate: bool,
+    triage_class: u8,
+) -> bool {
+    unsafe {
+        leansys_verify_counterexample_triage(
+            u8::from(has_violation),
+            u8::from(has_missing_hyp_hint),
+            u8::from(ref_disagrees_with_candidate),
+            triage_class,
+        ) == 1
+    }
+}
+
+#[inline]
+pub fn verify_dag_wave_step(
+    in_degree_sum: u64,
+    wave_size: u64,
+    completed_tasks: u64,
+    total_tasks: u64,
+    active_workers: u64,
+    max_workers: u64,
+) -> bool {
+    unsafe {
+        leansys_verify_dag_wave_step(
+            in_degree_sum,
+            wave_size,
+            completed_tasks,
+            total_tasks,
+            active_workers,
+            max_workers,
+        ) == 1
+    }
+}
+
+#[inline]
+pub fn verify_ios_jetsam_budget(
+    dirty_rss_bytes: u64,
+    alloc_bytes: u64,
+    max_jetsam_bytes: u64,
+    page_align_mask: u64,
+    is_app_extension: bool,
+) -> bool {
+    unsafe {
+        leansys_verify_ios_jetsam_budget(
+            dirty_rss_bytes,
+            alloc_bytes,
+            max_jetsam_bytes,
+            page_align_mask,
+            u8::from(is_app_extension),
+        ) == 1
+    }
+}
+
+#[inline]
+pub fn verify_worker_budget(
+    active_workers: u64,
+    max_workers: u64,
+    micro_chunks: u64,
+    total_len: u64,
+    topology_kind: u8,
+) -> bool {
+    unsafe {
+        leansys_verify_worker_budget(
+            active_workers,
+            max_workers,
+            micro_chunks,
+            total_len,
+            topology_kind,
+        ) == 1
+    }
+}
+
+#[inline]
+pub fn verify_page_aligned_buffer(
+    addr: u64,
+    alloc_bytes: u64,
+    capacity_bytes: u64,
+    dirty_rss_bytes: u64,
+    max_budget_bytes: u64,
+    page_align_mask: u64,
+) -> bool {
+    unsafe {
+        leansys_verify_page_aligned_buffer(
+            addr,
+            alloc_bytes,
+            capacity_bytes,
+            dirty_rss_bytes,
+            max_budget_bytes,
+            page_align_mask,
+        ) == 1
+    }
+}
+
+#[inline]
+pub fn select_isa(
+    detected_hw_caps: u64,
+    required_mask: u64,
+    requested_variant_id: u8,
+    max_variant_id: u8,
+) -> u8 {
+    unsafe {
+        leansys_select_isa(
+            detected_hw_caps,
+            required_mask,
+            requested_variant_id,
+            max_variant_id,
+        )
+    }
+}
+
+#[inline]
+pub fn verify_isa_selection(
+    detected_hw_caps: u64,
+    required_mask: u64,
+    selected_variant_id: u8,
+    max_variant_id: u8,
+) -> bool {
+    unsafe {
+        leansys_verify_isa_selection(
+            detected_hw_caps,
+            required_mask,
+            selected_variant_id,
+            max_variant_id,
+        ) == 1
+    }
+}
+
+#[inline]
+pub fn verify_fd_bounds(raw_word: u64, fd_out: u32) -> bool {
+    unsafe { leansys_verify_fd_bounds(raw_word, fd_out) == 1 }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn all_17_cabi_gates_enforce_tight_bounds() {
+    fn all_33_cabi_gates_enforce_tight_bounds() {
         assert!(verify_slice_bounds(4, 8, 12));
         assert!(!verify_slice_bounds(5, 8, 12));
 
@@ -581,5 +811,63 @@ mod tests {
 
         assert!(verify_arena_disjoint(0, 128, 128, 128, 256));
         assert!(!verify_arena_disjoint(0, 128, 64, 128, 256));
+
+        assert!(verify_snapshot_visibility(2, 5, false));
+        assert!(!verify_snapshot_visibility(6, 5, false));
+        assert!(!verify_snapshot_visibility(2, 5, true));
+
+        assert!(verify_http_route_match(true, true, 0, 4));
+        assert!(!verify_http_route_match(false, true, 0, 4));
+        assert!(!verify_http_route_match(true, true, 4, 4));
+        assert!(!verify_http_route_match(true, true, 0, 65));
+
+        assert!(verify_counterexample_triage(true, true, false, 1));
+        assert!(verify_counterexample_triage(true, false, true, 2));
+        assert!(verify_counterexample_triage(true, false, false, 3));
+        assert!(!verify_counterexample_triage(true, true, false, 3));
+        assert!(!verify_counterexample_triage(false, true, false, 1));
+
+        assert!(verify_dag_wave_step(0, 4, 8, 16, 4, 4));
+        assert!(!verify_dag_wave_step(1, 4, 8, 16, 4, 4));
+        assert!(!verify_dag_wave_step(0, 12, 8, 16, 4, 4));
+
+        assert!(verify_ios_jetsam_budget(4_194_304, 65_536, 134_217_728, 16_383, false));
+        assert!(verify_ios_jetsam_budget(4_194_304, 65_536, 25_165_824, 16_383, true));
+        assert!(!verify_ios_jetsam_budget(4_194_304, 65_536, 33_554_432, 16_383, true));
+
+        assert!(verify_worker_budget(4, 6, 24, 4096, 1));
+        assert!(!verify_worker_budget(4, 8, 24, 4096, 1));
+        assert!(verify_worker_budget(6, 9, 54, 4096, 2));
+        assert!(!verify_worker_budget(6, 10, 54, 4096, 2));
+
+        assert!(verify_page_aligned_buffer(
+            0x10000,
+            4096,
+            16_384,
+            1_048_576,
+            134_217_728,
+            16_383
+        ));
+        assert!(!verify_page_aligned_buffer(
+            0x11000,
+            4096,
+            16_384,
+            1_048_576,
+            134_217_728,
+            16_383
+        ));
+
+        assert_eq!(select_isa(0x37F, 0x37F, 3, 3), 3);
+        assert_eq!(select_isa(0x307, 0x37F, 3, 3), 0);
+        assert_eq!(select_isa(0x37F, 0, 3, 3), 0);
+
+        assert!(verify_isa_selection(0x37F, 0x37F, 3, 3));
+        assert!(!verify_isa_selection(0x307, 0x37F, 3, 3));
+        assert!(!verify_isa_selection(0x37F, 0x107, 3, 3));
+
+        assert!(verify_fd_bounds(70_000, 70_000));
+        assert!(verify_fd_bounds(0x7FFF_FFFF, 0x7FFF_FFFF));
+        assert!(!verify_fd_bounds(0x8000_0000, 0x8000_0000));
+        assert!(!verify_fd_bounds(70_000, 4_464));
     }
 }

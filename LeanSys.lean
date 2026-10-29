@@ -44,6 +44,7 @@ namespace Core
   abbrev bloomInsert := LeanSys.Hash.bloomInsert
   abbrev bloomContains := LeanSys.Hash.bloomContains
   abbrev verifySliceBounds := LeanSys.Spec.verifySliceBounds
+  abbrev verifyFdBounds := LeanSys.Spec.verifyFdBounds
   abbrev verifyCounterexampleTriage := LeanSys.Spec.verifyCounterexampleTriage
   abbrev checkCounterexampleTriage := LeanSys.Contracts.checkCounterexampleTriage
   abbrev CounterexampleTriageInput := LeanSys.Contracts.CounterexampleTriageInput
@@ -61,14 +62,19 @@ namespace Os
   abbrev LogChunk := LeanSys.ProcLog.LogChunk
   abbrev readLogChunk := LeanSys.ProcLog.readLogChunk
   abbrev SandboxQuota := LeanSys.Sandbox.SandboxQuota
+  abbrev LandlockPolicy := LeanSys.Sandbox.LandlockPolicy
   abbrev SandboxResult := LeanSys.Sandbox.SandboxResult
+  abbrev queryLandlockAbi := LeanSys.Sandbox.queryLandlockAbi
+  abbrev applyLandlockPolicy := LeanSys.Sandbox.applyLandlockPolicy
   abbrev runSandboxedGroup := LeanSys.Sandbox.runSandboxedGroup
+  abbrev runLandlockedGroup := LeanSys.Sandbox.runLandlockedGroup
 end Os
 
 /-! ## Crash-atomic WAL/CAS store, LSM SST tables, and snapshot-isolated composite-key range scans (`LeanSys.Db`) -/
 namespace Db
   abbrev StoreHandle := LeanSys.Store.Handle
   abbrev openStore := LeanSys.Store.openStore
+  abbrev openStoreWithChunk := LeanSys.Store.openStoreWithChunk
   abbrev put := LeanSys.Store.put
   abbrev putString := LeanSys.Store.putString
   abbrev putBatch := LeanSys.Store.putBatch
@@ -76,6 +82,7 @@ namespace Db
   abbrev getString? := LeanSys.Store.getString?
   abbrev compact := LeanSys.Store.compact
   abbrev casPut := LeanSys.Store.casPut
+  abbrev casGet := LeanSys.Store.casGet
   abbrev casMaterialize := LeanSys.Store.casMaterialize
   abbrev SstTable := LeanSys.Lsm.SstTable
   abbrev flushStore := LeanSys.Lsm.SstTable.flushStore
@@ -105,6 +112,9 @@ namespace Web
   abbrev parseRpcRequest? := LeanSys.JsonRpc.parseRequest?
   abbrev formatRpcSuccess := LeanSys.JsonRpc.formatSuccess
   abbrev verifyRotatedBearer := LeanSys.Auth.verifyRotatedBearer
+  abbrev sha256Bytes := LeanSys.Auth.sha256Bytes
+  abbrev hmacSha256Bytes := LeanSys.Auth.hmacSha256Bytes
+  abbrev hmacSha256Hex := LeanSys.Auth.hmacSha256Hex
   abbrev mintLease := LeanSys.Auth.mintLease
   abbrev validateLease := LeanSys.Auth.validateLease
 end Web

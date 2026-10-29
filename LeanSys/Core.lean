@@ -160,7 +160,12 @@ def runSelfTest : IO UInt32 := do
                    (WorkerBudget.ofTopology CoreTopology.appleA15).isMobileHetero &&
                    (WorkerBudget.ofTopology CoreTopology.tensorG3).microChunkFactor == 6 &&
                    (WorkerBudget.ofTopology CoreTopology.tensorG3).isMobileHetero
-  if !(sbOk && wfOk && casGateOk && httpGateOk && tapeGateOk && ringGateOk && sstGateOk && pollGateOk && rlimGateOk && mixGateOk && ckGateOk && tokGateOk && logGateOk && rpcGateOk && admitGateOk && seqlockGateOk && procStatGateOk && sseGateOk && gfmGateOk && tagGateOk && trIdxGateOk && parChunkGateOk && arenaDisjointGateOk && snapVisGateOk && routeMatchGateOk && triageGateOk && dagWaveGateOk && jetsamGateOk && workerGateOk && pageBufGateOk && isaGateOk) then
+  let fdGateOk := verifyFdBounds 70000 70000 == 1 &&
+                  verifyFdBounds 0x7FFFFFFF 0x7FFFFFFF == 1 &&
+                  verifyFdBounds 0x80000000 0x80000000 == 0 &&
+                  verifyFdBounds 70000 4464 == 0 &&
+                  verifyFdBounds 0xFFFFFFFFFFFFFFFF 0xFFFFFFFF == 0
+  if !(sbOk && wfOk && casGateOk && httpGateOk && tapeGateOk && ringGateOk && sstGateOk && pollGateOk && rlimGateOk && mixGateOk && ckGateOk && tokGateOk && logGateOk && rpcGateOk && admitGateOk && seqlockGateOk && procStatGateOk && sseGateOk && gfmGateOk && tagGateOk && trIdxGateOk && parChunkGateOk && arenaDisjointGateOk && snapVisGateOk && routeMatchGateOk && triageGateOk && dagWaveGateOk && jetsamGateOk && workerGateOk && pageBufGateOk && isaGateOk && fdGateOk) then
     IO.eprintln "[lean-sys-core] FAIL: C-ABI Spec gates check failed"
     return 1
 
@@ -204,20 +209,49 @@ def runSelfTest : IO UInt32 := do
     IO.eprintln "[lean-sys-core] FAIL: JsonTape zero-copy lookup mismatch"
     return 1
 
-  -- 3. Store WAL + Batch Group-Commit + Torn-Tail Recovery + Compaction + CAS Hardlink
+  -- 3. Store WAL + Batch Group-Commit + Torn-Tail Recovery + Mid-Log Corruption Fail-Closed + >64 MiB Replay + CAS Immutability
   let ts ← IO.monoNanosNow
-  let testDir := s!"/tmp/lean-sys-selftest-{ts}"
+  let tmpBase ← match ← IO.getEnv "TMPDIR" with
+    | some d => pure (if d.isEmpty then "/tmp" else d)
+    | none => pure "/tmp"
+  let testDir := s!"{tmpBase}/lean-sys-selftest-{ts}"
   let pTest : System.FilePath := testDir
   if ← pTest.pathExists then
     IO.FS.removeDirAll pTest
   IO.FS.createDirAll pTest
+
+  -- 3a. 32-Bit High File Descriptor (`F_DUPFD_CLOEXEC >= 65536`) I/O & `closeFd` Roundtrip
+  let hiFdPath := s!"{testDir}/high_fd_probe.bin"
+  let .ok baseFd ← openFd hiFdPath 4 | do IO.eprintln "[lean-sys-core] FAIL: openFd high_fd_probe"; return 1
+  let .ok highFd ← dupFdAbove64k baseFd 1 | do
+    discard <| closeFd baseFd
+    IO.eprintln "[lean-sys-core] FAIL: dupFdAbove64k (>= 65536)"
+    return 1
+  let .ok () ← closeFd baseFd | do IO.eprintln "[lean-sys-core] FAIL: closeFd baseFd"; return 1
+  if highFd.raw < 65536 then
+    discard <| closeFd highFd
+    IO.eprintln s!"[lean-sys-core] FAIL: highFd < 65536 ({highFd.raw})"
+    return 1
+  let .ok writtenHi ← writeAll highFd "high-fd-32bit-ok".toUTF8 true
+    | do discard <| closeFd highFd; IO.eprintln "[lean-sys-core] FAIL: writeAll on highFd"; return 1
+  let readHi ← preadByteArray highFd 0 64
+  let .ok () ← closeFd highFd | do IO.eprintln "[lean-sys-core] FAIL: closeFd highFd"; return 1
+  -- Verify `highFd` was genuinely closed (`fstatSize` on closed 32-bit FD returns `EBADF`)
+  match ← fstatSize highFd with
+  | .error .ebadf => pure ()
+  | other =>
+    IO.eprintln s!"[lean-sys-core] FAIL: closeFd did not close 32-bit highFd ({highFd.raw}), fstat={repr other}"
+    return 1
+  if writtenHi != 16 || String.fromUTF8! readHi != "high-fd-32bit-ok" then
+    IO.eprintln "[lean-sys-core] FAIL: highFd 32-bit read/write payload mismatch"
+    return 1
 
   let .ok st0 ← openStore testDir | do IO.eprintln "[lean-sys-core] FAIL: openStore initial"; return 1
   let .ok st1 ← putString st0 "alpha" "value-alpha-1" true | do IO.eprintln "[lean-sys-core] FAIL: put alpha"; return 1
   let .ok st2 ← putBatch st1 #[("beta", ByteSlice.ofString "value-beta-2"), ("gamma", ByteSlice.ofString "value-gamma-3")] true
     | do IO.eprintln "[lean-sys-core] FAIL: putBatch"; return 1
 
-  -- Inject a corrupt / torn trailing WAL frame (8 bytes instead of full frame)
+  -- Inject a partial / torn trailing WAL frame at EOF (8 bytes of valid LSYS magic + payloadLen)
   let tornBytes := ByteArray.mk #[0x53, 0x59, 0x53, 0x4C, 0x20, 0x00, 0x00, 0x00]
   let _ ← withFd st2.walPath 2 (fun fd => writeAll fd tornBytes true)
 
@@ -233,14 +267,93 @@ def runSelfTest : IO UInt32 := do
   if getString? stCompacted "gamma" != some "value-gamma-3" || stCompacted.framesCount != 3 then
     IO.eprintln "[lean-sys-core] FAIL: Store.compact state mismatch"; return 1
 
-  -- CAS put & hardlink materialize
+  -- 3b. Fail-closed mid-log WAL corruption detection
+  let corruptDir := s!"{testDir}/corrupt_wal"
+  IO.FS.createDirAll corruptDir
+  let .ok stCor0 ← openStore corruptDir | do IO.eprintln "[lean-sys-core] FAIL: openStore corruptDir"; return 1
+  let .ok stCor1 ← putString stCor0 "k1" "val-one-valid" false | do return 1
+  let .ok stCor2 ← putString stCor1 "k2" "val-two-to-corrupt" false | do return 1
+  let .ok stCor3 ← putString stCor2 "k3" "val-three-valid" true | do return 1
+  -- Flip a payload byte inside the middle frame (`k2`) without updating checksum
+  let walRaw ← IO.FS.readBinFile stCor3.walPath
+  let flipIdx := 34
+  let corruptedWal := walRaw.set! flipIdx (walRaw.get! flipIdx ^^^ 0xFF)
+  IO.FS.writeBinFile stCor3.walPath corruptedWal
+  match ← openStore corruptDir with
+  | .error .eio => pure ()
+  | .ok _ =>
+    IO.eprintln "[lean-sys-core] FAIL: openStore accepted mid-log corrupted WAL instead of failing closed"
+    return 1
+  | .error e =>
+    IO.eprintln s!"[lean-sys-core] FAIL: unexpected error on mid-log corrupt WAL: {e}"
+    return 1
+
+  -- 3c. Fail-closed premature empty read before `fileSize` (must NEVER misclassify I/O error as EOF torn tail)
+  let validWalImage := encodeWalKVFrame "f1" (ByteSlice.ofString "committed-one") ++
+    encodeWalKVFrame "f2" (ByteSlice.ofString "committed-two-must-survive")
+  let f1Len := (encodeWalKVFrame "f1" (ByteSlice.ofString "committed-one")).size
+  let cutInF2 := f1Len + 10
+  let prematureRes ← replayWalReader validWalImage.size.toUInt64 (fun off _ => do
+    if off == 0 then
+      pure (validWalImage.extract 0 cutInF2)
+    else
+      pure ByteArray.empty) 65536
+  match prematureRes with
+  | .error .eio => pure ()
+  | _ =>
+    IO.eprintln "[lean-sys-core] FAIL: replayWalReader did not return EIO on premature empty read before fileSize"
+    return 1
+
+  -- 3d. Streaming WAL replay across > 64 MiB log in portable temp dir (`testDir/bigwal`), cleaned up immediately
+  let bigWalDir := s!"{testDir}/bigwal"
+  IO.FS.createDirAll bigWalDir
+  let .ok stBig0 ← openStore bigWalDir | do IO.eprintln "[lean-sys-core] FAIL: openStore bigWalDir"; return 1
+  let chunk4m := ByteArray.mk (Array.replicate 4194304 (0x42 : UInt8))
+  let mut stBigCur := stBig0
+  for idx in [0:17] do
+    match ← put stBigCur s!"big-{idx}" (ByteSlice.ofByteArray chunk4m) false with
+    | .ok next => stBigCur := next
+    | .error e =>
+      IO.FS.removeDirAll bigWalDir
+      IO.eprintln s!"[lean-sys-core] FAIL: big WAL put {idx}: {e}"
+      return 1
+  let .ok stBigLast ← putString stBigCur "big-sentinel" "after-68mib-ok" false
+    | do IO.FS.removeDirAll bigWalDir; return 1
+  let .ok bigWalSz ← statFileSize stBigLast.walPath
+    | do IO.FS.removeDirAll bigWalDir; return 1
+  let .ok stBigReopened ← openStoreWithChunk bigWalDir 2097152
+    | do IO.FS.removeDirAll bigWalDir; IO.eprintln "[lean-sys-core] FAIL: >64 MiB WAL replay failed"; return 1
+  IO.FS.removeDirAll bigWalDir
+  if bigWalSz ≤ 67108864 || stBigReopened.framesCount != 18 ||
+     getString? stBigReopened "big-sentinel" != some "after-68mib-ok" ||
+     (get? stBigReopened "big-16").map ByteArray.size != some 4194304 then
+    IO.eprintln "[lean-sys-core] FAIL: >64 MiB streaming WAL replay state mismatch"
+    return 1
+
+  -- 3e. CAS `0444` immutability & copy-on-materialize isolation
   let blobPayload := ByteSlice.ofString "(lnir_module verified_cas_object_v1)"
   let .ok casKey ← casPut stCompacted blobPayload | do IO.eprintln "[lean-sys-core] FAIL: Store.casPut"; return 1
+  let casBlobPath := s!"{stCompacted.casDir}/{casKey}"
+  -- Direct write open on sealed CAS blob must be rejected (`EACCES` / `EPERM`) unless running as root (`uid == 0`),
+  -- and mutating a materialized target must NEVER mutate the stored CAS blob.
   let matPath := s!"{testDir}/materialized_blob.lnir"
   let .ok () ← casMaterialize stCompacted casKey matPath | do IO.eprintln "[lean-sys-core] FAIL: Store.casMaterialize"; return 1
   let matRead ← IO.FS.readFile matPath
   if matRead != "(lnir_module verified_cas_object_v1)" then
     IO.eprintln "[lean-sys-core] FAIL: CAS materialized content mismatch"; return 1
+  -- Mutate the materialized copy in place and verify CAS blob + subsequent `casGet`/`casMaterialize` remain untouched
+  IO.FS.writeFile matPath "TAMPERED_BY_CALLER_AFTER_MATERIALIZE"
+  let .ok casBytesAfter ← casGet stCompacted casKey
+    | do IO.eprintln "[lean-sys-core] FAIL: CAS corrupted when materialized file was modified!"; return 1
+  let matPath2 := s!"{testDir}/materialized_blob_clean.lnir"
+  let .ok () ← casMaterialize stCompacted casKey matPath2
+    | do IO.eprintln "[lean-sys-core] FAIL: second casMaterialize after caller mutation failed"; return 1
+  let matRead2 ← IO.FS.readFile matPath2
+  let casRawOnDisk ← IO.FS.readFile casBlobPath
+  if String.fromUTF8! casBytesAfter != "(lnir_module verified_cas_object_v1)" ||
+     matRead2 != "(lnir_module verified_cas_object_v1)" ||
+     casRawOnDisk != "(lnir_module verified_cas_object_v1)" then
+    IO.eprintln "[lean-sys-core] FAIL: CAS immutability / isolation invariant violated"; return 1
 
   -- 4. LSM Sorted-String Table (`SstTable`) & 64-Bit Bloom Filter
   let sstPath := s!"{testDir}/state.sst"
@@ -315,11 +428,15 @@ def runSelfTest : IO UInt32 := do
     return 1
 
   let lease := mintLease "cur-secret" "babylon" "job:submit" 2000
-  if !verifyRotatedBearer "old-tok" "new-tok" (some "old-tok") ||
+  let forgedLease := { lease with macHex := "0000000000000000000000000000000000000000000000000000000000000000" }
+  if !verifyRfc4231Vectors ||
+     !verifyRotatedBearer "old-tok" "new-tok" (some "old-tok") ||
      verifyRotatedBearer "bad-tok" "new-tok" (some "old-tok") ||
      !validateLease lease "new-secret" (some "cur-secret") "babylon" "job:submit" 1500 ||
+     validateLease forgedLease "cur-secret" none "babylon" "job:submit" 1500 ||
+     validateLease lease "wrong-secret" none "babylon" "job:submit" 1500 ||
      validateLease lease "new-secret" (some "cur-secret") "babylon" "job:submit" 2500 then
-    IO.eprintln "[lean-sys-core] FAIL: Auth token rotation / lease validation mismatch"
+    IO.eprintln "[lean-sys-core] FAIL: Auth RFC 4231 HMAC-SHA256 / token rotation / lease validation mismatch"
     return 1
 
   let logPath := s!"{testDir}/job.log"
@@ -335,18 +452,55 @@ def runSelfTest : IO UInt32 := do
   if rpcReq.method != "tools/list" || rpcReq.idRaw? != some "7" then
     IO.eprintln "[lean-sys-core] FAIL: JsonRpc field mismatch"; return 1
 
-  -- 5. Shared-Memory SPSC Ring Buffer (`ShmRing`) & Seqlock / `/proc/<pid>/stat`
+  -- 5. Shared-Memory `MAP_SHARED` Circular Ring (`ShmRing.init` + non-truncating `ShmRing.open`) & Seqlock / `/proc/<pid>/stat`
+  -- Verify empty (0-byte), undersized header (12-byte), and truncated payload (32-byte for cap=128) backing files return `.error .einval` without raising `SIGBUS`
+  let emptyRingPath := s!"{testDir}/empty_ipc.ring"
+  IO.FS.writeBinFile emptyRingPath ByteArray.empty
+  let shortRingPath := s!"{testDir}/short_ipc.ring"
+  IO.FS.writeBinFile shortRingPath (ByteArray.mk (Array.replicate 12 0))
+  let truncPayloadRingPath := s!"{testDir}/trunc_payload_ipc.ring"
+  let .ok truncRing ← ShmRing.init truncPayloadRingPath 128 | do IO.eprintln "[lean-sys-core] FAIL: ShmRing.init trunc_payload"; return 1
+  let .ok () ← ShmRing.push truncRing (ByteSlice.ofString "before-truncate") | do IO.eprintln "[lean-sys-core] FAIL: ShmRing.push trunc_payload"; return 1
+  -- Truncate file to 32 bytes (24-byte valid LRNG header + only 8 bytes of the 128-byte payload arena)
+  let .ok () ← withFd truncPayloadRingPath 5 (fun fd => ftruncateFd fd 32)
+    | do IO.eprintln "[lean-sys-core] FAIL: ftruncate trunc_payload"; return 1
+  let emptyOpenRes ← ShmRing.openExisting emptyRingPath
+  let emptyReadHdrRes ← ShmRing.readHeader { path := emptyRingPath, lockPath := emptyRingPath ++ ".lock", cap := 64 }
+  let shortOpenRes ← ShmRing.openExisting shortRingPath
+  let truncOpenRes ← ShmRing.openExisting truncPayloadRingPath
+  let truncPopRes ← ShmRing.pop? truncRing
+  let truncPushRes ← ShmRing.push truncRing (ByteSlice.ofString "after-truncate")
+  match emptyOpenRes, emptyReadHdrRes, shortOpenRes, truncOpenRes, truncPopRes, truncPushRes with
+  | .error .einval, .error .einval, .error .einval, .error .einval, .error .einval, .error .einval => pure ()
+  | _, _, _, _, _, _ =>
+    IO.eprintln "[lean-sys-core] FAIL: ShmRing empty/short/truncated backing file did not fail closed with EINVAL"
+    return 1
   let ringPath := s!"{testDir}/ipc.ring"
-  let .ok ring ← ShmRing.init ringPath 1024 | do IO.eprintln "[lean-sys-core] FAIL: ShmRing.init"; return 1
+  let .ok ring ← ShmRing.init ringPath 128 | do IO.eprintln "[lean-sys-core] FAIL: ShmRing.init"; return 1
   let .ok () ← ShmRing.push ring (ByteSlice.ofString "ring-msg-1") | do IO.eprintln "[lean-sys-core] FAIL: ShmRing.push 1"; return 1
-  let .ok () ← ShmRing.push ring (ByteSlice.ofString "ring-msg-2") | do IO.eprintln "[lean-sys-core] FAIL: ShmRing.push 2"; return 1
-  let .ok (some pop1) ← ShmRing.pop? ring | do IO.eprintln "[lean-sys-core] FAIL: ShmRing.pop 1"; return 1
+  -- Attach a second independent handle via non-truncating `ShmRing.open` and verify unread messages survive!
+  let .ok ring2 ← ShmRing.open ringPath | do IO.eprintln "[lean-sys-core] FAIL: ShmRing.open existing"; return 1
+  let .ok () ← ShmRing.push ring2 (ByteSlice.ofString "ring-msg-2-from-handle2") | do IO.eprintln "[lean-sys-core] FAIL: ShmRing.push 2"; return 1
+  let .ok (some pop1) ← ShmRing.pop? ring2 | do IO.eprintln "[lean-sys-core] FAIL: ShmRing.pop 1"; return 1
   let .ok (some pop2) ← ShmRing.pop? ring | do IO.eprintln "[lean-sys-core] FAIL: ShmRing.pop 2"; return 1
+  -- Exercise circular wrap-around past `cap = 128` via `MAP_SHARED` `mmap` without resizing file
+  let mut wrapOk := true
+  for wi in [0:12] do
+    let msgStr := s!"wrap-payload-{wi}-0123456789abcdef"
+    match ← ShmRing.push ring (ByteSlice.ofString msgStr) with
+    | .error _ => wrapOk := false
+    | .ok () =>
+      match ← ShmRing.pop? ring2 with
+      | .ok (some popped) =>
+        if String.fromUTF8! popped != msgStr then wrapOk := false
+      | _ => wrapOk := false
+  let .ok ringFileSz ← statFileSize ringPath | do return 1
   let .ok none ← ShmRing.pop? ring | do IO.eprintln "[lean-sys-core] FAIL: ShmRing.pop empty"; return 1
-  if String.fromUTF8! pop1 != "ring-msg-1" || String.fromUTF8! pop2 != "ring-msg-2" ||
+  if !wrapOk || ringFileSz != (24 + 128) ||
+     String.fromUTF8! pop1 != "ring-msg-1" || String.fromUTF8! pop2 != "ring-msg-2-from-handle2" ||
      !ShmRing.validateSeqlockSnapshot 1 1 8 8 3 2 64 1024 ||
      ShmRing.validateSeqlockSnapshot 1 1 7 7 3 2 64 1024 then
-    IO.eprintln "[lean-sys-core] FAIL: ShmRing FIFO order or seqlock snapshot mismatch"; return 1
+    IO.eprintln "[lean-sys-core] FAIL: ShmRing MAP_SHARED open/wrap/FIFO order or seqlock snapshot mismatch"; return 1
   let statSample := ByteSlice.ofString "4242 (my (tricky) worker) S 1 4242 4242 0 -1 4194304 10 0 0 0 5 2 0 0 20 0 1 0 987654321 123456"
   let some (commSl, fCount) := scanProcStatFields? statSample 5 | do IO.eprintln "[lean-sys-core] FAIL: scanProcStatFields?"; return 1
   if commSl.toStringLossy != "my (tricky) worker" || fCount != 21 then
@@ -355,47 +509,173 @@ def runSelfTest : IO UInt32 := do
   if statRec.commSlice.toStringLossy != "my (tricky) worker" || statRec.stateByte != 83 || statRec.startTicks != 987654321 || statRec.fieldsAfterComm != 21 then
     IO.eprintln "[lean-sys-core] FAIL: parseProcStatRecord? mismatch"; return 1
 
-  -- 6. Process-Group Sandbox & Quota Enforcer (`LeanSys.Sandbox`)
+  -- 6. Process-Group Sandbox & Honest Linux Landlock Confinement (`LeanSys.Sandbox`)
   let quota : SandboxQuota := { maxRssBytes := 536870912, timeoutMs := 3000, maxPipeBytes := 4194304 }
   let .ok sbRes ← runSandboxedGroup quota "/bin/true" #[]
     | do IO.eprintln "[lean-sys-core] FAIL: runSandboxedGroup /bin/true"; return 1
-  if sbRes.exitCode != 0 || sbRes.timedOut || sbRes.quotaBreach then
+  if sbRes.exitCode != 0 || sbRes.timedOut || sbRes.quotaBreach || sbRes.landlockEnforced then
     IO.eprintln s!"[lean-sys-core] FAIL: SandboxResult unexpected: {repr sbRes}"
     return 1
+  -- Verify ordinary argv starting with ASCII 31 (`0x1F`) is passed verbatim to `execve` without C-shim stripping
+  let unitSepArg := String.fromUTF8! (ByteArray.mk #[31] ++ "verbatim-arg0".toUTF8)
+  let argvCheckOut := s!"{testDir}/argv_byte31.txt"
+  let .ok sbArgvRes ← runSandboxedGroup quota "/bin/sh" #[
+      "-c", s!"printf '%s|%s' \"$0\" \"$1\" > {argvCheckOut}", unitSepArg, "second-arg"
+    ]
+    | do IO.eprintln "[lean-sys-core] FAIL: runSandboxedGroup byte-31 argv check"; return 1
+  let argvRecorded ← IO.FS.readFile argvCheckOut
+  if sbArgvRes.exitCode != 0 || argvRecorded != s!"{unitSepArg}|second-arg" then
+    IO.eprintln s!"[lean-sys-core] FAIL: byte-31 argv was altered or stripped: {repr argvRecorded}"
+    return 1
+  let llRoDir := s!"{testDir}/ll_ro"
+  let llRwDir := s!"{testDir}/ll_rw"
+  let llDeniedDir := s!"{testDir}/ll_denied"
+  IO.FS.createDirAll llRoDir
+  IO.FS.createDirAll llRwDir
+  IO.FS.createDirAll llDeniedDir
+  IO.FS.writeFile s!"{llRoDir}/in.txt" "landlock-ro-ok"
+  IO.FS.writeFile s!"{llDeniedDir}/secret.txt" "forbidden"
+  let llPolicy : LandlockPolicy := { readOnlyPath := llRoDir, readWritePath := llRwDir }
+  let landlockHonestOk ← match ← queryLandlockAbi with
+    | .error .eopnotsupp =>
+      -- On non-Landlock kernels/OSes, `runLandlockedGroup` MUST fail closed with `.error .eopnotsupp`
+      match ← runLandlockedGroup quota llPolicy "/bin/true" #[] with
+      | .error .eopnotsupp => pure true
+      | _ => pure false
+    | .error _ => pure false
+    | .ok abiVer =>
+      if abiVer < 1 then pure false
+      else
+        -- 1) Allowed: read from `llRoDir` and write to `llRwDir`
+        let allowedCmd := s!"cat {llRoDir}/in.txt > {llRwDir}/out.txt"
+        let rAllow ← runLandlockedGroup quota llPolicy "/bin/sh" #["-c", allowedCmd]
+        -- 2) Blocked by kernel Landlock: reading `llDeniedDir/secret.txt` must fail (`exitCode != 0`)
+        let rDenyRead ← runLandlockedGroup quota llPolicy "/bin/sh" #["-c", s!"exec 2>{llRwDir}/err1.log; cat {llDeniedDir}/secret.txt >{llRwDir}/leak.txt"]
+        -- 3) Blocked by kernel Landlock: writing into `llRoDir` must fail (`exitCode != 0`)
+        let rDenyWrite ← runLandlockedGroup quota llPolicy "/bin/sh" #["-c", s!"exec 2>{llRwDir}/err2.log; echo pwn > {llRoDir}/pwn.txt"]
+        match rAllow, rDenyRead, rDenyWrite with
+        | .ok resA, .ok resDR, .ok resDW =>
+          let copied ← IO.FS.readFile s!"{llRwDir}/out.txt"
+          let pwnExists ← (System.FilePath.mk s!"{llRoDir}/pwn.txt").pathExists
+          pure (resA.exitCode == 0 && resA.landlockEnforced && copied == "landlock-ro-ok" &&
+                resDR.exitCode != 0 && resDW.exitCode != 0 && !pwnExists)
+        | _, _, _ => pure false
+  if !landlockHonestOk then
+    IO.eprintln "[lean-sys-core] FAIL: Linux Landlock kernel enforcement / fail-closed check failed"
+    return 1
 
-  -- 7. Zero-Copy HTTP/1.1 & Reactor Loopback Roundtrip
+  -- 7. Smuggling-Safe HTTP/1.1 Parser, Fragmented Socket Reads & Pipelined Keep-Alive Reactor Roundtrip
+  let smuggleTe := "POST /v1/test HTTP/1.1\r\nHost: localhost\r\nContent-Length: 4\r\nTransfer-Encoding: chunked\r\n\r\ntest".toUTF8
+  let smuggleDupCl := "POST /v1/test HTTP/1.1\r\nHost: localhost\r\nContent-Length: 4\r\nContent-Length: 8\r\n\r\ntest".toUTF8
+  let smuggleNegCl := "POST /v1/test HTTP/1.1\r\nHost: localhost\r\nContent-Length: -1\r\n\r\n".toUTF8
+  if (parseRequest smuggleTe).isOk || (parseRequest smuggleDupCl).isOk || (parseRequest smuggleNegCl).isOk then
+    IO.eprintln "[lean-sys-core] FAIL: HTTP smuggling / conflicting or negative Content-Length was not rejected"
+    return 1
+
   let .ok (listenFd, boundPort) ← tcpListen "127.0.0.1" 0 16
     | do IO.eprintln "[lean-sys-core] FAIL: tcpListen ephemeral"; return 1
   let rCfg : ReactorConfig := { maxConns := 64, maxKeepAliveReq := 8, maxIdleMs := 3000, expectedBearer? := some "secret-cap-token" }
   let serverTask ← IO.asTask (prio := .dedicated) do
-    runReactorLoop rCfg listenFd 1 fun req => do
+    runReactorLoop rCfg listenFd 2 fun req => do
       let t := JsonTape.indexJsonObject req.bodySlice
       let pingVal := (JsonTape.lookupString? t "ping").getD "none"
       return HttpResponse.json 200 s!"\{\"ok\":true,\"method\":\"{req.method}\",\"path\":\"{req.path}\",\"ping\":\"{pingVal}\"}"
 
+  -- Session 1: Standard `httpClientRequest` (`Connection: close`)
   let reqJson := ByteSlice.ofString "{\"ping\":\"pong\"}"
   let clientRes ← httpClientRequest "127.0.0.1" boundPort "POST" "/v1/test" reqJson (some "secret-cap-token")
+
+  -- Session 2: Fragmented header/body writes + pipelined second request on the same keep-alive TCP socket
+  let .ok fragFd ← tcpConnect "127.0.0.1" boundPort
+    | do IO.eprintln "[lean-sys-core] FAIL: tcpConnect fragmented session"; return 1
+  let body1 := "{\"ping\":\"frag1\"}"
+  let body2 := "{\"ping\":\"pipe2\"}"
+  let rawReq1PartA := "POST /v1/frag HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: Bea".toUTF8
+  let rawReq1PartB := (s!"rer secret-cap-token\r\nContent-Length: {body1.utf8ByteSize}\r\nConnection: keep-alive\r\n\r\n" ++ "{\"ping\":").toUTF8
+  let rawReq1TailAndReq2 :=
+    ("\"frag1\"}" ++ s!"POST /v1/pipe HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: Bearer secret-cap-token\r\nContent-Length: {body2.utf8ByteSize}\r\nConnection: close\r\n\r\n{body2}").toUTF8
+  discard <| writeAll fragFd rawReq1PartA false
+  IO.sleep 5
+  discard <| writeAll fragFd rawReq1PartB false
+  IO.sleep 5
+  discard <| writeAll fragFd rawReq1TailAndReq2 false
+  let mut pipeResp := ByteArray.empty
+  for _ in [0:32] do
+    match ← pollReadable fragFd 1000 with
+    | .error _ => break
+    | .ok () =>
+      let ch ← readStreamChunk fragFd 16384
+      if ch.isEmpty then break
+      pipeResp := pipeResp ++ ch
+  discard <| closeFd fragFd
+  let pipeRespStr := String.fromUTF8! pipeResp
+
   let servedRes ← IO.wait serverTask
   let servedCount := match servedRes with | .ok n => n | .error _ => 0
   discard <| closeFd listenFd
+
+  -- 7b. `httpClientRequest` fail-closed deadline & truncated-response checks (no silent `.ok ""` or partial body)
+  let .ok (slowListenFd, slowPort) ← tcpListen "127.0.0.1" 0 16
+    | do IO.eprintln "[lean-sys-core] FAIL: tcpListen slow/truncated server"; return 1
+  let slowServerTask ← IO.asTask (prio := .dedicated) do
+    -- Case 1: Client connects, server accepts and stalls past client deadline without sending headers
+    if let .ok c1 ← tcpAcceptPoll slowListenFd 2000 then
+      discard <| pollReadable c1 50
+      discard <| readStreamChunk c1 4096
+      IO.sleep 140
+      discard <| closeFd c1
+    -- Case 2: Server sends `Content-Length: 32` header + only 6 bytes of body, then stalls past deadline
+    if let .ok c2 ← tcpAcceptPoll slowListenFd 2000 then
+      discard <| pollReadable c2 50
+      discard <| readStreamChunk c2 4096
+      let partialResp := "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 32\r\nConnection: close\r\n\r\n{\"par"
+      discard <| writeAll c2 partialResp.toUTF8 false
+      IO.sleep 140
+      discard <| closeFd c2
+    -- Case 3: Server sends `Content-Length: 32` header + 6 bytes of body, then closes socket immediately (premature EOF)
+    if let .ok c3 ← tcpAcceptPoll slowListenFd 2000 then
+      discard <| pollReadable c3 50
+      discard <| readStreamChunk c3 4096
+      let eofPartialResp := "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 32\r\nConnection: close\r\n\r\n{\"eof"
+      discard <| writeAll c3 eofPartialResp.toUTF8 false
+      discard <| closeFd c3
+  let emptyTimeoutRes ← httpClientRequest "127.0.0.1" slowPort "GET" "/stall" (ByteSlice.ofString "") none 60
+  let partialTimeoutRes ← httpClientRequest "127.0.0.1" slowPort "GET" "/partial-stall" (ByteSlice.ofString "") none 60
+  let prematureEofRes ← httpClientRequest "127.0.0.1" slowPort "GET" "/partial-eof" (ByteSlice.ofString "") none 500
+  discard <| IO.wait slowServerTask
+  discard <| closeFd slowListenFd
   IO.FS.removeDirAll pTest
+
+  match emptyTimeoutRes, partialTimeoutRes, prematureEofRes with
+  | .error .eagain, .error .eagain, .error .eio => pure ()
+  | _, _, _ =>
+    IO.eprintln s!"[lean-sys-core] FAIL: httpClientRequest did not fail closed on timeout/premature-EOF: {repr emptyTimeoutRes} / {repr partialTimeoutRes} / {repr prematureEofRes}"
+    return 1
 
   match clientRes with
   | .error e =>
     IO.eprintln s!"[lean-sys-core] FAIL: httpClientRequest error {e}"
     return 1
   | .ok respBody =>
-    if servedCount != 1 || (respBody.splitOn "\"ok\":true").length ≤ 1 || (respBody.splitOn "\"pong\"").length ≤ 1 then
-      IO.eprintln s!"[lean-sys-core] FAIL: unexpected HTTP response: {respBody}"
+    if servedCount != 3 ||
+       (respBody.splitOn "\"ok\":true").length ≤ 1 ||
+       (respBody.splitOn "\"pong\"").length ≤ 1 ||
+       (pipeRespStr.splitOn "\"frag1\"").length ≤ 1 ||
+       (pipeRespStr.splitOn "\"pipe2\"").length ≤ 1 then
+      IO.eprintln s!"[lean-sys-core] FAIL: unexpected HTTP/pipelined response (served={servedCount}): {respBody} / {pipeRespStr}"
       return 1
 
-  IO.println s!"\{ \"ok\": true, \"binary\": \"lean-sys-core\", \"c_abi_gates\": 32, \"par_scheduler\": true, \"wal_torn_recovery\": true, \"cas_hardlink\": true, \"sst_bloom\": true, \"table_range_scan\": true, \"auth_rotation\": true, \"proc_log\": true, \"proc_stat_scanner\": true, \"jsonrpc_2_0\": true, \"shm_ring\": true, \"mmap_seqlock\": true, \"jsonl_tape\": true, \"reactor_keepalive\": true, \"sandbox_rlimit\": true, \"pgid_reaper\": true, \"http_loopback_port\": {boundPort} }"
+  IO.println s!"\{ \"ok\": true, \"binary\": \"lean-sys-core\", \"c_abi_gates\": 33, \"fd_32bit_high\": true, \"hmac_sha256_rfc4231\": true, \"par_scheduler\": true, \"wal_torn_recovery\": true, \"wal_68mib_streaming\": true, \"cas_immutable\": true, \"sst_bloom\": true, \"table_range_scan\": true, \"auth_rotation\": true, \"proc_log\": true, \"proc_stat_scanner\": true, \"jsonrpc_2_0\": true, \"shm_ring_mmap\": true, \"mmap_seqlock\": true, \"jsonl_tape\": true, \"reactor_keepalive\": true, \"sandbox_landlock\": true, \"pgid_reaper\": true, \"http_loopback_port\": {boundPort} }"
   return 0
 
 /-- Run deterministic micro-benchmarks for `lean-sys-core bench` and emit JSON metrics. -/
 def runBench (iters : Nat := 2000) : IO UInt32 := do
   let ts ← IO.monoNanosNow
-  let benchDir := s!"/dev/shm/lean-sys-bench-{ts}"
+  let tmpBase ← match ← IO.getEnv "TMPDIR" with
+    | some d => pure (if d.isEmpty then "/tmp" else d)
+    | none => pure "/tmp"
+  let benchRoot := if ← (System.FilePath.mk "/dev/shm").pathExists then "/dev/shm" else tmpBase
+  let benchDir := s!"{benchRoot}/lean-sys-bench-{ts}"
   let pBench : System.FilePath := benchDir
   IO.FS.createDirAll pBench
 
@@ -456,7 +736,7 @@ def main (args : List String) : IO UInt32 := do
   | ["bench"] | ["--bench"] => LeanSys.Core.runBench 4000
   | ["bench", nStr] | ["--bench", nStr] => LeanSys.Core.runBench (nStr.toNat?.getD 4000)
   | ["--c-abi"] =>
-    IO.println "{\"ok\":true,\"exports\":[\"leansys_verify_slice_bounds\",\"leansys_verify_wal_frame\",\"leansys_verify_cas_digest\",\"leansys_check_http_bounds\",\"leansys_verify_jsonl_tape\",\"leansys_verify_ring_cursor\",\"leansys_verify_sst_block\",\"leansys_verify_poll_interest\",\"leansys_verify_rlimit_budget\",\"leansys_mix64_word\",\"leansys_verify_composite_key_order\",\"leansys_verify_token_auth\",\"leansys_verify_log_window\",\"leansys_verify_jsonrpc_frame\",\"leansys_gate_admit\",\"leansys_verify_mmap_seqlock\",\"leansys_verify_proc_stat_fields\",\"leansys_sse_frame_scan\",\"leansys_gfm_pipe_scan\",\"leansys_tag_scan\",\"leansys_transcript_index\",\"leansys_verify_par_chunk\",\"leansys_verify_arena_disjoint\",\"leansys_verify_snapshot_visibility\",\"leansys_verify_http_route_match\",\"leansys_verify_counterexample_triage\",\"leansys_verify_dag_wave_step\",\"leansys_verify_ios_jetsam_budget\",\"leansys_verify_worker_budget\",\"leansys_verify_page_aligned_buffer\",\"leansys_select_isa\",\"leansys_verify_isa_selection\"]}"
+    IO.println "{\"ok\":true,\"exports\":[\"leansys_verify_slice_bounds\",\"leansys_verify_wal_frame\",\"leansys_verify_cas_digest\",\"leansys_check_http_bounds\",\"leansys_verify_jsonl_tape\",\"leansys_verify_ring_cursor\",\"leansys_verify_sst_block\",\"leansys_verify_poll_interest\",\"leansys_verify_rlimit_budget\",\"leansys_mix64_word\",\"leansys_verify_composite_key_order\",\"leansys_verify_token_auth\",\"leansys_verify_log_window\",\"leansys_verify_jsonrpc_frame\",\"leansys_gate_admit\",\"leansys_verify_mmap_seqlock\",\"leansys_verify_proc_stat_fields\",\"leansys_sse_frame_scan\",\"leansys_gfm_pipe_scan\",\"leansys_tag_scan\",\"leansys_transcript_index\",\"leansys_verify_par_chunk\",\"leansys_verify_arena_disjoint\",\"leansys_verify_snapshot_visibility\",\"leansys_verify_http_route_match\",\"leansys_verify_counterexample_triage\",\"leansys_verify_dag_wave_step\",\"leansys_verify_ios_jetsam_budget\",\"leansys_verify_worker_budget\",\"leansys_verify_page_aligned_buffer\",\"leansys_select_isa\",\"leansys_verify_isa_selection\",\"leansys_verify_fd_bounds\"]}"
     return 0
   | _ =>
     IO.println "usage: lean-sys-core [self-test | bench | --c-abi]"
