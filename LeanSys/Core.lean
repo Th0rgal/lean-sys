@@ -211,7 +211,10 @@ def runSelfTest : IO UInt32 := do
 
   -- 3. Store WAL + Batch Group-Commit + Torn-Tail Recovery + Mid-Log Corruption Fail-Closed + >64 MiB Replay + CAS Immutability
   let ts ← IO.monoNanosNow
-  let testDir := s!"/tmp/lean-sys-selftest-{ts}"
+  let tmpBase ← match ← IO.getEnv "TMPDIR" with
+    | some d => pure (if d.isEmpty then "/tmp" else d)
+    | none => pure "/tmp"
+  let testDir := s!"{tmpBase}/lean-sys-selftest-{ts}"
   let pTest : System.FilePath := testDir
   if ← pTest.pathExists then
     IO.FS.removeDirAll pTest
@@ -285,8 +288,24 @@ def runSelfTest : IO UInt32 := do
     IO.eprintln s!"[lean-sys-core] FAIL: unexpected error on mid-log corrupt WAL: {e}"
     return 1
 
-  -- 3c. Streaming WAL replay across > 64 MiB log (68 MiB across 17 x 4 MiB frames)
-  let bigWalDir := s!"/dev/shm/lean-sys-bigwal-{ts}"
+  -- 3c. Fail-closed premature empty read before `fileSize` (must NEVER misclassify I/O error as EOF torn tail)
+  let validWalImage := encodeWalKVFrame "f1" (ByteSlice.ofString "committed-one") ++
+    encodeWalKVFrame "f2" (ByteSlice.ofString "committed-two-must-survive")
+  let f1Len := (encodeWalKVFrame "f1" (ByteSlice.ofString "committed-one")).size
+  let cutInF2 := f1Len + 10
+  let prematureRes ← replayWalReader validWalImage.size.toUInt64 (fun off _ => do
+    if off == 0 then
+      pure (validWalImage.extract 0 cutInF2)
+    else
+      pure ByteArray.empty) 65536
+  match prematureRes with
+  | .error .eio => pure ()
+  | _ =>
+    IO.eprintln "[lean-sys-core] FAIL: replayWalReader did not return EIO on premature empty read before fileSize"
+    return 1
+
+  -- 3d. Streaming WAL replay across > 64 MiB log in portable temp dir (`testDir/bigwal`), cleaned up immediately
+  let bigWalDir := s!"{testDir}/bigwal"
   IO.FS.createDirAll bigWalDir
   let .ok stBig0 ← openStore bigWalDir | do IO.eprintln "[lean-sys-core] FAIL: openStore bigWalDir"; return 1
   let chunk4m := ByteArray.mk (Array.replicate 4194304 (0x42 : UInt8))
@@ -311,7 +330,7 @@ def runSelfTest : IO UInt32 := do
     IO.eprintln "[lean-sys-core] FAIL: >64 MiB streaming WAL replay state mismatch"
     return 1
 
-  -- 3d. CAS `0444` immutability & copy-on-materialize isolation
+  -- 3e. CAS `0444` immutability & copy-on-materialize isolation
   let blobPayload := ByteSlice.ofString "(lnir_module verified_cas_object_v1)"
   let .ok casKey ← casPut stCompacted blobPayload | do IO.eprintln "[lean-sys-core] FAIL: Store.casPut"; return 1
   let casBlobPath := s!"{stCompacted.casDir}/{casKey}"
@@ -434,6 +453,28 @@ def runSelfTest : IO UInt32 := do
     IO.eprintln "[lean-sys-core] FAIL: JsonRpc field mismatch"; return 1
 
   -- 5. Shared-Memory `MAP_SHARED` Circular Ring (`ShmRing.init` + non-truncating `ShmRing.open`) & Seqlock / `/proc/<pid>/stat`
+  -- Verify empty (0-byte), undersized header (12-byte), and truncated payload (32-byte for cap=128) backing files return `.error .einval` without raising `SIGBUS`
+  let emptyRingPath := s!"{testDir}/empty_ipc.ring"
+  IO.FS.writeBinFile emptyRingPath ByteArray.empty
+  let shortRingPath := s!"{testDir}/short_ipc.ring"
+  IO.FS.writeBinFile shortRingPath (ByteArray.mk (Array.replicate 12 0))
+  let truncPayloadRingPath := s!"{testDir}/trunc_payload_ipc.ring"
+  let .ok truncRing ← ShmRing.init truncPayloadRingPath 128 | do IO.eprintln "[lean-sys-core] FAIL: ShmRing.init trunc_payload"; return 1
+  let .ok () ← ShmRing.push truncRing (ByteSlice.ofString "before-truncate") | do IO.eprintln "[lean-sys-core] FAIL: ShmRing.push trunc_payload"; return 1
+  -- Truncate file to 32 bytes (24-byte valid LRNG header + only 8 bytes of the 128-byte payload arena)
+  let .ok () ← withFd truncPayloadRingPath 5 (fun fd => ftruncateFd fd 32)
+    | do IO.eprintln "[lean-sys-core] FAIL: ftruncate trunc_payload"; return 1
+  let emptyOpenRes ← ShmRing.openExisting emptyRingPath
+  let emptyReadHdrRes ← ShmRing.readHeader { path := emptyRingPath, lockPath := emptyRingPath ++ ".lock", cap := 64 }
+  let shortOpenRes ← ShmRing.openExisting shortRingPath
+  let truncOpenRes ← ShmRing.openExisting truncPayloadRingPath
+  let truncPopRes ← ShmRing.pop? truncRing
+  let truncPushRes ← ShmRing.push truncRing (ByteSlice.ofString "after-truncate")
+  match emptyOpenRes, emptyReadHdrRes, shortOpenRes, truncOpenRes, truncPopRes, truncPushRes with
+  | .error .einval, .error .einval, .error .einval, .error .einval, .error .einval, .error .einval => pure ()
+  | _, _, _, _, _, _ =>
+    IO.eprintln "[lean-sys-core] FAIL: ShmRing empty/short/truncated backing file did not fail closed with EINVAL"
+    return 1
   let ringPath := s!"{testDir}/ipc.ring"
   let .ok ring ← ShmRing.init ringPath 128 | do IO.eprintln "[lean-sys-core] FAIL: ShmRing.init"; return 1
   let .ok () ← ShmRing.push ring (ByteSlice.ofString "ring-msg-1") | do IO.eprintln "[lean-sys-core] FAIL: ShmRing.push 1"; return 1
@@ -474,6 +515,17 @@ def runSelfTest : IO UInt32 := do
     | do IO.eprintln "[lean-sys-core] FAIL: runSandboxedGroup /bin/true"; return 1
   if sbRes.exitCode != 0 || sbRes.timedOut || sbRes.quotaBreach || sbRes.landlockEnforced then
     IO.eprintln s!"[lean-sys-core] FAIL: SandboxResult unexpected: {repr sbRes}"
+    return 1
+  -- Verify ordinary argv starting with ASCII 31 (`0x1F`) is passed verbatim to `execve` without C-shim stripping
+  let unitSepArg := String.fromUTF8! (ByteArray.mk #[31] ++ "verbatim-arg0".toUTF8)
+  let argvCheckOut := s!"{testDir}/argv_byte31.txt"
+  let .ok sbArgvRes ← runSandboxedGroup quota "/bin/sh" #[
+      "-c", s!"printf '%s|%s' \"$0\" \"$1\" > {argvCheckOut}", unitSepArg, "second-arg"
+    ]
+    | do IO.eprintln "[lean-sys-core] FAIL: runSandboxedGroup byte-31 argv check"; return 1
+  let argvRecorded ← IO.FS.readFile argvCheckOut
+  if sbArgvRes.exitCode != 0 || argvRecorded != s!"{unitSepArg}|second-arg" then
+    IO.eprintln s!"[lean-sys-core] FAIL: byte-31 argv was altered or stripped: {repr argvRecorded}"
     return 1
   let llRoDir := s!"{testDir}/ll_ro"
   let llRwDir := s!"{testDir}/ll_rw"
@@ -561,7 +613,44 @@ def runSelfTest : IO UInt32 := do
   let servedRes ← IO.wait serverTask
   let servedCount := match servedRes with | .ok n => n | .error _ => 0
   discard <| closeFd listenFd
+
+  -- 7b. `httpClientRequest` fail-closed deadline & truncated-response checks (no silent `.ok ""` or partial body)
+  let .ok (slowListenFd, slowPort) ← tcpListen "127.0.0.1" 0 16
+    | do IO.eprintln "[lean-sys-core] FAIL: tcpListen slow/truncated server"; return 1
+  let slowServerTask ← IO.asTask (prio := .dedicated) do
+    -- Case 1: Client connects, server accepts and stalls past client deadline without sending headers
+    if let .ok c1 ← tcpAcceptPoll slowListenFd 2000 then
+      discard <| pollReadable c1 50
+      discard <| readStreamChunk c1 4096
+      IO.sleep 140
+      discard <| closeFd c1
+    -- Case 2: Server sends `Content-Length: 32` header + only 6 bytes of body, then stalls past deadline
+    if let .ok c2 ← tcpAcceptPoll slowListenFd 2000 then
+      discard <| pollReadable c2 50
+      discard <| readStreamChunk c2 4096
+      let partialResp := "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 32\r\nConnection: close\r\n\r\n{\"par"
+      discard <| writeAll c2 partialResp.toUTF8 false
+      IO.sleep 140
+      discard <| closeFd c2
+    -- Case 3: Server sends `Content-Length: 32` header + 6 bytes of body, then closes socket immediately (premature EOF)
+    if let .ok c3 ← tcpAcceptPoll slowListenFd 2000 then
+      discard <| pollReadable c3 50
+      discard <| readStreamChunk c3 4096
+      let eofPartialResp := "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 32\r\nConnection: close\r\n\r\n{\"eof"
+      discard <| writeAll c3 eofPartialResp.toUTF8 false
+      discard <| closeFd c3
+  let emptyTimeoutRes ← httpClientRequest "127.0.0.1" slowPort "GET" "/stall" (ByteSlice.ofString "") none 60
+  let partialTimeoutRes ← httpClientRequest "127.0.0.1" slowPort "GET" "/partial-stall" (ByteSlice.ofString "") none 60
+  let prematureEofRes ← httpClientRequest "127.0.0.1" slowPort "GET" "/partial-eof" (ByteSlice.ofString "") none 500
+  discard <| IO.wait slowServerTask
+  discard <| closeFd slowListenFd
   IO.FS.removeDirAll pTest
+
+  match emptyTimeoutRes, partialTimeoutRes, prematureEofRes with
+  | .error .eagain, .error .eagain, .error .eio => pure ()
+  | _, _, _ =>
+    IO.eprintln s!"[lean-sys-core] FAIL: httpClientRequest did not fail closed on timeout/premature-EOF: {repr emptyTimeoutRes} / {repr partialTimeoutRes} / {repr prematureEofRes}"
+    return 1
 
   match clientRes with
   | .error e =>
@@ -582,7 +671,11 @@ def runSelfTest : IO UInt32 := do
 /-- Run deterministic micro-benchmarks for `lean-sys-core bench` and emit JSON metrics. -/
 def runBench (iters : Nat := 2000) : IO UInt32 := do
   let ts ← IO.monoNanosNow
-  let benchDir := s!"/dev/shm/lean-sys-bench-{ts}"
+  let tmpBase ← match ← IO.getEnv "TMPDIR" with
+    | some d => pure (if d.isEmpty then "/tmp" else d)
+    | none => pure "/tmp"
+  let benchRoot := if ← (System.FilePath.mk "/dev/shm").pathExists then "/dev/shm" else tmpBase
+  let benchDir := s!"{benchRoot}/lean-sys-bench-{ts}"
   let pBench : System.FilePath := benchDir
   IO.FS.createDirAll pBench
 

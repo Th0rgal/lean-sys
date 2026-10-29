@@ -35,7 +35,7 @@ static inline int ls_ll(const char *ro, const char *rw) { int v = (int)syscall(_
 int rename(const char *, const char *); extern char **environ;
 #define SA (struct sockaddr*)
 static inline lean_obj_res R(int64_t rc) { return lean_io_result_mk_ok(lean_box_uint64(rc < 0 ? ((1ULL << 63) | ((uint64_t)(uint32_t)errno << 32)) : ((uint64_t)rc & 0x7FFFFFFFFFFFFFFFULL))); }
-static inline int64_t fail_close(int fd) { int e = errno; close(fd); errno = e; return -1; }
+static inline int64_t fail_close(int fd) { int e = errno; return close(fd), errno = e, -1; }
 LEAN_EXPORT lean_obj_res leansys_open_flock(b_lean_obj_arg path, uint8_t wr, uint8_t ex, uint32_t aux) { struct stat st; int fl = O_CLOEXEC | (wr ? ((wr == 5 ? 0 : O_CREAT) | O_RDWR | (wr == 2 ? O_APPEND : 0) | (wr == 4 ? O_TRUNC : 0) | (ex == 2 ? O_EXCL : 0)) : O_RDONLY), fd = (wr == 3 || wr >= 7) ? -2 : open(lean_string_cstr(path), fl, wr == 1 && aux == 444 ? 0444 : 0644);
     return R(wr == 3 ? close((int)aux) : (wr == 7 ? (fstat((int)aux, &st) < 0 ? -1 : st.st_size) : (wr == 8 ? fcntl((int)aux, F_DUPFD_CLOEXEC, (int)ex * 65536) : (wr == 9 ? ls_ll(NULL, "") : (fd >= 0 && ex == 1 && flock(fd, LOCK_EX | (aux ? LOCK_NB : 0)) < 0 ? fail_close(fd) : fd))))); }
 LEAN_EXPORT lean_obj_res leansys_fs_clone_or_link(b_lean_obj_arg src, b_lean_obj_arg dst, uint8_t op) { const char *s = lean_string_cstr(src), *d = lean_string_cstr(dst); struct stat st; return R(op == 1 ? rename(s, d) : (op == 2 ? chmod(s, 0444) : (op == 3 ? (stat(s, &st) < 0 ? -1 : st.st_size) : (op == 4 ? ls_ll(s, d) : (unlink(d), LS_CLONE(s, d)))))); }
@@ -43,16 +43,16 @@ LEAN_EXPORT lean_obj_res leansys_write_all(uint32_t fd, b_lean_obj_arg ba, size_
     if (mode >= 2 || off > sz || len > sz - off) return mode == 3 ? R(m ? 0 : -1) : (m != MAP_FAILED ? (memcpy((uint8_t*)m + off, lean_sarray_cptr(ba), len), munmap(m, msz), R((int64_t)len)) : (mode == 2 && msz >= off && len <= sz ? (msz ? R(-1) : R(0)) : (errno = EINVAL, R(-1))));
     for (const uint8_t *p = lean_sarray_cptr(ba) + off, *end = p + len; p < end;) { ssize_t w = send((int)fd, p, (size_t)(end - p), MSG_NOSIGNAL); w = (w < 0 && (errno == ENOTSOCK || errno == EBADF || errno == EINVAL)) ? write((int)fd, p, (size_t)(end - p)) : w; if (w < 0 && errno != EINTR) return R(-1); p += w > 0 ? (size_t)w : 0; }
     return R((mode == 1 && LS_FSYNC((int)fd)) ? -1 : (int64_t)len); }
-LEAN_EXPORT lean_obj_res leansys_pread_ba(uint32_t fd, uint64_t off, size_t max_len) { lean_object *ba = lean_alloc_sarray(1, 0, max_len); size_t mo = (size_t)(off & 0x3FFFFFFFFFFFFFFFULL); void *m = (off >> 62) == 2 && max_len ? mmap(NULL, mo + max_len, PROT_READ, MAP_SHARED, (int)fd, 0) : MAP_FAILED;
-    ssize_t n = m != MAP_FAILED ? (memcpy(lean_sarray_cptr(ba), (uint8_t*)m + mo, max_len), munmap(m, mo + max_len), (ssize_t)max_len) : (off == UINT64_MAX ? read((int)fd, lean_sarray_cptr(ba), max_len) : ((off >> 62) == 2 ? (ssize_t)(max_len ? -1 : 0) : pread((int)fd, lean_sarray_cptr(ba), max_len, (off_t)off)));
+LEAN_EXPORT lean_obj_res leansys_pread_ba(uint32_t fd, uint64_t off, size_t max_len) { lean_object *ba = lean_alloc_sarray(1, 0, max_len); size_t mo = (size_t)(off & 0x3FFFFFFFFFFFFFFFULL); void *m = (off >> 62) == 2 && max_len ? mmap(NULL, mo + max_len, PROT_READ, MAP_SHARED, (int)fd, 0) : MAP_FAILED; ssize_t n = 0;
+    do { n = m != MAP_FAILED ? (memcpy(lean_sarray_cptr(ba), (uint8_t*)m + mo, max_len), munmap(m, mo + max_len), (ssize_t)max_len) : (off == UINT64_MAX ? read((int)fd, lean_sarray_cptr(ba), max_len) : ((off >> 62) == 2 ? (ssize_t)(max_len ? -1 : 0) : pread((int)fd, lean_sarray_cptr(ba), max_len, (off_t)off))); } while (n < 0 && errno == EINTR && (off >> 62) != 2);
     return (n > 0 ? lean_sarray_set_size(ba, (size_t)n) : (void)0), lean_io_result_mk_ok(ba); }
-LEAN_EXPORT lean_obj_res leansys_spawn_group(b_lean_obj_arg cmd, b_lean_obj_arg args) {
+LEAN_EXPORT lean_obj_res leansys_spawn_group(b_lean_obj_arg cmd, b_lean_obj_arg args, b_lean_obj_arg ro, b_lean_obj_arg rw, uint8_t confine) {
 #if defined(__APPLE__) && defined(TARGET_OS_IPHONE) && TARGET_OS_IPHONE
-    return (void)cmd, (void)args, errno = ENOSYS, R(-1); }
+    return (void)cmd, (void)args, (void)ro, (void)rw, (void)confine, errno = ENOSYS, R(-1); }
 #else
-    size_t n = lean_array_size(args), m = n < 64 ? n : 64, o = m >= 2 && *lean_string_cstr(lean_array_get_core(args, 0)) == 31 ? 2 : 0; char *argv[66]; argv[0] = (char*)lean_string_cstr(cmd); argv[m - o + 1] = NULL;
-    for (size_t i = o; i < m; i++) argv[i - o + 1] = (char*)lean_string_cstr(lean_array_get_core(args, i));
-    pid_t pid = fork(); if (pid == 0) { setpgid(0, 0); if (o && ls_ll(lean_string_cstr(lean_array_get_core(args, 0)) + 1, lean_string_cstr(lean_array_get_core(args, 1))) < 0) _exit(126); execve(argv[0], argv, environ); _exit(127); }
+    size_t n = lean_array_size(args), m = n < 64 ? n : 64; char *argv[66] = { (char*)lean_string_cstr(cmd) };
+    for (size_t i = 0; i < m; i++) argv[i + 1] = (char*)lean_string_cstr(lean_array_get_core(args, i));
+    pid_t pid = fork(); if (pid == 0) _exit((setpgid(0, 0), confine && ls_ll(lean_string_cstr(ro), lean_string_cstr(rw)) < 0) ? 126 : (execve(argv[0], argv, environ), 127));
     return (pid > 0 ? (void)setpgid(pid, pid) : (void)0), R(pid); }
 #endif
 LEAN_EXPORT lean_obj_res leansys_kill_wait_group(uint32_t pid, uint32_t sig, uint8_t nohang) { int st = (sig > 0 && pid > 1 ? kill(-(pid_t)pid, (int)sig) : 0, 0); pid_t r = waitpid((pid_t)pid, &st, nohang ? WNOHANG : 0);

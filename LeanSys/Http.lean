@@ -382,7 +382,10 @@ def serveLoop (listenFd : Fd) (maxRequests : Nat := 0) (timeoutMs : UInt32 := 20
       if maxRequests > 0 then break
 
 /-- Perform an HTTP/1.1 client request to `host:port`, looping `pollReadable` + `readStreamChunk`
-    until `\r\n\r\n` and all `Content-Length` response body bytes arrive (or clean EOF). -/
+    until `\r\n\r\n` and all declared `Content-Length` response body bytes arrive (or clean EOF when
+    no `Content-Length` is declared). Fails closed on deadline expiry (`.error .eagain`), socket poll
+    errors, malformed response framing/headers (`.error .einval`), or premature EOF before headers or
+    declared `Content-Length` (`.error .eio`). -/
 def httpClientRequest (host : String) (port : UInt16) (method : String) (path : String)
     (body : ByteSlice) (bearerToken? : Option String := none) (timeoutMs : UInt32 := 3000) :
     IO (SysResult String) := do
@@ -405,45 +408,74 @@ def httpClientRequest (host : String) (port : UInt16) (method : String) (path : 
       | .error e => pure (.error e)
       | .ok _ =>
         let t0 ← IO.monoNanosNow
-        let budgetMs := Nat.max 100 timeoutMs.toNat
+        let budgetMs := Nat.max 50 timeoutMs.toNat
         let mut respBuf := ByteArray.empty
+        let mut hdrEnd? : Option Nat := none
         let mut targetTotal : Option Nat := none
         let mut eof := false
-        while !eof do
+        let mut ioErr? : Option Errno := none
+        while !eof && ioErr?.isNone do
           match targetTotal with
           | some tot =>
             if respBuf.size >= tot then break
           | none => pure ()
+          if hdrEnd?.isNone && respBuf.size > maxHttpHeaderBytes + 4 then
+            ioErr? := some .einval
+            break
           let now ← IO.monoNanosNow
           let elapsedMs := (now - t0) / 1000000
-          if elapsedMs >= budgetMs then break
+          if elapsedMs >= budgetMs then
+            ioErr? := some .eagain
+            break
           match ← pollReadable fd (budgetMs - elapsedMs).toUInt32 with
-          | .error _ => break
+          | .error e =>
+            ioErr? := some e
+            break
           | .ok () =>
             let chunk ← readStreamChunk fd 65536
             if chunk.isEmpty then
               eof := true
             else
               respBuf := if respBuf.isEmpty then chunk else respBuf ++ chunk
-              if targetTotal.isNone then
+              if hdrEnd?.isNone then
                 if let some bStart := findHeaderEnd? respBuf then
-                  let headStr := String.fromUTF8! (respBuf.extract 0 (bStart - 4))
-                  for ln in headStr.splitOn "\r\n" do
-                    match ln.splitOn ":" with
-                    | k :: rest =>
-                      if asciiEqIgnoreCase k "content-length" then
-                        if let some cl := parseStrictContentLength? (String.intercalate ":" rest) then
-                          targetTotal := some (bStart + cl)
-                    | [] => pure ()
-        match findHeaderEnd? respBuf with
-        | some bStart =>
-          let endIdx := match targetTotal with
-            | some tot => Nat.min tot respBuf.size
-            | none => respBuf.size
-          let bodyBytes := respBuf.extract bStart endIdx
-          pure (.ok (String.fromUTF8! bodyBytes))
+                  if bStart - 4 > maxHttpHeaderBytes then
+                    ioErr? := some .einval
+                  else
+                    match String.fromUTF8? (respBuf.extract 0 (bStart - 4)) with
+                    | none => ioErr? := some .einval
+                    | some headStr =>
+                      match headStr.splitOn "\r\n" with
+                      | [] => ioErr? := some .einval
+                      | statusLine :: hdrLines =>
+                        if !(statusLine.startsWith "HTTP/1.1 " || statusLine.startsWith "HTTP/1.0 ") then
+                          ioErr? := some .einval
+                        else
+                          match parseValidatedHeaders hdrLines with
+                          | .error _ => ioErr? := some .einval
+                          | .ok (_, cl?, _) =>
+                            hdrEnd? := some bStart
+                            if let some cl := cl? then
+                              targetTotal := some (bStart + cl)
+        match ioErr? with
+        | some e => pure (.error e)
         | none =>
-          pure (.ok (String.fromUTF8! respBuf))
+          match hdrEnd? with
+          | none => pure (.error .eio)
+          | some bStart =>
+            match targetTotal with
+            | some tot =>
+              if respBuf.size < tot then
+                pure (.error .eio)
+              else
+                let bodyBytes := respBuf.extract bStart tot
+                pure (.ok (String.fromUTF8! bodyBytes))
+            | none =>
+              if respBuf.size - bStart > maxHttpBodyBytes then
+                pure (.error .einval)
+              else
+                let bodyBytes := respBuf.extract bStart respBuf.size
+                pure (.ok (String.fromUTF8! bodyBytes))
     finally
       discard <| closeFd fd
 

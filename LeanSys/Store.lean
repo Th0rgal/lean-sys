@@ -231,67 +231,77 @@ def replayWalBuffer (buf : ByteArray) : Std.HashMap String ByteArray × Nat × B
 /-- Default streaming `pread` window size for WAL replay (4 MiB; dynamically grows up to 16 MiB + 16 B for max frames). -/
 @[inline] def defaultWalChunkBytes : Nat := 4194304
 
+/-- Stream-replay a WAL file descriptor across known byte extent `fileSize` using bounded `readChunk` windows.
+    - Truncates an incomplete EOF torn tail cleanly (`hadTornTail = true`, returning `validPrefixBytes`).
+    - Fails closed with `.error .eio` on any premature empty read before `fileSize` (`fileOff < fileSize`),
+      corrupt mid-log frame, bad magic, or payload checksum mismatch (never misclassifying a transient
+      read error as an EOF torn tail that would truncate committed frames). -/
+def replayWalReader (fileSize : UInt64) (readChunk : UInt64 → Nat → IO ByteArray)
+    (chunkBytes : Nat := defaultWalChunkBytes) :
+    IO (SysResult (Std.HashMap String ByteArray × Nat × Bool × UInt64)) := do
+  if fileSize == 0 then
+    return .ok ({}, 0, false, 0)
+  let stepChunk := Nat.max 65536 chunkBytes
+  let mut kv : Std.HashMap String ByteArray := {}
+  let mut validFrames : Nat := 0
+  let mut fileOff : UInt64 := 0
+  let mut carry := ByteArray.empty
+  let mut hadTornTail := false
+  let mut validPrefixBytes : UInt64 := 0
+  let mut atEof := false
+  while !atEof || carry.size > 0 do
+    if !atEof && carry.size < 16 + walMaxPayload.toNat then
+      if fileOff >= fileSize then
+        atEof := true
+      else
+        let remFile := (fileSize - fileOff).toNat
+        let toRead := Nat.min remFile stepChunk
+        let chunk ← readChunk fileOff toRead
+        if chunk.isEmpty then
+          return .error .eio
+        else
+          fileOff := fileOff + chunk.size.toUInt64
+          if fileOff >= fileSize then
+            atEof := true
+          carry := if carry.isEmpty then chunk else carry ++ chunk
+    let mut localOff : Nat := 0
+    let mut needMoreData := false
+    while localOff < carry.size && !needMoreData && !hadTornTail do
+      match stepWalFrameAt carry localOff atEof with
+      | .ok k vSlice nextOff =>
+        let consumed := nextOff - localOff
+        kv := kv.insert k vSlice.toByteArray
+        localOff := nextOff
+        validFrames := validFrames + 1
+        validPrefixBytes := validPrefixBytes + consumed.toUInt64
+      | .needMore =>
+        if atEof then
+          hadTornTail := true
+        else
+          needMoreData := true
+      | .tornTail =>
+        hadTornTail := true
+      | .corrupt =>
+        return .error .eio
+    if hadTornTail then
+      break
+    if localOff > 0 then
+      carry := if localOff >= carry.size then ByteArray.empty else carry.extract localOff carry.size
+    if atEof && carry.isEmpty then
+      break
+    if needMoreData && !atEof && carry.size >= 16 + walMaxPayload.toNat then
+      return .error .eio
+  return .ok (kv, validFrames, hadTornTail, validPrefixBytes)
+
 /-- Stream-replay a WAL file descriptor of arbitrary size (`> 64 MiB` supported) using bounded `pread` windows.
     - Truncates an incomplete EOF torn tail cleanly (`hadTornTail = true`, returning `validPrefixBytes`).
-    - Fails closed with `.error .eio` on any corrupt mid-log frame, bad magic, or payload checksum mismatch. -/
+    - Fails closed with `.error .eio` on any premature empty read before `fstatSize` or mid-log frame corruption. -/
 def replayWalFd (fd : Fd) (chunkBytes : Nat := defaultWalChunkBytes) :
     IO (SysResult (Std.HashMap String ByteArray × Nat × Bool × UInt64)) := do
   match ← fstatSize fd with
   | .error e => return .error e
   | .ok fileSize =>
-    if fileSize == 0 then
-      return .ok ({}, 0, false, 0)
-    let stepChunk := Nat.max 65536 chunkBytes
-    let mut kv : Std.HashMap String ByteArray := {}
-    let mut validFrames : Nat := 0
-    let mut fileOff : UInt64 := 0
-    let mut carry := ByteArray.empty
-    let mut hadTornTail := false
-    let mut validPrefixBytes : UInt64 := 0
-    let mut atEof := false
-    while !atEof || carry.size > 0 do
-      if !atEof && carry.size < 16 + walMaxPayload.toNat then
-        let remFile := if fileSize > fileOff then (fileSize - fileOff).toNat else 0
-        if remFile == 0 then
-          atEof := true
-        else
-          let toRead := Nat.min remFile stepChunk
-          let chunk ← preadByteArray fd fileOff toRead
-          if chunk.isEmpty then
-            atEof := true
-          else
-            fileOff := fileOff + chunk.size.toUInt64
-            if fileOff >= fileSize then
-              atEof := true
-            carry := if carry.isEmpty then chunk else carry ++ chunk
-      let mut localOff : Nat := 0
-      let mut needMoreData := false
-      while localOff < carry.size && !needMoreData && !hadTornTail do
-        match stepWalFrameAt carry localOff atEof with
-        | .ok k vSlice nextOff =>
-          let consumed := nextOff - localOff
-          kv := kv.insert k vSlice.toByteArray
-          localOff := nextOff
-          validFrames := validFrames + 1
-          validPrefixBytes := validPrefixBytes + consumed.toUInt64
-        | .needMore =>
-          if atEof then
-            hadTornTail := true
-          else
-            needMoreData := true
-        | .tornTail =>
-          hadTornTail := true
-        | .corrupt =>
-          return .error .eio
-      if hadTornTail then
-        break
-      if localOff > 0 then
-        carry := if localOff >= carry.size then ByteArray.empty else carry.extract localOff carry.size
-      if atEof && carry.isEmpty then
-        break
-      if needMoreData && !atEof && carry.size >= 16 + walMaxPayload.toNat then
-        return .error .eio
-    return .ok (kv, validFrames, hadTornTail, validPrefixBytes)
+    replayWalReader fileSize (preadByteArray fd) chunkBytes
 
 /-! ## Persistent Store Handle (`LeanSys.Store.Handle`) -/
 

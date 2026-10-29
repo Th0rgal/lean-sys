@@ -42,56 +42,71 @@ def encodeHeader (cap : UInt32) (head tail : UInt64) : ByteArray :=
 private def writeCircularShared (fd : Fd) (cap : Nat) (cursor : UInt64) (data : ByteArray) : IO (SysResult Unit) := do
   if data.isEmpty then
     return .ok ()
-  let pos := (cursor.toNat) % cap
-  let firstLen := Nat.min data.size (cap - pos)
-  let firstChunk := if firstLen == data.size then data else data.extract 0 firstLen
-  match ← mmapWriteShared fd (24 + pos) firstChunk with
+  match ← fstatSize fd with
   | .error e => return .error e
-  | .ok _ =>
-    if firstLen == data.size then
-      return .ok ()
-    let secondChunk := data.extract firstLen data.size
-    match ← mmapWriteShared fd 24 secondChunk with
+  | .ok fsz =>
+    if fsz < (24 + cap).toUInt64 then
+      return .error .einval
+    let pos := (cursor.toNat) % cap
+    let firstLen := Nat.min data.size (cap - pos)
+    let firstChunk := if firstLen == data.size then data else data.extract 0 firstLen
+    match ← mmapWriteShared fd (24 + pos) firstChunk with
     | .error e => return .error e
-    | .ok _ => return .ok ()
+    | .ok _ =>
+      if firstLen == data.size then
+        return .ok ()
+      let secondChunk := data.extract firstLen data.size
+      match ← mmapWriteShared fd 24 secondChunk with
+      | .error e => return .error e
+      | .ok _ => return .ok ()
 
 /-- Read `len` bytes from the circular ring payload arena `[24 .. 24 + cap)` at monotonic cursor `cursor`,
     wrapping cleanly around `cap` via at most two `MAP_SHARED` `mmap` reads. -/
 private def readCircularShared (fd : Fd) (cap : Nat) (cursor : UInt64) (len : Nat) : IO (SysResult ByteArray) := do
   if len == 0 then
     return .ok ByteArray.empty
-  let pos := (cursor.toNat) % cap
-  let firstLen := Nat.min len (cap - pos)
-  let firstChunk ← mmapReadShared fd (24 + pos) firstLen
-  if firstChunk.size != firstLen then
-    return .error .eio
-  if firstLen == len then
-    return .ok firstChunk
-  let remLen := len - firstLen
-  let secondChunk ← mmapReadShared fd 24 remLen
-  if secondChunk.size != remLen then
-    return .error .eio
-  return .ok (firstChunk ++ secondChunk)
+  match ← fstatSize fd with
+  | .error e => return .error e
+  | .ok fsz =>
+    if fsz < (24 + cap).toUInt64 then
+      return .error .einval
+    let pos := (cursor.toNat) % cap
+    let firstLen := Nat.min len (cap - pos)
+    let firstChunk ← mmapReadShared fd (24 + pos) firstLen
+    if firstChunk.size != firstLen then
+      return .error .eio
+    if firstLen == len then
+      return .ok firstChunk
+    let remLen := len - firstLen
+    let secondChunk ← mmapReadShared fd 24 remLen
+    if secondChunk.size != remLen then
+      return .error .eio
+    return .ok (firstChunk ++ secondChunk)
 
-/-- Read and validate the 24-byte `MAP_SHARED` ring header from an already-open `fd`. -/
+/-- Read and validate the 24-byte `MAP_SHARED` ring header from an already-open `fd`.
+    Validates backing-file extent (`fsz >= 24` before mapping header, and `fsz >= 24 + cap` before payload)
+    so empty or truncated backing files fail closed with `.error .einval` without raising `SIGBUS`. -/
 private def readHeaderFd (fd : Fd) : IO (SysResult (UInt32 × UInt64 × UInt64)) := do
   match ← fstatSize fd with
   | .error e => pure (.error e)
   | .ok fsz =>
-    let hdr ← mmapReadShared fd 0 24
-    if hdr.size < 24 then
-      pure (.error .eio)
+    if fsz < 24 then
+      pure (.error .einval)
     else
-      let magic := readUInt32LE hdr 0
-      let cap := readUInt32LE hdr 4
-      let head := readUInt64LE hdr 8
-      let tail := readUInt64LE hdr 16
-      if magic != ringMagic || cap < 64 || fsz < (24 + cap.toUInt64) then
-        pure (.error .einval)
-      else if verifyRingCursor head tail cap.toUInt64 0 != 1 then
-        pure (.error .einval)
+      let hdr ← mmapReadShared fd 0 24
+      if hdr.size < 24 then
+        pure (.error .eio)
       else
-        pure (.ok (cap, head, tail))
+        let magic := readUInt32LE hdr 0
+        let cap := readUInt32LE hdr 4
+        let head := readUInt64LE hdr 8
+        let tail := readUInt64LE hdr 16
+        if magic != ringMagic || cap < 64 || fsz < (24 + cap.toUInt64) then
+          pure (.error .einval)
+        else if verifyRingCursor head tail cap.toUInt64 0 != 1 then
+          pure (.error .einval)
+        else
+          pure (.ok (cap, head, tail))
 
 /-- Read `(magic, cap, head, tail)` from `r.path` via `MAP_SHARED` `mmap(2)`. -/
 def readHeader (r : ShmRing) : IO (SysResult (UInt32 × UInt64 × UInt64)) :=

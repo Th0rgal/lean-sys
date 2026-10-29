@@ -39,11 +39,10 @@ structure SandboxResult where
   deriving Repr, DecidableEq
 
 @[inline]
-private def hasDisallowedControlByte (s : String) : Bool := Id.run do
+private def hasInteriorNullByte (s : String) : Bool := Id.run do
   let b := s.toUTF8
   for i in [0:b.size] do
-    let c := b.get! i
-    if c == 0 || c == 31 then
+    if b.get! i == 0 then
       return true
   return false
 
@@ -55,7 +54,7 @@ def queryLandlockAbi : IO (SysResult UInt32) :=
 /-- Apply `policy` to the calling process/thread via `landlock_create_ruleset` + `landlock_restrict_self`.
     Fails closed with `.error .eopnotsupp` when Landlock is unsupported or `.error .einval` on invalid paths. -/
 def applyLandlockPolicy (policy : LandlockPolicy) : IO (SysResult UInt32) := do
-  if hasDisallowedControlByte policy.readOnlyPath || hasDisallowedControlByte policy.readWritePath then
+  if hasInteriorNullByte policy.readOnlyPath || hasInteriorNullByte policy.readWritePath then
     return .error .einval
   match ← probeLandlockAbi with
   | .error e => return .error e
@@ -64,28 +63,23 @@ def applyLandlockPolicy (policy : LandlockPolicy) : IO (SysResult UInt32) := do
     | .error e => return .error e
     | .ok () => return .ok abi
 
-/-- Internal helper running `cmd` with optional pre-`execve` Landlock confinement (`landlockPolicy?`). -/
+/-- Internal helper running `cmd` with optional pre-`execve` Landlock confinement (`landlockPolicy?`)
+    decoded in Lean and passed as explicit typed parameters (`roPath`, `rwPath`, `confine`) to `withChildGroupWithLandlock`. -/
 private def runGroupInternal (quota : SandboxQuota) (landlockPolicy? : Option LandlockPolicy)
     (cmd : String) (args : Array String)
     (observedRssBytes : UInt64 := 0) (observedPipeBytes : UInt64 := 0) : IO (SysResult SandboxResult) := do
-  if args.size > 62 then
+  if args.size > 64 || hasInteriorNullByte cmd || args.any hasInteriorNullByte then
     return .error .einval
-  if let some a0 := args[0]? then
-    let b0 := a0.toUTF8
-    if b0.size > 0 && b0.get! 0 == 31 then
-      return .error .einval
-  let spawnArgs ← match landlockPolicy? with
-    | none => pure args
+  let (roPath, rwPath, confine) ← match landlockPolicy? with
+    | none => pure ("", "", false)
     | some pol =>
-      if hasDisallowedControlByte pol.readOnlyPath || hasDisallowedControlByte pol.readWritePath then
+      if hasInteriorNullByte pol.readOnlyPath || hasInteriorNullByte pol.readWritePath then
         return .error .einval
       match ← probeLandlockAbi with
       | .error e => return .error e
-      | .ok _ =>
-        let sentinelRo := String.fromUTF8! (ByteArray.mk #[31] ++ pol.readOnlyPath.toUTF8)
-        pure (#[sentinelRo, pol.readWritePath] ++ args)
+      | .ok _ => pure (pol.readOnlyPath, pol.readWritePath, true)
   let t0 ← IO.monoNanosNow
-  withChildGroup cmd spawnArgs fun cg => do
+  withChildGroupWithLandlock cmd args roPath rwPath confine fun cg => do
     let mut doneExit : Option UInt32 := none
     let mut timedOut := false
     let mut quotaBreach := false

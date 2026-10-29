@@ -111,7 +111,7 @@ opaque rawWriteAll (fd : UInt32) (ba : @& ByteArray) (off : USize) (len : USize)
 opaque rawPreadBa (fd : UInt32) (off : UInt64) (maxLen : USize) : IO ByteArray
 
 @[extern "leansys_spawn_group"]
-opaque rawSpawnGroup (cmd : @& String) (args : @& Array String) : IO UInt64
+opaque rawSpawnGroup (cmd : @& String) (args : @& Array String) (roPath : @& String) (rwPath : @& String) (confine : UInt8) : IO UInt64
 
 @[extern "leansys_kill_wait_group"]
 opaque rawKillWaitGroup (pid : UInt32) (sig : UInt32) (nohang : UInt8) : IO UInt64
@@ -347,12 +347,18 @@ def hardLinkReplace (src dst : String) : IO (SysResult Unit) := do
   | .ok _ => pure (.ok ())
   | .error e => pure (.error e)
 
-/-- Spawn an isolated process group (`setpgid(0, 0)`) executing `cmd` with `args`. -/
-def spawnProcessGroup (cmd : String) (args : Array String) : IO (SysResult ChildGroup) := do
-  let w ← rawSpawnGroup cmd args
+/-- Spawn an isolated process group (`setpgid(0, 0)`) executing `cmd` with `args`,
+    optionally applying Linux Landlock path confinement (`roPath`, `rwPath`) in the child before `execve`. -/
+def spawnProcessGroupWithLandlock (cmd : String) (args : Array String)
+    (roPath : String := "") (rwPath : String := "") (confine : Bool := false) : IO (SysResult ChildGroup) := do
+  let w ← rawSpawnGroup cmd args roPath rwPath (if confine then 1 else 0)
   match decodePackedWord w with
   | .ok pid => pure (.ok ⟨pid.toUInt32⟩)
   | .error e => pure (.error e)
+
+/-- Spawn an isolated process group (`setpgid(0, 0)`) executing `cmd` with `args`. -/
+def spawnProcessGroup (cmd : String) (args : Array String) : IO (SysResult ChildGroup) :=
+  spawnProcessGroupWithLandlock cmd args "" "" false
 
 /-- Synchronously poll or wait on a `ChildGroup` (`sig = 0` for status poll, `sig = 9`/`15` to kill `-pgid`).
     Returns `some exitCode` if the process exited, or `none` if still running (`WNOHANG`). -/
@@ -367,15 +373,22 @@ def waitOrKillGroup (cg : ChildGroup) (sig : UInt32 := 0) (nohang : Bool := fals
     else
       pure (.ok (some (packed &&& 0xFFFF).toUInt32))
 
-/-- Run a child process group in a bracketed scope that guarantees `SIGKILL` (`-pgid`) and `waitpid` reaper on exit. -/
-def withChildGroup (cmd : String) (args : Array String) (k : ChildGroup → IO (SysResult α)) : IO (SysResult α) := do
-  match ← spawnProcessGroup cmd args with
+/-- Run a child process group with optional pre-`execve` Landlock confinement in a bracketed scope
+    that guarantees `SIGKILL` (`-pgid`) and `waitpid` reaper on exit. -/
+def withChildGroupWithLandlock (cmd : String) (args : Array String)
+    (roPath : String) (rwPath : String) (confine : Bool)
+    (k : ChildGroup → IO (SysResult α)) : IO (SysResult α) := do
+  match ← spawnProcessGroupWithLandlock cmd args roPath rwPath confine with
   | .error e => pure (.error e)
   | .ok cg =>
     try
       k cg
     finally
       discard <| waitOrKillGroup cg 9 false
+
+/-- Run a child process group in a bracketed scope that guarantees `SIGKILL` (`-pgid`) and `waitpid` reaper on exit. -/
+def withChildGroup (cmd : String) (args : Array String) (k : ChildGroup → IO (SysResult α)) : IO (SysResult α) :=
+  withChildGroupWithLandlock cmd args "" "" false k
 
 /-- Bind and listen on `host:port` (`port = 0` selects an ephemeral port). Returns `(listenFd, boundPort)`. -/
 def tcpListen (host : String) (port : UInt16) (backlog : UInt32 := 64) : IO (SysResult (Fd × UInt16)) := do
