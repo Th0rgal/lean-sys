@@ -244,9 +244,10 @@ def probeLandlockAbi : IO (SysResult UInt32) := do
   | .ok v => pure (.ok v.toUInt32)
   | .error e => pure (.error e)
 
-/-- Bracketed file-descriptor scope: guarantees `closeFd` runs even if `k` throws an IO exception. -/
-def withFd (path : String) (mode : UInt8) (k : Fd → IO (SysResult α)) : IO (SysResult α) := do
-  match ← openFd path mode with
+/-- Bracketed file-descriptor scope: guarantees `closeFd` runs even if `k` throws an IO exception.
+    Pass `exclusive := 2` with a creating `mode` to add `O_EXCL` (fails with `.eexist` on any existing path, including symlinks). -/
+def withFd (path : String) (mode : UInt8) (k : Fd → IO (SysResult α)) (exclusive : UInt8 := 0) : IO (SysResult α) := do
+  match ← openFd path mode exclusive with
   | .error e => pure (.error e)
   | .ok fd =>
     try

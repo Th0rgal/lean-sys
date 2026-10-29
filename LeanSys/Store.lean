@@ -486,7 +486,7 @@ def casPut (h : Handle) (payload : ByteSlice) : IO (SysResult String) := do
       pure ()
   let nonce ← IO.monoNanosNow
   let tmpPath := s!"{dstPath}.{nonce}.tmp"
-  match ← withFd tmpPath 4 (fun fd => writeSliceAll fd payload true) with
+  match ← withFd tmpPath 4 (fun fd => writeSliceAll fd payload true) (exclusive := 2) with
   | .error e => pure (.error e)
   | .ok _ =>
     match ← chmodReadOnly tmpPath with
@@ -516,7 +516,7 @@ def casMaterialize (h : Handle) (hexKey : String) (targetPath : String) : IO (Sy
   | .ok bytes =>
     let nonce ← IO.monoNanosNow
     let tmpTarget := s!"{targetPath}.{nonce}.cas.tmp"
-    match ← withFd tmpTarget 4 (fun fd => writeAll fd bytes true) with
+    match ← withFd tmpTarget 4 (fun fd => writeAll fd bytes true) (exclusive := 2) with
     | .error e => pure (.error e)
     | .ok _ => atomicRename tmpTarget targetPath
 
