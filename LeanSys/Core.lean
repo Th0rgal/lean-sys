@@ -85,11 +85,16 @@ def selfTestMmapBounds (testDir : String) : IO UInt32 := do
       let inRange ← mmapWriteShared fd 28 "abcd".toUTF8
       let pastEnd ← mmapWriteShared fd 30 "abcd".toUTF8
       let farOff ← mmapWriteShared fd 4096 "x".toUTF8
+      let wrapWrite ← mmapWriteShared fd 0xFFFFFFFFFFFFFFFE "abcd".toUTF8
+      let oobEmpty ← mmapWriteShared fd 4096 ByteArray.empty
       let rdIn ← mmapReadShared fd 28 4
       let rdPast ← mmapReadShared fd 30 4
-      let ok := match inRange, pastEnd, farOff with
-        | .ok 4, .error .einval, .error .einval => rdIn == "abcd".toUTF8 && rdPast.isEmpty
-        | _, _, _ => false
+      let rdTagWrap ← mmapReadShared fd (1 <<< 62) 4
+      let rdRawWrap ← rawPreadBa fd.raw (((2 : UInt64) <<< 62) ||| 0x3FFFFFFFFFFFFFFE) 4
+      let ok := match inRange, pastEnd, farOff, wrapWrite, oobEmpty with
+        | .ok 4, .error .einval, .error .einval, .error .einval, .error .einval =>
+          rdIn == "abcd".toUTF8 && rdPast.isEmpty && rdTagWrap.isEmpty && rdRawWrap.isEmpty
+        | _, _, _, _, _ => false
       pure (.ok ok))
     | do IO.eprintln "[lean-sys-core] FAIL: mmap probe open"; return 1
   if !mmapProbeOk then
