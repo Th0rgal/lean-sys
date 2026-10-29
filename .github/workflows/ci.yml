@@ -54,6 +54,7 @@ jobs:
       - name: Run Lean 4 CI verification gates (build, self-test, bench, TCB & shim hygiene)
         run: |
           export PATH="$HOME/.elan/bin:$PATH"
+          ulimit -n "$(ulimit -Hn)" || ulimit -n 131072
           ./scripts/ci_verify.sh
 
       - name: Run Rust build, warnings check, and C-ABI integration tests
