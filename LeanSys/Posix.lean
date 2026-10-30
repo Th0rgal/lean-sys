@@ -193,27 +193,41 @@ end ByteSlice
 /-! ## Zero-Copy External Pointer View (`BorrowedSlice` / `RawByteView`) & `ByteSource` -/
 
 /-- Validated external `(ptr, len)` view over live `mmap`, `io_uring`, or Rust `&[u8]` memory without `ByteArray` copying.
-    Constructor is `private`: safe Lean callers obtain views via `MmapRegion.withView` / `MmapArena.withPayloadView`,
-    while C-ABI / FFI callers must opt into `BorrowedSlice.unsafeFromRawParts?`. -/
+    Constructor and raw pointer field are `private`: safe Lean callers evaluate pure queries via `MmapRegion.withView`
+    / `MmapArena.withPayloadView` (whose `ViewSafeRet` typeclass forbids returning `BorrowedSlice`/`ByteSource` handles
+    and whose `pinCount` blocks concurrent `mmapUnmap`), while FFI callers must opt into `unsafe def unsafeFromRawParts?`. -/
 structure BorrowedSlice where
   private mk ::
-  ptr : USize
+  private ptr : USize
   len : USize
-  deriving Repr, DecidableEq, Inhabited
+  deriving DecidableEq
+
+instance : Repr BorrowedSlice where
+  reprPrec v _ := s!"BorrowedSlice(len={v.len})"
 
 /-- Canonical alias for raw external `(ptr, len)` byte views across C-ABI boundaries. -/
 abbrev RawByteView := BorrowedSlice
 
 namespace BorrowedSlice
 
-/-- Unsafe FFI constructor for an external `(ptr, len)` buffer whose liveness is guaranteed by the caller,
-    gated by `leansys_verify_borrowed_view` (`ptr != 0` and no 64-bit wraparound). -/
+/-- Private module-internal validated constructor for `MmapRegion.withView`. -/
 @[inline]
-def unsafeFromRawParts? (ptr : USize) (len : USize) : Option BorrowedSlice :=
+private def mkChecked? (ptr : USize) (len : USize) : Option BorrowedSlice :=
   if Spec.verifyBorrowedView ptr.toUInt64 len.toUInt64 0 len.toUInt64 == 1 then
     some { ptr := ptr, len := len }
   else
     none
+
+/-- Kernel-enforced `unsafe` FFI constructor for an external `(ptr, len)` buffer whose liveness is guaranteed
+    by the foreign caller, gated by `leansys_verify_borrowed_view` (`ptr != 0` and no 64-bit wraparound). -/
+@[inline]
+unsafe def unsafeFromRawParts? (ptr : USize) (len : USize) : Option BorrowedSlice :=
+  mkChecked? ptr len
+
+/-- Certified non-zero raw base address (read-only getter). -/
+@[inline]
+def rawAddr (v : BorrowedSlice) : USize :=
+  v.ptr
 
 /-- Sub-slice `[relOff, relOff + subLen)` gated by `leansys_verify_borrowed_view`. -/
 @[inline]
@@ -261,7 +275,8 @@ end BorrowedSlice
 inductive ByteSource where
   | heap (slice : ByteSlice)
   | borrowed (view : BorrowedSlice)
-  deriving Inhabited
+
+instance : Inhabited ByteSource := ⟨.heap default⟩
 
 namespace ByteSource
 
@@ -592,16 +607,68 @@ def reflinkFile (src dst : String) : IO (SysResult Unit) := do
   | .ok _ => pure (.ok ())
   | .error e => pure (.error e)
 
-/-- Persistent `MAP_SHARED` arena handle (`baseAddr`, `lenBytes`) with an `IO.Ref Bool` liveness token
-    preventing use-after-`munmap` or double-`munmap` in safe Lean code. -/
+/-- Value-only return typeclass for `MmapRegion.withView` / `MmapArena.withPayloadView`.
+    Intentionally has NO instances for `BorrowedSlice`, `ByteSource`, `BorrowedJsonTape`, `BorrowedRpcRequest`,
+    `BorrowedHttpRequest`, or function closures (`α → β`), making it unutterable in safe Lean to smuggle a raw
+    `BorrowedSlice` out of its pinned `MmapRegion.withView` lifetime scope. -/
+class ViewSafeRet (α : Type) : Prop where
+  isValue : True := trivial
+
+instance : ViewSafeRet Unit := {}
+instance : ViewSafeRet Bool := {}
+instance : ViewSafeRet Nat := {}
+instance : ViewSafeRet Int := {}
+instance : ViewSafeRet UInt8 := {}
+instance : ViewSafeRet UInt16 := {}
+instance : ViewSafeRet UInt32 := {}
+instance : ViewSafeRet UInt64 := {}
+instance : ViewSafeRet USize := {}
+instance : ViewSafeRet Int32 := {}
+instance : ViewSafeRet Int64 := {}
+instance : ViewSafeRet String := {}
+instance : ViewSafeRet ByteArray := {}
+instance : ViewSafeRet ByteSlice := {}
+instance : ViewSafeRet Errno := {}
+instance [ViewSafeRet α] : ViewSafeRet (Option α) := {}
+instance [ViewSafeRet α] [ViewSafeRet β] : ViewSafeRet (α × β) := {}
+instance [ViewSafeRet ε] [ViewSafeRet α] : ViewSafeRet (Except ε α) := {}
+instance [ViewSafeRet α] : ViewSafeRet (Array α) := {}
+instance [ViewSafeRet α] : ViewSafeRet (List α) := {}
+
+/-- Persistent `MAP_SHARED` arena handle (`baseAddr`, `lenBytes`) with `private` constructor & fields:
+    external callers cannot forge addresses, enlarge `lenBytes`, clear `readOnly`, or reset `closed` / `pins`. -/
 structure MmapRegion where
-  baseAddr : USize
-  lenBytes : USize
-  readOnly : Bool
-  closed   : IO.Ref Bool
+  private mk ::
+  private baseAddr : USize
+  private lenBytes : USize
+  private readOnly : Bool
+  private closed   : IO.Ref Bool
+  private pins     : IO.Ref Nat
+
+namespace MmapRegion
+
+@[inline] def byteLength (r : MmapRegion) : USize := r.lenBytes
+@[inline] def isReadOnly (r : MmapRegion) : Bool := r.readOnly
+@[inline] def isClosed (r : MmapRegion) : IO Bool := r.closed.get
+
+/-- Pin a live `MmapRegion` (`pins > 0` blocks `mmapUnmap` with `.ebusy` while DMA or a `withView` scope is active). -/
+def acquirePin (r : MmapRegion) : IO (SysResult USize) := do
+  if ← r.closed.get then
+    return .error .einval
+  r.pins.modify (· + 1)
+  if ← r.closed.get then
+    r.pins.modify (· - 1)
+    return .error .einval
+  return .ok r.baseAddr
+
+/-- Release an active pin acquired via `MmapRegion.acquirePin`. -/
+def releasePin (r : MmapRegion) : IO Unit :=
+  r.pins.modify (· - 1)
+
+end MmapRegion
 
 instance : Repr MmapRegion where
-  reprPrec r _ := s!"MmapRegion(base={r.baseAddr}, len={r.lenBytes}, ro={r.readOnly})"
+  reprPrec r _ := s!"MmapRegion(len={r.lenBytes}, ro={r.readOnly})"
 
 /-- Create a persistent `MAP_SHARED` mapping of `fd` at `fileOffset` of size `lenBytes` (`mode = 4` in `leansys_write_all`). -/
 def mmapMapShared (fd : Fd) (lenBytes : Nat) (fileOffset : Nat := 0) (readOnly : Bool := false) : IO (SysResult MmapRegion) := do
@@ -614,16 +681,18 @@ def mmapMapShared (fd : Fd) (lenBytes : Nat) (fileOffset : Nat := 0) (readOnly :
   | .ok addr =>
     if Spec.verifyBorrowedView addr lenBytes.toUInt64 0 lenBytes.toUInt64 == 1 then
       let closedRef ← IO.mkRef false
-      pure (.ok { baseAddr := addr.toUSize, lenBytes := lenBytes.toUSize, readOnly := readOnly, closed := closedRef })
+      let pinsRef ← IO.mkRef (0 : Nat)
+      pure (.ok { baseAddr := addr.toUSize, lenBytes := lenBytes.toUSize, readOnly := readOnly, closed := closedRef, pins := pinsRef })
     else
       let _ ← rawWriteAll 0 ByteArray.empty addr.toUSize lenBytes.toUSize 5
       pure (.error .einval)
 
-/-- Unmap a persistent `MmapRegion` via `munmap(2)` (`mode = 5` in `leansys_write_all`), idempotently marking it closed. -/
+/-- Unmap a persistent `MmapRegion` via `munmap(2)` (`mode = 5` in `leansys_write_all`),
+    rejecting with `.einval` if `pins > 0` (active `withView` or `IoUring` DMA) and idempotently marking it closed. -/
 def mmapUnmap (reg : MmapRegion) : IO (SysResult Unit) := do
   if ← reg.closed.get then
     return .ok ()
-  if reg.baseAddr == 0 || reg.lenBytes == 0 then
+  if (← reg.pins.get) != 0 || reg.baseAddr == 0 || reg.lenBytes == 0 then
     return .error .einval
   reg.closed.set true
   let w ← rawWriteAll 0 ByteArray.empty reg.baseAddr reg.lenBytes 5
@@ -631,20 +700,23 @@ def mmapUnmap (reg : MmapRegion) : IO (SysResult Unit) := do
   | .ok _ => pure (.ok ())
   | .error e => pure (.error e)
 
-/-- Scoped zero-copy `BorrowedSlice` access over `[relOff, relOff + subLen)` of a live `MmapRegion`
-    (fails closed with `.einval` if `reg` has already been unmapped or bounds overflow). -/
-def MmapRegion.withView {α : Type} (reg : MmapRegion) (relOff : Nat := 0) (subLen : Nat := reg.lenBytes.toNat)
+/-- Scoped zero-copy `BorrowedSlice` access over `[relOff, relOff + subLen)` of a live `MmapRegion`.
+    Pins `reg` during `k` (so `mmapUnmap` inside `k` fails closed instead of unmapping live memory) and restricts `α`
+    via `[ViewSafeRet α]` so `BorrowedSlice` / `ByteSource` handles cannot escape the scope. -/
+def MmapRegion.withView {α : Type} [ViewSafeRet α] (reg : MmapRegion) (relOff : Nat := 0) (subLen : Nat := reg.byteLength.toNat)
     (k : BorrowedSlice → IO α) : IO (SysResult α) := do
-  if ← reg.closed.get then
-    return .error .einval
-  let some full := BorrowedSlice.unsafeFromRawParts? reg.baseAddr reg.lenBytes
-    | return .error .einval
-  let some sub := full.subView? relOff subLen
-    | return .error .einval
-  let res ← k sub
-  if ← reg.closed.get then
-    return .error .einval
-  return .ok res
+  match ← reg.acquirePin with
+  | .error e => return .error e
+  | .ok base =>
+    try
+      let some full := BorrowedSlice.mkChecked? base reg.lenBytes
+        | return .error .einval
+      let some sub := full.subView? relOff subLen
+        | return .error .einval
+      let res ← k sub
+      return .ok res
+    finally
+      reg.releasePin
 
 /-- Effectful `__ATOMIC_ACQUIRE` 32-bit aligned load at `relOff` inside a live `MmapRegion`. -/
 def mmapAtomicLoadU32 (reg : MmapRegion) (relOff : Nat) : IO (SysResult UInt32) := do

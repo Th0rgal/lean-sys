@@ -225,6 +225,7 @@ end ShmRing
     - `[32..40)`: `tail : UInt64`
     - `[40..40+cap)`: circular payload ring -/
 structure MmapArena where
+  private mk ::
   path          : String
   region        : MmapRegion
   cap           : UInt32
@@ -299,7 +300,7 @@ def close (arena : MmapArena) : IO (SysResult Unit) :=
 
 /-- Scoped zero-copy `BorrowedSlice` access over the payload region `[40, 40 + cap)` while `arena` remains mapped. -/
 @[inline]
-def withPayloadView {α : Type} (arena : MmapArena) (k : BorrowedSlice → IO α) : IO (SysResult α) :=
+def withPayloadView {α : Type} [ViewSafeRet α] (arena : MmapArena) (k : BorrowedSlice → IO α) : IO (SysResult α) :=
   arena.region.withView headerBytes arena.cap.toNat k
 
 private def writeRingBytes (reg : MmapRegion) (cap : Nat) (cursor : UInt64) (data : ByteArray) : IO (SysResult Unit) := do
@@ -402,10 +403,11 @@ structure IoUringCqe where
 
 /-- Live Linux `io_uring` handle with `MAP_SHARED` SQ ring, CQ ring, and SQE array mappings. -/
 structure IoUring where
-  ringFd      : Fd
-  sqRing      : MmapRegion
-  cqRing      : MmapRegion
-  sqesRegion  : MmapRegion
+  private mk ::
+  private ringFd      : Fd
+  private sqRing      : MmapRegion
+  private cqRing      : MmapRegion
+  private sqesRegion  : MmapRegion
   sqEntries   : UInt32
   cqEntries   : UInt32
   sqOffHead   : Nat
@@ -484,13 +486,18 @@ def setup (entries : UInt32 := 8) : IO (SysResult IoUring) := do
             singleMmap := singleMmap
           }
 
-/-- Tear down `IoUring` mappings and close `ringFd`. -/
-def close (ring : IoUring) : IO Unit := do
-  discard <| mmapUnmap ring.sqesRegion
-  if !ring.singleMmap then
-    discard <| mmapUnmap ring.cqRing
-  discard <| mmapUnmap ring.sqRing
-  discard <| closeFd ring.ringFd
+/-- Tear down `IoUring` mappings and close `ringFd` (fails closed with `.einval` if any ring region is pinned). -/
+def close (ring : IoUring) : IO (SysResult Unit) := do
+  match ← mmapUnmap ring.sqesRegion with
+  | .error e => return .error e
+  | .ok () =>
+    if !ring.singleMmap then
+      match ← mmapUnmap ring.cqRing with
+      | .error e => return .error e
+      | .ok () => pure ()
+    match ← mmapUnmap ring.sqRing with
+    | .error e => return .error e
+    | .ok () => closeFd ring.ringFd
 
 private def buildSqe64 (opcode : UInt8) (fd : Int32) (off addr : UInt64) (len : UInt32) (userData : UInt64) : ByteArray := Id.run do
   let mut b := ByteArray.emptyWithCapacity 64
@@ -569,20 +576,32 @@ def submitNop (ring : IoUring) (userData : UInt64 := 0xCAFEBABE) : IO (SysResult
 /-- Submit an `IORING_OP_READ` into a live mapped `MmapRegion` slice `[regionOff, regionOff + len)` at `fileOff`. -/
 def submitReadToRegion (ring : IoUring) (fd : Fd) (fileOff : UInt64)
     (dst : MmapRegion) (regionOff len : Nat) (userData : UInt64 := 1) : IO (SysResult IoUringCqe) := do
-  if (← dst.closed.get) || dst.readOnly ||
-     verifyBorrowedView dst.baseAddr.toUInt64 dst.lenBytes.toUInt64 regionOff.toUInt64 len.toUInt64 != 1 then
+  if dst.isReadOnly then
     return .error .einval
-  let targetAddr := dst.baseAddr.toUInt64 + regionOff.toUInt64
-  submitAndWaitOne ring opRead fd.raw.toInt32 fileOff targetAddr len.toUInt32 userData
+  match ← dst.acquirePin with
+  | .error e => return .error e
+  | .ok base =>
+    try
+      if verifyBorrowedView base.toUInt64 dst.byteLength.toUInt64 regionOff.toUInt64 len.toUInt64 != 1 then
+        return .error .einval
+      let targetAddr := base.toUInt64 + regionOff.toUInt64
+      submitAndWaitOne ring opRead fd.raw.toInt32 fileOff targetAddr len.toUInt32 userData
+    finally
+      dst.releasePin
 
 /-- Submit an `IORING_OP_WRITE` from a live mapped `MmapRegion` slice `[regionOff, regionOff + len)` to `fd` at `fileOff`. -/
 def submitWriteFromRegion (ring : IoUring) (fd : Fd) (fileOff : UInt64)
     (src : MmapRegion) (regionOff len : Nat) (userData : UInt64 := 2) : IO (SysResult IoUringCqe) := do
-  if (← src.closed.get) ||
-     verifyBorrowedView src.baseAddr.toUInt64 src.lenBytes.toUInt64 regionOff.toUInt64 len.toUInt64 != 1 then
-    return .error .einval
-  let srcAddr := src.baseAddr.toUInt64 + regionOff.toUInt64
-  submitAndWaitOne ring opWrite fd.raw.toInt32 fileOff srcAddr len.toUInt32 userData
+  match ← src.acquirePin with
+  | .error e => return .error e
+  | .ok base =>
+    try
+      if verifyBorrowedView base.toUInt64 src.byteLength.toUInt64 regionOff.toUInt64 len.toUInt64 != 1 then
+        return .error .einval
+      let srcAddr := base.toUInt64 + regionOff.toUInt64
+      submitAndWaitOne ring opWrite fd.raw.toInt32 fileOff srcAddr len.toUInt32 userData
+    finally
+      src.releasePin
 
 end IoUring
 

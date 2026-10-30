@@ -169,6 +169,10 @@ def selfTestWave1Features (testDir : String) : IO UInt32 := do
   let rawHttpBytes := s!"POST /v1/rpc HTTP/1.1\r\nHost: unix\r\nContent-Length: {rpcWire.utf8ByteSize}\r\n\r\n{rpcWire}".toUTF8
   let _ ← mmapRegionWrite arena.region 512 rawHttpBytes
   let viewOk ← arena.region.withView 512 rawHttpBytes.size fun bView => do
+    -- Regression: attempting `MmapArena.close` / `mmapUnmap` while `withView` holds a pin MUST fail closed with `.error .einval`!
+    match ← MmapArena.close arena with
+    | .ok () => return false
+    | .error _ => pure ()
     let bSrc := ByteSource.ofBorrowed bView
     let sliceRef := ByteSlice.ofByteArray rawHttpBytes
     if xxh64Borrowed bView != xxh64Slice sliceRef ||
@@ -222,7 +226,7 @@ def selfTestWave1Features (testDir : String) : IO UInt32 := do
         else
           return .error .eio
       | _, _ => return .error .eio
-    IoUring.close ring
+    discard <| IoUring.close ring
     match nopRes, ioOk with
     | .ok cqe, .ok () =>
       if cqe.userData != 0x12345678 || cqe.res != 0 then

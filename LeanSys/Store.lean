@@ -719,10 +719,26 @@ private def streamCopyWritable (srcPath tmpTarget : String) (chunkBytes : Nat :=
         | .error e => pure (.error e)
         | .ok _ => pure (.ok ())
 
+/-- Verify a materialized temporary file (`tmpTarget`) against either a 256-bit `Digest256` or 64-bit `xxh64` digest
+    immediately before atomic `rename`, eliminating any reopen TOCTOU window between `casPath` and `tmpTarget`. -/
+private def verifyMaterializedTmp (tmpTarget : String) (cleanKey : String)
+    (pathSep : UInt8) (algo256 : CasAlgo256) : IO (SysResult Unit) := do
+  if cleanKey.utf8ByteSize == 64 then
+    match Digest256.ofHex? cleanKey with
+    | none => pure (.error .einval)
+    | some exp256 => verifyCasFile256 tmpTarget exp256 pathSep algo256
+  else
+    match parseHex16? cleanKey with
+    | none => pure (.error .einval)
+    | some exp64 =>
+      match ← readVerifiedCasBlob tmpTarget exp64 pathSep with
+      | .ok _ => pure (.ok ())
+      | .error e => pure (.error e)
+
 /-- Materialize an immutable `0444` CAS object (`16-hex` 64-bit OR `64-hex` 256-bit key) to `targetPath`
-    as an independent writable (`0644`) file via CoW reflink (`FICLONE` / `clonefile`) + atomic `rename`.
+    as an independent writable (`0644`) file via CoW reflink (`FICLONE` / `clonefile`) + post-clone digest check + atomic `rename`.
     NEVER hardlinks `0444` CAS blobs. When the filesystem returns `.eopnotsupp` or `.exdev`, fails with that
-    typed `Errno` unless `allowCopyFallback == true`, in which case it streams `pread` chunks + `fsync` + `rename`. -/
+    typed `Errno` unless `allowCopyFallback == true`, in which case it streams `pread` chunks + `fsync` + digest check + `rename`. -/
 def casMaterializeReflink (h : Handle) (hexKey : String) (targetPath : String)
     (allowCopyFallback : Bool := false) : IO (SysResult ReflinkOutcome) := do
   let (algo256, cleanKey) := match hexKey.splitOn ":" with
@@ -730,45 +746,46 @@ def casMaterializeReflink (h : Handle) (hexKey : String) (targetPath : String)
     | [_, rest] => (CasAlgo256.sha256, rest)
     | _ => (CasAlgo256.sha256, hexKey)
   let pathSep := hasPathTraversal cleanKey
+  if pathSep != 0 then
+    return .error .einval
+  if cleanKey.utf8ByteSize == 64 then
+    if (Digest256.ofHex? cleanKey).isNone then return .error .einval
+  else
+    if (parseHex16? cleanKey).isNone then return .error .einval
   let casPath := (System.FilePath.mk h.casDir / cleanKey).toString
-  let verified : SysResult Unit ←
-    if cleanKey.utf8ByteSize == 64 then
-      match Digest256.ofHex? cleanKey with
-      | none => pure (.error .einval)
-      | some exp256 => verifyCasFile256 casPath exp256 pathSep algo256
-    else
-      match parseHex16? cleanKey with
-      | none => pure (.error .einval)
-      | some exp64 =>
-        match ← readVerifiedCasBlob casPath exp64 pathSep with
-        | .ok _ => pure (.ok ())
-        | .error e => pure (.error e)
-  match verified with
-  | .error e => return .error e
+  let nonce ← IO.monoNanosNow
+  let tmpTarget := s!"{targetPath}.{nonce}.reflink.tmp"
+  match ← reflinkFile casPath tmpTarget with
   | .ok () =>
-    let nonce ← IO.monoNanosNow
-    let tmpTarget := s!"{targetPath}.{nonce}.reflink.tmp"
-    match ← reflinkFile casPath tmpTarget with
+    match ← verifyMaterializedTmp tmpTarget cleanKey pathSep algo256 with
+    | .error ve =>
+      discard <| unlinkFile tmpTarget
+      return .error ve
     | .ok () =>
       match ← atomicRename tmpTarget targetPath with
       | .ok () => return .ok .reflinked
       | .error e =>
         discard <| unlinkFile tmpTarget
         return .error e
-    | .error e =>
-      discard <| unlinkFile tmpTarget
-      if allowCopyFallback && (e == .eopnotsupp || e == .exdev || e == .enosys || e == .einval) then
-        match ← streamCopyWritable casPath tmpTarget with
-        | .error ce =>
+  | .error e =>
+    discard <| unlinkFile tmpTarget
+    if allowCopyFallback && (e == .eopnotsupp || e == .exdev || e == .enosys || e == .einval) then
+      match ← streamCopyWritable casPath tmpTarget with
+      | .error ce =>
+        discard <| unlinkFile tmpTarget
+        return .error ce
+      | .ok () =>
+        match ← verifyMaterializedTmp tmpTarget cleanKey pathSep algo256 with
+        | .error ve =>
           discard <| unlinkFile tmpTarget
-          return .error ce
+          return .error ve
         | .ok () =>
           match ← atomicRename tmpTarget targetPath with
           | .ok () => return .ok .copiedFallback
           | .error re =>
             discard <| unlinkFile tmpTarget
             return .error re
-      else
-        return .error e
+    else
+      return .error e
 
 end LeanSys.Store

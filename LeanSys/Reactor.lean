@@ -216,7 +216,9 @@ def runMultiplexedReactor (cfg : ReactorConfig) (listenFd : Fd)
           | .error _ =>
             acceptMore := false
 
-      -- 2. Advance every active client connection state machine without blocking
+      -- 2. Advance every active client connection state machine without blocking.
+      -- Keep `slotsRef` synchronized with the exact live open descriptors before every `handler` call and on `closeFd`,
+      -- so exception cleanup (`finally`) never closes an already-dropped (and potentially reused) descriptor.
       let mut nextSlots : Array ConnSlot := #[]
       for idx in [0:slots.size] do
         let mut s := slots[idx]!
@@ -248,16 +250,16 @@ def runMultiplexedReactor (cfg : ReactorConfig) (listenFd : Fd)
               parseLoop := false
             | .ok (some (req, rem)) =>
               let nextReqs := s.reqsServed + 1
-              if verifyStepReactor 1 1 nextReqs.toUInt64 cfg.maxKeepAliveReq.toUInt64 slots.size.toUInt32 cfg.maxConns 0 != 1 then
+              if verifyStepReactor 1 1 nextReqs.toUInt64 cfg.maxKeepAliveReq.toUInt64 (nextSlots.size + (slots.size - idx)).toUInt32 cfg.maxConns 0 != 1 then
                 dropConn := true
                 parseLoop := false
               else
                 let wantsClose := req.headers.any fun (k, v) =>
                   asciiEqIgnoreCase k "connection" && asciiEqIgnoreCase v "close"
+                let activeCount := (nextSlots.size + (slots.size - idx)).toUInt32
                 let canKeep := !wantsClose &&
-                  verifyPollInterest slots.size.toUInt32 cfg.maxConns nextReqs.toUInt32 cfg.maxKeepAliveReq 0 cfg.maxIdleMs == 1
-                slots := slots.set! idx s
-                slotsRef.set slots
+                  verifyPollInterest activeCount cfg.maxConns nextReqs.toUInt32 cfg.maxKeepAliveReq 0 cfg.maxIdleMs == 1
+                slotsRef.set ((nextSlots.push s) ++ slots.extract (idx + 1) slots.size)
                 let resp ← handler req
                 completedRef.modify (· + 1)
                 let remTx := if s.txOff == 0 then s.txBuf else s.txBuf.extract s.txOff s.txBuf.size
@@ -289,6 +291,7 @@ def runMultiplexedReactor (cfg : ReactorConfig) (listenFd : Fd)
           | .error _ => dropConn := true
 
         if dropConn then
+          slotsRef.set (nextSlots ++ slots.extract (idx + 1) slots.size)
           discard <| closeFd s.fd
         else
           nextSlots := nextSlots.push s
