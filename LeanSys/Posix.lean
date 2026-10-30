@@ -6,6 +6,7 @@
   - Resource-safe `Fd`, `DirLock`, and `ChildGroup` lifecycle combinators
 -/
 import LeanSys.Spec
+import Std.Sync.Mutex
 
 namespace LeanSys.Posix
 
@@ -99,34 +100,34 @@ def decodePackedWord (w : UInt64) : SysResult UInt64 :=
 /-! ## Raw Borrowed C-Shim Externs (`c/lean_sys_shim.c`) -/
 
 @[extern "leansys_open_flock"]
-opaque rawOpenFlock (path : @& String) (writable : UInt8) (exclusive : UInt8) (aux : UInt32) : IO UInt64
+private opaque rawOpenFlock (path : @& String) (writable : UInt8) (exclusive : UInt8) (aux : UInt32) : IO UInt64
 
 @[extern "leansys_fs_clone_or_link"]
-opaque rawFsCloneOrLink (src : @& String) (dst : @& String) (op : UInt8) : IO UInt64
+private opaque rawFsCloneOrLink (src : @& String) (dst : @& String) (op : UInt8) : IO UInt64
 
 @[extern "leansys_write_all"]
-opaque rawWriteAll (fd : UInt32) (ba : @& ByteArray) (off : USize) (len : USize) (mode : UInt8) : IO UInt64
+private opaque rawWriteAll (fd : UInt32) (ba : @& ByteArray) (off : USize) (len : USize) (mode : UInt8) : IO UInt64
 
 @[extern "leansys_pread_ba"]
-opaque rawPreadBa (fd : UInt32) (off : UInt64) (maxLen : USize) : IO ByteArray
+private opaque rawPreadBa (fd : UInt32) (off : UInt64) (maxLen : USize) : IO ByteArray
 
 @[extern "leansys_spawn_group"]
-opaque rawSpawnGroup (cmd : @& String) (args : @& Array String) (roPath : @& String) (rwPath : @& String) (confine : UInt8) : IO UInt64
+private opaque rawSpawnGroup (cmd : @& String) (args : @& Array String) (roPath : @& String) (rwPath : @& String) (confine : UInt8) : IO UInt64
 
 @[extern "leansys_kill_wait_group"]
-opaque rawKillWaitGroup (pid : UInt32) (sig : UInt32) (nohang : UInt8) : IO UInt64
+private opaque rawKillWaitGroup (pid : UInt32) (sig : UInt32) (nohang : UInt8) : IO UInt64
 
 @[extern "leansys_net_listen"]
-opaque rawNetListen (host : @& String) (port : UInt16) (backlog : UInt32) : IO UInt64
+private opaque rawNetListen (host : @& String) (port : UInt16) (backlog : UInt32) : IO UInt64
 
 @[extern "leansys_net_accept_poll"]
-opaque rawNetAcceptPoll (listenFd : UInt32) (timeoutMs : UInt32) (pollOnly : UInt8) : IO UInt64
+private opaque rawNetAcceptPoll (listenFd : UInt32) (timeoutMs : UInt32) (pollOnly : UInt8) : IO UInt64
 
 @[extern "leansys_ptr_read"]
-opaque rawPtrRead (ptr : USize) (cap : USize) (off : USize) (word64 : UInt8) : UInt64
+private opaque rawPtrRead (ptr : USize) (cap : USize) (off : USize) (word64 : UInt8) : UInt64
 
 @[extern "leansys_ptr_load_io"]
-opaque rawPtrLoadIO (ptr : USize) (cap : USize) (off : USize) (width : UInt8) : IO UInt64
+private opaque rawPtrLoadIO (ptr : USize) (cap : USize) (off : USize) (width : UInt8) : IO UInt64
 
 /-! ## Zero-Copy ByteSlice over Borrowed `ByteArray` -/
 
@@ -607,63 +608,82 @@ def reflinkFile (src dst : String) : IO (SysResult Unit) := do
   | .ok _ => pure (.ok ())
   | .error e => pure (.error e)
 
-/-- Value-only return typeclass for `MmapRegion.withView` / `MmapArena.withPayloadView`.
-    Intentionally has NO instances for `BorrowedSlice`, `ByteSource`, `BorrowedJsonTape`, `BorrowedRpcRequest`,
-    `BorrowedHttpRequest`, or function closures (`α → β`), making it unutterable in safe Lean to smuggle a raw
-    `BorrowedSlice` out of its pinned `MmapRegion.withView` lifetime scope. -/
+/-- Pure value-only return typeclass for `MmapRegion.withView` / `MmapArena.withPayloadView`.
+    Constructor is `private` (`private mk ::`) so external callers cannot forge instances for `BorrowedSlice`,
+    `ByteSource`, `BorrowedJsonTape`, `BorrowedRpcRequest`, `BorrowedHttpRequest`, or function closures (`α → β`),
+    and the callback `BorrowedSlice → α` is pure (not `IO`), making it impossible in safe Lean to stash a `BorrowedSlice`
+    into an external `IO.Ref` or smuggle it out of its pinned `MmapRegion.withView` lifetime scope. -/
 class ViewSafeRet (α : Type) : Prop where
+  private mk ::
   isValue : True := trivial
 
-instance : ViewSafeRet Unit := {}
-instance : ViewSafeRet Bool := {}
-instance : ViewSafeRet Nat := {}
-instance : ViewSafeRet Int := {}
-instance : ViewSafeRet UInt8 := {}
-instance : ViewSafeRet UInt16 := {}
-instance : ViewSafeRet UInt32 := {}
-instance : ViewSafeRet UInt64 := {}
-instance : ViewSafeRet USize := {}
-instance : ViewSafeRet Int32 := {}
-instance : ViewSafeRet Int64 := {}
-instance : ViewSafeRet String := {}
-instance : ViewSafeRet ByteArray := {}
-instance : ViewSafeRet ByteSlice := {}
-instance : ViewSafeRet Errno := {}
-instance [ViewSafeRet α] : ViewSafeRet (Option α) := {}
-instance [ViewSafeRet α] [ViewSafeRet β] : ViewSafeRet (α × β) := {}
-instance [ViewSafeRet ε] [ViewSafeRet α] : ViewSafeRet (Except ε α) := {}
-instance [ViewSafeRet α] : ViewSafeRet (Array α) := {}
-instance [ViewSafeRet α] : ViewSafeRet (List α) := {}
+instance : ViewSafeRet Unit := ⟨trivial⟩
+instance : ViewSafeRet Bool := ⟨trivial⟩
+instance : ViewSafeRet Nat := ⟨trivial⟩
+instance : ViewSafeRet Int := ⟨trivial⟩
+instance : ViewSafeRet UInt8 := ⟨trivial⟩
+instance : ViewSafeRet UInt16 := ⟨trivial⟩
+instance : ViewSafeRet UInt32 := ⟨trivial⟩
+instance : ViewSafeRet UInt64 := ⟨trivial⟩
+instance : ViewSafeRet USize := ⟨trivial⟩
+instance : ViewSafeRet Int32 := ⟨trivial⟩
+instance : ViewSafeRet Int64 := ⟨trivial⟩
+instance : ViewSafeRet String := ⟨trivial⟩
+instance : ViewSafeRet ByteArray := ⟨trivial⟩
+instance : ViewSafeRet ByteSlice := ⟨trivial⟩
+instance : ViewSafeRet Errno := ⟨trivial⟩
+instance [ViewSafeRet α] : ViewSafeRet (Option α) := ⟨trivial⟩
+instance [ViewSafeRet α] [ViewSafeRet β] : ViewSafeRet (α × β) := ⟨trivial⟩
+instance [ViewSafeRet ε] [ViewSafeRet α] : ViewSafeRet (Except ε α) := ⟨trivial⟩
+instance [ViewSafeRet α] : ViewSafeRet (Array α) := ⟨trivial⟩
+instance [ViewSafeRet α] : ViewSafeRet (List α) := ⟨trivial⟩
 
-/-- Persistent `MAP_SHARED` arena handle (`baseAddr`, `lenBytes`) with `private` constructor & fields:
-    external callers cannot forge addresses, enlarge `lenBytes`, clear `readOnly`, or reset `closed` / `pins`. -/
+/-- Persistent `MAP_SHARED` arena handle (`baseAddr`, `lenBytes`) with `private` constructor & OS-mutex-synchronized
+    `(closed, pins)` state (`Std.Mutex (Bool × Nat)`): external callers cannot forge addresses, enlarge `lenBytes`,
+    clear `readOnly`, decrement `pins`, or race multi-threaded `mmapUnmap` against active pins. -/
 structure MmapRegion where
   private mk ::
   private baseAddr : USize
   private lenBytes : USize
   private readOnly : Bool
-  private closed   : IO.Ref Bool
-  private pins     : IO.Ref Nat
+  private state    : Std.Mutex (Bool × Nat)
 
 namespace MmapRegion
 
 @[inline] def byteLength (r : MmapRegion) : USize := r.lenBytes
 @[inline] def isReadOnly (r : MmapRegion) : Bool := r.readOnly
-@[inline] def isClosed (r : MmapRegion) : IO Bool := r.closed.get
+@[inline] def isClosed (r : MmapRegion) : IO Bool := r.state.atomically do pure (← get).1
 
-/-- Pin a live `MmapRegion` (`pins > 0` blocks `mmapUnmap` with `.ebusy` while DMA or a `withView` scope is active). -/
-def acquirePin (r : MmapRegion) : IO (SysResult USize) := do
-  if ← r.closed.get then
-    return .error .einval
-  r.pins.modify (· + 1)
-  if ← r.closed.get then
-    r.pins.modify (· - 1)
-    return .error .einval
-  return .ok r.baseAddr
+/-- Private OS-mutex pin helper (`pins > 0` blocks `mmapUnmap` across all `IO.asTask` threads while DMA or `withView` is active). -/
+private def acquirePin (r : MmapRegion) : IO (SysResult USize) :=
+  r.state.atomically do
+    let (closed, pins) ← get
+    if closed then
+      return .error .einval
+    set (false, pins + 1)
+    return .ok r.baseAddr
 
-/-- Release an active pin acquired via `MmapRegion.acquirePin`. -/
-def releasePin (r : MmapRegion) : IO Unit :=
-  r.pins.modify (· - 1)
+/-- Private OS-mutex unpin helper paired exclusively with `acquirePin` inside `try ... finally`. -/
+private def releasePin (r : MmapRegion) : IO Unit :=
+  r.state.atomically do
+    let (closed, pins) ← get
+    set (closed, pins - 1)
+
+/-- Scoped DMA pin over `[relOff, relOff + subLen)` of a live `MmapRegion`: validates bounds via `leansys_verify_borrowed_view`,
+    holds an atomic pin throughout `k` so concurrent `mmapUnmap` fails closed, and never exposes manual `releasePin`. -/
+def withPinnedAddr {α : Type} (r : MmapRegion) (needWritable : Bool) (relOff subLen : Nat)
+    (k : UInt64 → IO (SysResult α)) : IO (SysResult α) := do
+  if needWritable && r.readOnly then
+    return .error .einval
+  match ← r.acquirePin with
+  | .error e => return .error e
+  | .ok base =>
+    try
+      if Spec.verifyBorrowedView base.toUInt64 r.lenBytes.toUInt64 relOff.toUInt64 subLen.toUInt64 != 1 then
+        return .error .einval
+      k (base.toUInt64 + relOff.toUInt64)
+    finally
+      r.releasePin
 
 end MmapRegion
 
@@ -680,31 +700,39 @@ def mmapMapShared (fd : Fd) (lenBytes : Nat) (fileOffset : Nat := 0) (readOnly :
   | .error e => pure (.error e)
   | .ok addr =>
     if Spec.verifyBorrowedView addr lenBytes.toUInt64 0 lenBytes.toUInt64 == 1 then
-      let closedRef ← IO.mkRef false
-      let pinsRef ← IO.mkRef (0 : Nat)
-      pure (.ok { baseAddr := addr.toUSize, lenBytes := lenBytes.toUSize, readOnly := readOnly, closed := closedRef, pins := pinsRef })
+      let st ← Std.Mutex.new (false, (0 : Nat))
+      pure (.ok { baseAddr := addr.toUSize, lenBytes := lenBytes.toUSize, readOnly := readOnly, state := st })
     else
       let _ ← rawWriteAll 0 ByteArray.empty addr.toUSize lenBytes.toUSize 5
       pure (.error .einval)
 
 /-- Unmap a persistent `MmapRegion` via `munmap(2)` (`mode = 5` in `leansys_write_all`),
-    rejecting with `.einval` if `pins > 0` (active `withView` or `IoUring` DMA) and idempotently marking it closed. -/
+    atomically checking `pins == 0` under OS mutex `reg.state` so active `withView`, `withPinnedAddr`, or
+    `mmapRegion*` calls on any thread can never race against `munmap(2)`. -/
 def mmapUnmap (reg : MmapRegion) : IO (SysResult Unit) := do
-  if ← reg.closed.get then
+  let action ← reg.state.atomically do
+    let (closed, pins) ← get
+    if closed then
+      return (0 : UInt8)
+    if pins != 0 || reg.baseAddr == 0 || reg.lenBytes == 0 then
+      return (1 : UInt8)
+    set (true, 0)
+    return (2 : UInt8)
+  if action == 0 then
     return .ok ()
-  if (← reg.pins.get) != 0 || reg.baseAddr == 0 || reg.lenBytes == 0 then
+  if action == 1 then
     return .error .einval
-  reg.closed.set true
   let w ← rawWriteAll 0 ByteArray.empty reg.baseAddr reg.lenBytes 5
   match decodePackedWord w with
   | .ok _ => pure (.ok ())
   | .error e => pure (.error e)
 
-/-- Scoped zero-copy `BorrowedSlice` access over `[relOff, relOff + subLen)` of a live `MmapRegion`.
-    Pins `reg` during `k` (so `mmapUnmap` inside `k` fails closed instead of unmapping live memory) and restricts `α`
-    via `[ViewSafeRet α]` so `BorrowedSlice` / `ByteSource` handles cannot escape the scope. -/
+/-- Scoped zero-copy pure query over `[relOff, relOff + subLen)` of a live `MmapRegion`.
+    Atomically pins `reg` during `k` (blocking concurrent `mmapUnmap`), takes a pure `BorrowedSlice → α` function
+    so `BorrowedSlice` can never be stashed in an `IO.Ref`, and restricts `α` via private `[ViewSafeRet α]` so
+    neither `BorrowedSlice`/`ByteSource` nor closures can escape the scope. -/
 def MmapRegion.withView {α : Type} [ViewSafeRet α] (reg : MmapRegion) (relOff : Nat := 0) (subLen : Nat := reg.byteLength.toNat)
-    (k : BorrowedSlice → IO α) : IO (SysResult α) := do
+    (k : BorrowedSlice → α) : IO (SysResult α) := do
   match ← reg.acquirePin with
   | .error e => return .error e
   | .ok base =>
@@ -713,47 +741,73 @@ def MmapRegion.withView {α : Type} [ViewSafeRet α] (reg : MmapRegion) (relOff 
         | return .error .einval
       let some sub := full.subView? relOff subLen
         | return .error .einval
-      let res ← k sub
-      return .ok res
+      return .ok (k sub)
     finally
       reg.releasePin
 
 /-- Effectful `__ATOMIC_ACQUIRE` 32-bit aligned load at `relOff` inside a live `MmapRegion`. -/
 def mmapAtomicLoadU32 (reg : MmapRegion) (relOff : Nat) : IO (SysResult UInt32) := do
-  if (← reg.closed.get) || (relOff % 4) != 0 ||
-     Spec.verifyBorrowedView reg.baseAddr.toUInt64 reg.lenBytes.toUInt64 relOff.toUInt64 4 != 1 then
+  if (relOff % 4) != 0 then
     return .error .einval
-  let v ← rawPtrLoadIO reg.baseAddr reg.lenBytes relOff.toUSize 4
-  return .ok v.toUInt32
+  match ← reg.acquirePin with
+  | .error e => return .error e
+  | .ok base =>
+    try
+      if Spec.verifyBorrowedView base.toUInt64 reg.lenBytes.toUInt64 relOff.toUInt64 4 != 1 then
+        return .error .einval
+      let v ← rawPtrLoadIO base reg.lenBytes relOff.toUSize 4
+      return .ok v.toUInt32
+    finally
+      reg.releasePin
 
 /-- Effectful `__ATOMIC_ACQUIRE` 64-bit aligned load at `relOff` inside a live `MmapRegion`. -/
 def mmapAtomicLoadU64 (reg : MmapRegion) (relOff : Nat) : IO (SysResult UInt64) := do
-  if (← reg.closed.get) || (relOff % 8) != 0 ||
-     Spec.verifyBorrowedView reg.baseAddr.toUInt64 reg.lenBytes.toUInt64 relOff.toUInt64 8 != 1 then
+  if (relOff % 8) != 0 then
     return .error .einval
-  let v ← rawPtrLoadIO reg.baseAddr reg.lenBytes relOff.toUSize 8
-  return .ok v
+  match ← reg.acquirePin with
+  | .error e => return .error e
+  | .ok base =>
+    try
+      if Spec.verifyBorrowedView base.toUInt64 reg.lenBytes.toUInt64 relOff.toUInt64 8 != 1 then
+        return .error .einval
+      let v ← rawPtrLoadIO base reg.lenBytes relOff.toUSize 8
+      return .ok v
+    finally
+      reg.releasePin
 
 /-- Write `ba` into `[relOff, relOff + ba.size)` of a writable live `MmapRegion` with `__ATOMIC_RELEASE` store/fence (`mode = 8`). -/
 def mmapRegionWrite (reg : MmapRegion) (relOff : Nat) (ba : ByteArray) : IO (SysResult Nat) := do
-  if (← reg.closed.get) || reg.readOnly || relOff >= 0x100000000 ||
-     Spec.verifyBorrowedView reg.baseAddr.toUInt64 reg.lenBytes.toUInt64 relOff.toUInt64 ba.size.toUInt64 != 1 then
+  if reg.readOnly || relOff >= 0x100000000 then
     return .error .einval
-  let w ← rawWriteAll relOff.toUInt32 ba reg.baseAddr ba.size.toUSize 8
-  match decodePackedWord w with
-  | .ok n => pure (.ok n.toNat)
-  | .error e => pure (.error e)
+  match ← reg.acquirePin with
+  | .error e => return .error e
+  | .ok base =>
+    try
+      if Spec.verifyBorrowedView base.toUInt64 reg.lenBytes.toUInt64 relOff.toUInt64 ba.size.toUInt64 != 1 then
+        return .error .einval
+      let w ← rawWriteAll relOff.toUInt32 ba base ba.size.toUSize 8
+      match decodePackedWord w with
+      | .ok n => pure (.ok n.toNat)
+      | .error e => pure (.error e)
+    finally
+      reg.releasePin
 
 /-- Read `len` bytes from `[relOff, relOff + len)` of a live `MmapRegion` with `__ATOMIC_ACQUIRE` fence (`tg = 1` in `leansys_pread_ba`). -/
 def mmapRegionRead (reg : MmapRegion) (relOff : Nat) (len : Nat) : IO ByteArray := do
-  if (← reg.closed.get) || relOff >= 0x100000000 ||
-     Spec.verifyBorrowedView reg.baseAddr.toUInt64 reg.lenBytes.toUInt64 relOff.toUInt64 len.toUInt64 != 1 then
+  if relOff >= 0x100000000 then
     return ByteArray.empty
-  let base64 := reg.baseAddr.toUInt64
-  if base64 >= (1 : UInt64) <<< 62 then
-    return ByteArray.empty
-  let tagged : UInt64 := ((1 : UInt64) <<< 62) ||| base64
-  rawPreadBa relOff.toUInt32 tagged len.toUSize
+  match ← reg.acquirePin with
+  | .error _ => return ByteArray.empty
+  | .ok base =>
+    try
+      let base64 := base.toUInt64
+      if base64 >= (1 : UInt64) <<< 62 ||
+         Spec.verifyBorrowedView base64 reg.lenBytes.toUInt64 relOff.toUInt64 len.toUInt64 != 1 then
+        return ByteArray.empty
+      let tagged : UInt64 := ((1 : UInt64) <<< 62) ||| base64
+      rawPreadBa relOff.toUInt32 tagged len.toUSize
+    finally
+      reg.releasePin
 
 /-- Linux `io_uring_setup(entries, paramsBuf)` (`mode = 6` in `leansys_write_all`).
     `paramsBuf` must be a 120-byte zeroed `ByteArray`; on success returns `(ringFd, populatedParamsBuf)`. -/
@@ -782,26 +836,21 @@ def ioUringEnterRaw (ringFd : Fd) (toSubmit minComplete : UInt32) (flags : UInt1
   | .ok submitted => pure (.ok submitted.toUInt32)
 
 /-- Multi-FD readiness multiplexer (`poll(2)`, `mode = 9` in `leansys_write_all`) over up to 62 descriptors.
-    Packs `struct pollfd { int fd; short events; short revents; }` (8 bytes LE per slot) and returns the subset
-    of indices with `POLLIN | POLLHUP | POLLERR` ready, or `.ok #[]` on timeout (`EAGAIN`). -/
+    Packs 4-byte LE `fd` words + 64-bit `pollOutMask` (`off`), letting the C shim populate host-native `POLLIN`/`POLLOUT`
+    fields without endianness assumptions, and returns ready indices or `.ok #[]` on timeout (`EAGAIN`). -/
 def pollFdSet (fds : Array Fd) (timeoutMs : UInt32 := 50) (pollOutMask : UInt64 := 0) : IO (SysResult (Array Nat)) := do
   if fds.size == 0 then
     return .ok #[]
   if fds.size > 62 || Spec.verifyPollInterest fds.size.toUInt32 62 0 1 0 (timeoutMs + 1) != 1 then
     return .error .einval
-  let mut buf := ByteArray.emptyWithCapacity (fds.size * 8)
+  let mut buf := ByteArray.emptyWithCapacity (fds.size * 4)
   for idx in [0:fds.size] do
     let raw := (fds[idx]!).raw
-    let ev : UInt16 := if ((pollOutMask >>> idx.toUInt64) &&& 1) == 1 then 5 else 1 -- POLLIN=1, POLLOUT=4
     buf := buf.push (raw &&& 0xFF).toUInt8
     buf := buf.push ((raw >>> 8) &&& 0xFF).toUInt8
     buf := buf.push ((raw >>> 16) &&& 0xFF).toUInt8
     buf := buf.push ((raw >>> 24) &&& 0xFF).toUInt8
-    buf := buf.push (ev &&& 0xFF).toUInt8
-    buf := buf.push ((ev >>> 8) &&& 0xFF).toUInt8
-    buf := buf.push 0
-    buf := buf.push 0
-  let w ← rawWriteAll timeoutMs buf 0 fds.size.toUSize 9
+  let w ← rawWriteAll timeoutMs buf pollOutMask.toUSize fds.size.toUSize 9
   match decodePackedWord w with
   | .error .eagain => pure (.ok #[])
   | .error e => pure (.error e)

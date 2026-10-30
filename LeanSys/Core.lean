@@ -165,37 +165,49 @@ def selfTestWave1Features (testDir : String) : IO UInt32 := do
     IO.eprintln "[lean-sys-core] FAIL: MmapArena roundtrip mismatch"
     return 1
 
-  -- Scoped zero-copy `BorrowedSlice` directly over mapped `MmapRegion` memory (`0` ByteArray copies, liveness-checked)
+  -- Scoped zero-copy `BorrowedSlice` directly over mapped `MmapRegion` memory (`0` ByteArray copies, pure `ViewSafeRet` lifetime + pin lock)
   let rawHttpBytes := s!"POST /v1/rpc HTTP/1.1\r\nHost: unix\r\nContent-Length: {rpcWire.utf8ByteSize}\r\n\r\n{rpcWire}".toUTF8
-  let _ ← mmapRegionWrite arena.region 512 rawHttpBytes
-  let viewOk ← arena.region.withView 512 rawHttpBytes.size fun bView => do
-    -- Regression: attempting `MmapArena.close` / `mmapUnmap` while `withView` holds a pin MUST fail closed with `.error .einval`!
-    match ← MmapArena.close arena with
-    | .ok () => return false
-    | .error _ => pure ()
+  let viewRegionPath := s!"{testDir}/wave1-view.region"
+  let .ok viewReg ← withFd viewRegionPath 4 fun vfd => do
+    let .ok _ ← ftruncateFd vfd 4096 | return .error .eio
+    mmapMapShared vfd 4096 0 false
+    | do IO.eprintln "[lean-sys-core] FAIL: mmapMapShared viewReg"; return 1
+  let _ ← mmapRegionWrite viewReg 512 rawHttpBytes
+  -- Regression: attempting `mmapUnmap` while `withPinnedAddr` holds an active pin MUST fail closed with `.error .einval`!
+  let pinBlocksUnmap ← viewReg.withPinnedAddr false 512 rawHttpBytes.size fun _ => do
+    match ← mmapUnmap viewReg with
+    | .ok () => pure (.error .eio)
+    | .error .einval => pure (.ok true)
+    | .error e => pure (.error e)
+  let viewOk ← viewReg.withView 512 rawHttpBytes.size fun bView =>
     let bSrc := ByteSource.ofBorrowed bView
     let sliceRef := ByteSlice.ofByteArray rawHttpBytes
     if xxh64Borrowed bView != xxh64Slice sliceRef ||
        sha256Source bSrc != sha256Bytes rawHttpBytes ||
        !ctEqSource bSrc (ByteSource.ofByteSlice sliceRef) then
-      return false
-    match parseRequestSourcePrefix bSrc none false with
-    | .error _ => return false
-    | .ok (breq, _) =>
-      let some parsedRpc := parseRequestSource? breq.bodySource | return false
-      let some pt := parsedRpc.paramsTape | return false
-      return (parsedRpc.method == "ping" && BorrowedJsonTape.lookupNat? pt "n" == some 99)
-  match viewOk with
-  | .ok true => pure ()
-  | _ =>
+      false
+    else
+      match parseRequestSourcePrefix bSrc none false with
+      | .error _ => false
+      | .ok (breq, _) =>
+        match parseRequestSource? breq.bodySource with
+        | none => false
+        | some parsedRpc =>
+          match parsedRpc.paramsTape with
+          | none => false
+          | some pt => parsedRpc.method == "ping" && BorrowedJsonTape.lookupNat? pt "n" == some 99
+  match pinBlocksUnmap, viewOk with
+  | .ok true, .ok true => pure ()
+  | _, _ =>
     IO.eprintln "[lean-sys-core] FAIL: scoped MmapRegion.withView zero-copy verification failed"
     return 1
+  discard <| mmapUnmap viewReg
   discard <| MmapArena.close arena2
   discard <| MmapArena.close arena
-  -- Regression: accessing `withView` or `MmapArena.pop?` after `MmapArena.close` fails closed with `.error .einval`!
-  match ← arena.region.withView 0 16 (fun v => pure (v.getByteD 0)), ← MmapArena.pop? arena 7 with
-  | .error .einval, .error .einval => pure ()
-  | _, _ =>
+  -- Regression: accessing `withView`, `withPayloadView`, or `MmapArena.pop?` after close/unmap fails closed with `.error .einval`!
+  match ← viewReg.withView 0 16 (fun v => v.getByteD 0), ← MmapArena.withPayloadView arena (fun v => v.getByteD 0), ← MmapArena.pop? arena 7 with
+  | .error .einval, .error .einval, .error .einval => pure ()
+  | _, _, _ =>
     IO.eprintln "[lean-sys-core] FAIL: MmapArena/MmapRegion allowed use-after-close!"
     return 1
 
@@ -207,6 +219,11 @@ def selfTestWave1Features (testDir : String) : IO UInt32 := do
     return 1
   | .ok ring =>
     let nopRes ← IoUring.submitNop ring 0x12345678
+    -- Regression: enqueue sibling SQE `0x1111`, then `submitNop` `0x2222`; `0x1111` completes ahead of `0x2222`
+    -- and MUST be preserved in `pendingCqes` rather than dropped when `0x2222` drains CQ!
+    let _ ← IoUring.enqueueNop ring 0x1111
+    let oooSecond ← IoUring.submitNop ring 0x2222
+    let oooFirst ← IoUring.waitSubmittedCqe ring 0x1111
     let urFile := s!"{testDir}/uring-io.bin"
     let urData := "io_uring_verified_payload_64b!".toUTF8
     let ioOk ← withFd urFile 4 fun ufd => do
@@ -227,12 +244,12 @@ def selfTestWave1Features (testDir : String) : IO UInt32 := do
           return .error .eio
       | _, _ => return .error .eio
     discard <| IoUring.close ring
-    match nopRes, ioOk with
-    | .ok cqe, .ok () =>
-      if cqe.userData != 0x12345678 || cqe.res != 0 then
-        IO.eprintln "[lean-sys-core] FAIL: IoUring NOP cqe mismatch"
+    match nopRes, oooSecond, oooFirst, ioOk with
+    | .ok cqe, .ok c2, .ok c1, .ok () =>
+      if cqe.userData != 0x12345678 || cqe.res != 0 || c2.userData != 0x2222 || c1.userData != 0x1111 then
+        IO.eprintln "[lean-sys-core] FAIL: IoUring NOP / out-of-order CQE mismatch"
         return 1
-    | _, _ =>
+    | _, _, _, _ =>
       IO.eprintln "[lean-sys-core] FAIL: IoUring NOP/READ/WRITE failed"
       return 1
 
@@ -380,7 +397,7 @@ def selfTestMmapBounds (testDir : String) : IO UInt32 := do
       let rdIn ← mmapReadShared fd 28 4
       let rdPast ← mmapReadShared fd 30 4
       let rdTagWrap ← mmapReadShared fd (1 <<< 62) 4
-      let rdRawWrap ← rawPreadBa fd.raw (((2 : UInt64) <<< 62) ||| 0x3FFFFFFFFFFFFFFE) 4
+      let rdRawWrap ← mmapReadShared fd 0x3FFFFFFFFFFFFFFE 4
       let ok := match inRange, pastEnd, farOff, wrapWrite, oobEmpty with
         | .ok 4, .error .einval, .error .einval, .error .einval, .error .einval =>
           rdIn == "abcd".toUTF8 && rdPast.isEmpty && rdTagWrap.isEmpty && rdRawWrap.isEmpty

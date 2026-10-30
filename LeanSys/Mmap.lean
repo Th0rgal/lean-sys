@@ -226,11 +226,11 @@ end ShmRing
     - `[40..40+cap)`: circular payload ring -/
 structure MmapArena where
   private mk ::
-  path          : String
-  region        : MmapRegion
-  cap           : UInt32
-  schemaVersion : UInt32 := 1
-  writerEpoch   : UInt64 := 1
+  path           : String
+  private region : MmapRegion
+  cap            : UInt32
+  schemaVersion  : UInt32 := 1
+  writerEpoch    : UInt64 := 1
   deriving Repr
 
 namespace MmapArena
@@ -298,9 +298,9 @@ def attach (path : String) (minEpoch : UInt64 := 0) : IO (SysResult MmapArena) :
 def close (arena : MmapArena) : IO (SysResult Unit) :=
   mmapUnmap arena.region
 
-/-- Scoped zero-copy `BorrowedSlice` access over the payload region `[40, 40 + cap)` while `arena` remains mapped. -/
+/-- Scoped zero-copy pure query over the payload region `[40, 40 + cap)` while `arena` remains mapped. -/
 @[inline]
-def withPayloadView {α : Type} [ViewSafeRet α] (arena : MmapArena) (k : BorrowedSlice → IO α) : IO (SysResult α) :=
+def withPayloadView {α : Type} [ViewSafeRet α] (arena : MmapArena) (k : BorrowedSlice → α) : IO (SysResult α) :=
   arena.region.withView headerBytes arena.cap.toNat k
 
 private def writeRingBytes (reg : MmapRegion) (cap : Nat) (cursor : UInt64) (data : ByteArray) : IO (SysResult Unit) := do
@@ -399,15 +399,16 @@ structure IoUringCqe where
   userData : UInt64
   res      : Int32
   flags    : UInt32
-  deriving Repr, DecidableEq
+  deriving Repr, DecidableEq, Inhabited
 
-/-- Live Linux `io_uring` handle with `MAP_SHARED` SQ ring, CQ ring, and SQE array mappings. -/
+/-- Live Linux `io_uring` handle with `MAP_SHARED` SQ ring, CQ ring, SQE array mappings, and buffered out-of-order CQEs. -/
 structure IoUring where
   private mk ::
   private ringFd      : Fd
   private sqRing      : MmapRegion
   private cqRing      : MmapRegion
   private sqesRegion  : MmapRegion
+  private pendingCqes : IO.Ref (Array IoUringCqe)
   sqEntries   : UInt32
   cqEntries   : UInt32
   sqOffHead   : Nat
@@ -468,11 +469,13 @@ def setup (entries : UInt32 := 8) : IO (SysResult IoUring) := do
           discard <| closeFd rfd
           return .error e
         | .ok sqesReg =>
+          let stashRef ← IO.mkRef (#[] : Array IoUringCqe)
           return .ok {
             ringFd := rfd
             sqRing := sqReg
             cqRing := cqReg
             sqesRegion := sqesReg
+            pendingCqes := stashRef
             sqEntries := sqEnt
             cqEntries := cqEnt
             sqOffHead := sqHead
@@ -515,11 +518,52 @@ private def buildSqe64 (opcode : UInt8) (fd : Int32) (off addr : UInt64) (len : 
     b := b.push 0
   return b
 
-/-- Submit a single SQE (`NOP`, `READ`, or `WRITE`) and wait for its matching `userData` CQE completion
-    (retrying `ioUringEnterRaw` on `EINTR` with `toSubmit = 0` so in-flight kernel DMA buffers are never abandoned early),
-    using `__ATOMIC_ACQUIRE` 32-bit loads and `__ATOMIC_RELEASE` 32-bit stores gated by `leansys_verify_io_uring_ring`. -/
-def submitAndWaitOne (ring : IoUring) (opcode : UInt8) (targetFd : Int32)
-    (fileOff bufAddr : UInt64) (bufLen : UInt32) (userData : UInt64) : IO (SysResult IoUringCqe) := do
+/-- Drain an already-submitted completion matching `userData` from `pendingCqes` or the kernel CQ ring (`toSubmit = 0`). -/
+def waitSubmittedCqe (ring : IoUring) (userData : UInt64) : IO (SysResult IoUringCqe) := do
+  let mut matchedCqe : Option IoUringCqe := none
+  let mut fatalErr : Option Errno := none
+  while matchedCqe.isNone && fatalErr.isNone do
+    let stashed ← ring.pendingCqes.modifyGet fun arr =>
+      match arr.findIdx? (fun c => c.userData == userData) with
+      | none => (none, arr)
+      | some idx => (some arr[idx]!, arr.eraseIdx! idx)
+    if let some hit := stashed then
+      return .ok hit
+    let .ok cqHead0 ← mmapAtomicLoadU32 ring.cqRing ring.cqOffHead | return .error .einval
+    let .ok cqTail  ← mmapAtomicLoadU32 ring.cqRing ring.cqOffTail | return .error .einval
+    let .ok cqMask  ← mmapAtomicLoadU32 ring.cqRing ring.cqOffMask | return .error .einval
+    if cqHead0 != cqTail then
+      let mut curHead := cqHead0
+      while curHead != cqTail && matchedCqe.isNone do
+        let cqeOff := ring.cqOffCqes + (curHead &&& cqMask).toNat * 16
+        let cqeBytes ← mmapRegionRead ring.cqRing cqeOff 16
+        if cqeBytes.size < 16 then
+          fatalErr := some .eio
+          break
+        let item : IoUringCqe := {
+          userData := readUInt64LE cqeBytes 0
+          res := (readUInt32LE cqeBytes 8).toInt32
+          flags := readUInt32LE cqeBytes 12
+        }
+        curHead := curHead + 1
+        let _ ← mmapRegionWrite ring.cqRing ring.cqOffHead (pushUInt32LE ByteArray.empty curHead)
+        if item.userData == userData then
+          matchedCqe := some item
+        else
+          ring.pendingCqes.modify (·.push item)
+    else
+      match ← ioUringEnterRaw ring.ringFd 0 1 1 with
+      | .error .eintr => pure ()
+      | .error e => fatalErr := some e
+      | .ok _ => pure ()
+  match fatalErr, matchedCqe with
+  | some e, _ => return .error e
+  | none, some cqe => return .ok cqe
+  | none, none => return .error .eagain
+
+/-- Enqueue a single SQE (`NOP`, `READ`, or `WRITE`) into the SQ ring without calling `io_uring_enter`. -/
+private def enqueueSqe (ring : IoUring) (opcode : UInt8) (targetFd : Int32)
+    (fileOff bufAddr : UInt64) (bufLen : UInt32) (userData : UInt64) : IO (SysResult Unit) := do
   let .ok head ← mmapAtomicLoadU32 ring.sqRing ring.sqOffHead | return .error .einval
   let .ok tail ← mmapAtomicLoadU32 ring.sqRing ring.sqOffTail | return .error .einval
   let .ok mask ← mmapAtomicLoadU32 ring.sqRing ring.sqOffMask | return .error .einval
@@ -527,47 +571,29 @@ def submitAndWaitOne (ring : IoUring) (opcode : UInt8) (targetFd : Int32)
     return .error .eagain
   let slotIdx := (tail &&& mask).toNat
   let sqeBytes := buildSqe64 opcode targetFd fileOff bufAddr bufLen userData
-  match ← mmapRegionWrite ring.sqesRegion (slotIdx * 64) sqeBytes with
+  let .ok _ ← mmapRegionWrite ring.sqesRegion (slotIdx * 64) sqeBytes | return .error .eio
+  let .ok _ ← mmapRegionWrite ring.sqRing (ring.sqOffArray + slotIdx * 4) (pushUInt32LE ByteArray.empty slotIdx.toUInt32) | return .error .eio
+  let .ok _ ← mmapRegionWrite ring.sqRing ring.sqOffTail (pushUInt32LE ByteArray.empty (tail + 1)) | return .error .eio
+  return .ok ()
+
+/-- Submit a single SQE (`NOP`, `READ`, or `WRITE`) and wait for its matching `userData` CQE completion
+    (preserving any out-of-order sibling CQEs in `pendingCqes` and retrying `EINTR` with `toSubmit = 0`),
+    using `__ATOMIC_ACQUIRE` 32-bit loads and `__ATOMIC_RELEASE` 32-bit stores gated by `leansys_verify_io_uring_ring`. -/
+private def submitAndWaitOne (ring : IoUring) (opcode : UInt8) (targetFd : Int32)
+    (fileOff bufAddr : UInt64) (bufLen : UInt32) (userData : UInt64) : IO (SysResult IoUringCqe) := do
+  match ← enqueueSqe ring opcode targetFd fileOff bufAddr bufLen userData with
   | .error e => return .error e
-  | .ok _ =>
-    match ← mmapRegionWrite ring.sqRing (ring.sqOffArray + slotIdx * 4) (pushUInt32LE ByteArray.empty slotIdx.toUInt32) with
+  | .ok () =>
+    let .ok sqHead ← mmapAtomicLoadU32 ring.sqRing ring.sqOffHead | return .error .einval
+    let .ok sqTail ← mmapAtomicLoadU32 ring.sqRing ring.sqOffTail | return .error .einval
+    let toSub := sqTail - sqHead
+    match ← ioUringEnterRaw ring.ringFd (if toSub == 0 then 1 else toSub) 1 1 with
+    | .error .eintr | .ok _ => waitSubmittedCqe ring userData
     | .error e => return .error e
-    | .ok _ =>
-      match ← mmapRegionWrite ring.sqRing ring.sqOffTail (pushUInt32LE ByteArray.empty (tail + 1)) with
-      | .error e => return .error e
-      | .ok _ =>
-        let mut toSubmit : UInt32 := 1
-        let mut matchedCqe : Option IoUringCqe := none
-        let mut fatalErr : Option Errno := none
-        while matchedCqe.isNone && fatalErr.isNone do
-          match ← ioUringEnterRaw ring.ringFd toSubmit 1 1 with
-          | .error .eintr =>
-            toSubmit := 0
-          | .error e =>
-            fatalErr := some e
-          | .ok _ =>
-            toSubmit := 0
-            let .ok cqHead0 ← mmapAtomicLoadU32 ring.cqRing ring.cqOffHead | do fatalErr := some .einval; break
-            let .ok cqTail  ← mmapAtomicLoadU32 ring.cqRing ring.cqOffTail | do fatalErr := some .einval; break
-            let .ok cqMask  ← mmapAtomicLoadU32 ring.cqRing ring.cqOffMask | do fatalErr := some .einval; break
-            let mut curHead := cqHead0
-            while curHead != cqTail && matchedCqe.isNone do
-              let cqeOff := ring.cqOffCqes + (curHead &&& cqMask).toNat * 16
-              let cqeBytes ← mmapRegionRead ring.cqRing cqeOff 16
-              if cqeBytes.size < 16 then
-                fatalErr := some .eio
-                break
-              let ud := readUInt64LE cqeBytes 0
-              let resU32 := readUInt32LE cqeBytes 8
-              let flg := readUInt32LE cqeBytes 12
-              curHead := curHead + 1
-              let _ ← mmapRegionWrite ring.cqRing ring.cqOffHead (pushUInt32LE ByteArray.empty curHead)
-              if ud == userData then
-                matchedCqe := some { userData := ud, res := resU32.toInt32, flags := flg }
-        match fatalErr, matchedCqe with
-        | some e, _ => return .error e
-        | none, some cqe => return .ok cqe
-        | none, none => return .error .eagain
+
+/-- Enqueue an `IORING_OP_NOP` probe without waiting (`io_uring_enter` deferred to subsequent submit), for out-of-order CQE testing. -/
+def enqueueNop (ring : IoUring) (userData : UInt64) : IO (SysResult Unit) :=
+  enqueueSqe ring opNop (-1) 0 0 0 userData
 
 /-- Submit an `IORING_OP_NOP` probe and verify round-trip `userData` completion. -/
 def submitNop (ring : IoUring) (userData : UInt64 := 0xCAFEBABE) : IO (SysResult IoUringCqe) :=
@@ -575,33 +601,15 @@ def submitNop (ring : IoUring) (userData : UInt64 := 0xCAFEBABE) : IO (SysResult
 
 /-- Submit an `IORING_OP_READ` into a live mapped `MmapRegion` slice `[regionOff, regionOff + len)` at `fileOff`. -/
 def submitReadToRegion (ring : IoUring) (fd : Fd) (fileOff : UInt64)
-    (dst : MmapRegion) (regionOff len : Nat) (userData : UInt64 := 1) : IO (SysResult IoUringCqe) := do
-  if dst.isReadOnly then
-    return .error .einval
-  match ← dst.acquirePin with
-  | .error e => return .error e
-  | .ok base =>
-    try
-      if verifyBorrowedView base.toUInt64 dst.byteLength.toUInt64 regionOff.toUInt64 len.toUInt64 != 1 then
-        return .error .einval
-      let targetAddr := base.toUInt64 + regionOff.toUInt64
-      submitAndWaitOne ring opRead fd.raw.toInt32 fileOff targetAddr len.toUInt32 userData
-    finally
-      dst.releasePin
+    (dst : MmapRegion) (regionOff len : Nat) (userData : UInt64 := 1) : IO (SysResult IoUringCqe) :=
+  dst.withPinnedAddr true regionOff len fun targetAddr =>
+    submitAndWaitOne ring opRead fd.raw.toInt32 fileOff targetAddr len.toUInt32 userData
 
 /-- Submit an `IORING_OP_WRITE` from a live mapped `MmapRegion` slice `[regionOff, regionOff + len)` to `fd` at `fileOff`. -/
 def submitWriteFromRegion (ring : IoUring) (fd : Fd) (fileOff : UInt64)
-    (src : MmapRegion) (regionOff len : Nat) (userData : UInt64 := 2) : IO (SysResult IoUringCqe) := do
-  match ← src.acquirePin with
-  | .error e => return .error e
-  | .ok base =>
-    try
-      if verifyBorrowedView base.toUInt64 src.byteLength.toUInt64 regionOff.toUInt64 len.toUInt64 != 1 then
-        return .error .einval
-      let srcAddr := base.toUInt64 + regionOff.toUInt64
-      submitAndWaitOne ring opWrite fd.raw.toInt32 fileOff srcAddr len.toUInt32 userData
-    finally
-      src.releasePin
+    (src : MmapRegion) (regionOff len : Nat) (userData : UInt64 := 2) : IO (SysResult IoUringCqe) :=
+  src.withPinnedAddr false regionOff len fun srcAddr =>
+    submitAndWaitOne ring opWrite fd.raw.toInt32 fileOff srcAddr len.toUInt32 userData
 
 end IoUring
 
