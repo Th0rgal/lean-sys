@@ -526,4 +526,207 @@ def httpClientRequest (host : String) (port : UInt16) (method : String) (path : 
     finally
       discard <| closeFd fd
 
+
+/-! ## `AF_UNIX` HTTP/1.1 Client (`requestUnix`) & Zero-Copy `BorrowedSlice` / `ByteSource` Request Parser -/
+
+/-- Execute an HTTP/1.1 request over an already-connected socket descriptor `fd` (closing `fd` on exit). -/
+def httpClientRequestOnFd (fd : Fd) (hostHeader : String) (method : String) (path : String)
+    (body : ByteSource) (bearerToken? : Option String := none) (timeoutMs : UInt32 := 3000) :
+    IO (SysResult String) := do
+  try
+    let authHdr := match bearerToken? with
+      | some tok => s!"Authorization: Bearer {tok}\r\n"
+      | none => ""
+    let bodyBytes := body.toByteArray
+    let reqHead :=
+      s!"{method} {path} HTTP/1.1\r\n" ++
+      s!"Host: {hostHeader}\r\n" ++
+      "Content-Type: application/json\r\n" ++
+      authHdr ++
+      s!"Content-Length: {bodyBytes.size}\r\n" ++
+      "Connection: close\r\n\r\n"
+    let wire := reqHead.toUTF8 ++ bodyBytes
+    match ← writeAll fd wire false with
+    | .error e => pure (.error e)
+    | .ok _ =>
+      let t0 ← IO.monoNanosNow
+      let budgetMs := Nat.max 50 timeoutMs.toNat
+      let mut respBuf := ByteArray.empty
+      let mut hdrEnd? : Option Nat := none
+      let mut targetTotal : Option Nat := none
+      let mut eof := false
+      let mut ioErr? : Option Errno := none
+      while !eof && ioErr?.isNone do
+        match targetTotal with
+        | some tot => if respBuf.size >= tot then break
+        | none => pure ()
+        if hdrEnd?.isNone && respBuf.size > maxHttpHeaderBytes + 4 then
+          ioErr? := some .einval; break
+        if let some bStart := hdrEnd? then
+          if targetTotal.isNone && respBuf.size - bStart > maxHttpBodyBytes then
+            ioErr? := some .einval; break
+        let now ← IO.monoNanosNow
+        let elapsedMs := (now - t0) / 1000000
+        if elapsedMs >= budgetMs then
+          ioErr? := some .eagain; break
+        match ← pollReadable fd (budgetMs - elapsedMs).toUInt32 with
+        | .error e => ioErr? := some e; break
+        | .ok () =>
+          let chunk ← readStreamChunk fd 65536
+          if chunk.isEmpty then
+            eof := true
+          else
+            respBuf := if respBuf.isEmpty then chunk else respBuf ++ chunk
+            if hdrEnd?.isNone then
+              if let some bStart := findHeaderEnd? respBuf then
+                if bStart - 4 > maxHttpHeaderBytes then
+                  ioErr? := some .einval
+                else
+                  match String.fromUTF8? (respBuf.extract 0 (bStart - 4)) with
+                  | none => ioErr? := some .einval
+                  | some headStr =>
+                    match headStr.splitOn "\r\n" with
+                    | [] => ioErr? := some .einval
+                    | statusLine :: hdrLines =>
+                      if !isValidStatusLine statusLine then
+                        ioErr? := some .einval
+                      else
+                        match parseValidatedHeaders hdrLines with
+                        | .error _ => ioErr? := some .einval
+                        | .ok (_, cl?, _) =>
+                          hdrEnd? := some bStart
+                          if let some cl := cl? then
+                            targetTotal := some (bStart + cl)
+      match ioErr? with
+      | some e => pure (.error e)
+      | none =>
+        match hdrEnd? with
+        | none => pure (.error .eio)
+        | some bStart =>
+          match targetTotal with
+          | some tot =>
+            if respBuf.size < tot then pure (.error .eio)
+            else pure (decodeResponseBody (respBuf.extract bStart tot))
+          | none =>
+            if respBuf.size - bStart > maxHttpBodyBytes then pure (.error .einval)
+            else pure (decodeResponseBody (respBuf.extract bStart respBuf.size))
+  finally
+    discard <| closeFd fd
+
+/-- Execute a bounded HTTP/1.1 client request over an `AF_UNIX` domain socket (`socketPath`)
+    gated by `leansys_verify_unix_path_bounds` (e.g. Docker / Podman / Firecracker / local sidecar IPC). -/
+def requestUnix (socketPath : String) (method : String) (path : String)
+    (body : ByteSlice := ByteSlice.ofByteArray ByteArray.empty)
+    (bearerToken? : Option String := none) (timeoutMs : UInt32 := 3000) :
+    IO (SysResult String) := do
+  match ← unixConnect socketPath with
+  | .error e => pure (.error e)
+  | .ok fd => httpClientRequestOnFd fd "localhost" method path (ByteSource.ofByteSlice body) bearerToken? timeoutMs
+
+/-- Zero-copy HTTP/1.1 request envelope whose `bodySource` remains a `ByteSource` (`BorrowedSlice` or `ByteSlice`). -/
+structure BorrowedHttpRequest where
+  method        : String
+  path          : String
+  headers       : Array (String × String)
+  contentLength : Nat
+  authBearer    : Option String
+  bodySource    : ByteSource
+
+private def findHeaderEndSource? (src : ByteSource) : Option Nat := Id.run do
+  let n := src.size
+  if n < 4 then return none
+  for i in [0 : n - 3] do
+    if src.getByteD i == 13 && src.getByteD (i + 1) == 10 &&
+       src.getByteD (i + 2) == 13 && src.getByteD (i + 3) == 10 then
+      return some (i + 4)
+  return none
+
+/-- Parse a bounded HTTP/1.1 request directly from a `ByteSource` (`BorrowedSlice` or `ByteSlice`)
+    without copying the body payload into a `ByteArray`, gated by `leansys_check_http_bounds`. -/
+def parseRequestSourcePrefix (src : ByteSource) (expectedBearer? : Option String := none)
+    (allowTrailingBytes : Bool := false) : Except String (BorrowedHttpRequest × Nat) := do
+  let some bodyStart := findHeaderEndSource? src
+    | .error "missing_header_terminator"
+  if bodyStart - 4 > maxHttpHeaderBytes then
+    .error "headers_too_large"
+  let some headSrc := src.subSource? 0 (bodyStart - 4)
+    | .error "invalid_header_slice"
+  let some headStr := String.fromUTF8? headSrc.toByteArray
+    | .error "invalid_utf8_headers"
+  match headStr.splitOn "\r\n" with
+  | [] => .error "empty_request_line"
+  | reqLine :: hdrLines =>
+    let parts := reqLine.trimAscii.toString.splitOn " "
+    let (method, path, proto) ← match parts with
+      | [m, p, v] => .ok (m.trimAscii.toString, p.trimAscii.toString, v.trimAscii.toString)
+      | _ => .error "malformed_request_line"
+    if proto != "HTTP/1.1" && proto != "HTTP/1.0" then
+      .error "unsupported_http_version"
+    if path.isEmpty || !path.startsWith "/" then
+      .error "malformed_request_target"
+    if method != "GET" && method != "POST" && method != "HEAD" && method != "PUT" && method != "DELETE" then
+      .error s!"unsupported_method:{method}"
+    let (headers, contentLen?, authBearer) ← parseValidatedHeaders hdrLines
+    let declContentLen := contentLen?.getD 0
+    let availTotalBody := src.size - bodyStart
+    if availTotalBody < declContentLen then
+      .error "content_length_mismatch"
+    else if !allowTrailingBytes && availTotalBody != declContentLen then
+      .error "content_length_mismatch"
+    else
+      let framedBodyLen := if allowTrailingBytes then declContentLen else availTotalBody
+      let authOk : UInt8 := match expectedBearer? with
+        | none => 1
+        | some reqTok =>
+          match authBearer with
+          | some presented => if ctEqString presented reqTok then 1 else 0
+          | none => 0
+      if checkHttpBounds headers.size.toUInt32 declContentLen.toUInt64 framedBodyLen.toUInt64 authOk != 1 then
+        if authOk == 0 then .error "unauthorized_bearer_token"
+        else if headers.size > 32 then .error "too_many_headers"
+        else if declContentLen > maxHttpBodyBytes then .error "payload_too_large"
+        else .error "content_length_mismatch"
+      else
+        let some bodySrc := src.subSource? bodyStart declContentLen
+          | .error "invalid_body_slice"
+        .ok ({
+          method := method
+          path := path
+          headers := headers
+          contentLength := declContentLen
+          authBearer := authBearer
+          bodySource := bodySrc
+        }, bodyStart + declContentLen)
+
+/--Incremental non-blocking framing inspection: returns `.ok (some (req, remCarry))` when a full frame has
+   arrived in `buf`, `.ok none` when more bytes are still needed without violating header/body caps,
+   or `.error reason` when framing/caps/auth fail immediately. -/
+def tryParseIncremental (buf : ByteArray) (expectedBearer? : Option String := none) :
+    Except String (Option (HttpRequest × ByteArray)) := do
+  match findHeaderEnd? buf with
+  | none =>
+    if buf.size > maxHttpHeaderBytes + 4 then
+      .error "headers_too_large"
+    else
+      .ok none
+  | some bStart =>
+    if bStart - 4 > maxHttpHeaderBytes then
+      .error "headers_too_large"
+    else
+      let some headStr := String.fromUTF8? (buf.extract 0 (bStart - 4))
+        | .error "invalid_utf8_headers"
+      match headStr.splitOn "\r\n" with
+      | [] => .error "empty_request_line"
+      | _ :: hdrLines =>
+        let (_, cl?, _) ← parseValidatedHeaders hdrLines
+        let declCl := cl?.getD 0
+        if declCl > maxHttpBodyBytes then
+          .error "payload_too_large"
+        else if buf.size < bStart + declCl then
+          .ok none
+        else
+          let (req, consumed) ← parseRequestPrefix buf expectedBearer? true
+          let rem := if consumed < buf.size then buf.extract consumed buf.size else ByteArray.empty
+          .ok (some (req, rem))
+
 end LeanSys.Http

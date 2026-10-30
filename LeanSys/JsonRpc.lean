@@ -62,4 +62,37 @@ def formatError (idRaw? : Option String) (code : Int) (message : String) : Strin
   let idField := idRaw?.getD "null"
   s!"\{\"jsonrpc\":\"2.0\",\"id\":{idField},\"error\":\{\"code\":{code},\"message\":\"{message}\"}}"
 
+
+/-- Zero-copy JSON-RPC 2.0 request frame indexed directly over a `ByteSource` (`BorrowedSlice` or `ByteSlice`). -/
+structure BorrowedRpcRequest where
+  idRaw?     : Option String
+  method     : String
+  paramsTape : Option BorrowedJsonTape
+  rawTape    : BorrowedJsonTape
+
+/-- Parse and validate a JSON-RPC 2.0 request directly from a `ByteSource` (`mmap` / `io_uring` / `&[u8]`)
+    without copying the wire frame, gated by `leansys_verify_jsonrpc_frame`. -/
+def parseRequestSource? (src : ByteSource) : Option BorrowedRpcRequest := do
+  let tape := BorrowedJsonTape.indexSource src
+  let ver ← BorrowedJsonTape.lookupString? tape "jsonrpc"
+  let hasV2 : UInt8 := if ver == "2.0" then 1 else 0
+  let method ← BorrowedJsonTape.lookupString? tape "method"
+  let idEntry? := BorrowedJsonTape.findEntry? tape "id"
+  let hasId : UInt8 := if idEntry?.isSome then 1 else 0
+  if verifyJsonRpcFrame hasV2 hasId method.utf8ByteSize.toUInt32 src.size.toUInt64 != 1 then
+    none
+  else
+    let idRaw? := match idEntry? with
+      | none => none
+      | some e =>
+        match tape.root.subSource? e.valOff e.valLen with
+        | none => none
+        | some s => some (if e.isString then s!"\"{s.toStringLossy}\"" else s.toStringLossy)
+    let paramsTape := (BorrowedJsonTape.lookupSource? tape "params").map fun (ps, _) => BorrowedJsonTape.indexSource ps
+    some { idRaw? := idRaw?, method := method, paramsTape := paramsTape, rawTape := tape }
+
+@[inline]
+def parseRequestBorrowed? (v : BorrowedSlice) : Option BorrowedRpcRequest :=
+  parseRequestSource? (ByteSource.ofBorrowed v)
+
 end LeanSys.JsonRpc

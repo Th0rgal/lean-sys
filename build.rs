@@ -86,6 +86,13 @@ const LEANSYS_EXPORTS: &[&str] = &[
     "leansys_select_isa",
     "leansys_verify_isa_selection",
     "leansys_verify_fd_bounds",
+    "leansys_verify_unix_path_bounds",
+    "leansys_verify_cas_digest256",
+    "leansys_verify_sigv4_envelope",
+    "leansys_verify_cgroup_v2_budget",
+    "leansys_verify_io_uring_ring",
+    "leansys_verify_borrowed_view",
+    "leansys_verify_step_reactor",
 ];
 
 fn extract_spec_exports(spec_src: &str) -> Vec<String> {

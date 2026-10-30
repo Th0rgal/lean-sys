@@ -37,8 +37,375 @@ open LeanSys.Reactor
 open LeanSys.Sandbox
 open LeanSys.Par
 
-/-- Regression checks for HTTP field-name/value validation, duplicate framing/auth headers,
-    strict status lines, panic-free body decoding, and fail-closed invalid IPv4 hosts. -/
+/-- End-to-end self-test for Wave 1 subsystems (`P0.2` Reflink + 256-bit streaming CAS, `P0.3` `AF_UNIX` HTTP/1.1,
+    `P0.4` `cgroup v2` metrics + atomic child placement, `P1.5` `StepReactorSpec` + governed state, `P1.6` non-blocking
+    multi-FD `Reactor` multiplexer, `P1.7` AWS SigV4 + S3 presigned URLs, `P2.8` x86_64 Zen 4/5 ISA selection,
+    `P2.9` zero-copy `BorrowedSlice` across `Hash`/`Codec`/`JsonRpc`/`Http`/`Auth`, and `P3.11` `MmapArena` + `IoUring`). -/
+def selfTestWave1Features (testDir : String) : IO UInt32 := do
+  -- 1. P2.8: x86_64 Zen 4 (variant 5) & Zen 5 (variant 6) ISA selection
+  if selectIsaVariant 0x7C00 0x7C00 5 6 != 5 ||
+     selectIsaVariant 0xFC00 0xFC00 6 6 != 6 ||
+     selectIsaVariant 0x7C00 0xFC00 6 6 != 0 ||
+     verifyIsaSelection 0xFC00 0xFC00 6 6 != 1 then
+    IO.eprintln "[lean-sys-core] FAIL: x86_64 Zen4/Zen5 ISA selection gate"
+    return 1
+
+  -- 2. P1.5: StepReactor governed lease/idempotency/quota state machine
+  let st0 : GovernedReactorState Nat := { minEpoch := 1, quotaCap := 100, maxConns := 32, appState := 0 }
+  let (st1, eff1) := stepGoverned st0 (.message 5 1001 40 7) (fun s m => (s + m, #[s + m]))
+  let (st2, eff2) := stepGoverned st1 (.message 5 1001 10 3) (fun s m => (s + m, #[s + m])) -- duplicate key
+  let (st3, eff3) := stepGoverned st1 (.message 4 1002 10 3) (fun s m => (s + m, #[s + m])) -- stale epoch
+  let (_, eff4)   := stepGoverned st1 (.message 6 1003 70 3) (fun s m => (s + m, #[s + m])) -- over quota
+  if st1.appState != 7 || eff1.size != 1 || st2.appState != 7 || st3.appState != 7 ||
+     eff2.size != 1 || eff3.size != 1 || eff4.size != 1 then
+    IO.eprintln "[lean-sys-core] FAIL: StepReactor governed transitions"
+    return 1
+
+  -- 3. P1.7: Incremental SHA-256 streaming + AWS SigV4 (`AWS4-HMAC-SHA256` official vector & S3 presigned URL)
+  let bigSample := ByteArray.mk ((List.range 200).map fun i => (i % 251).toUInt8).toArray
+  let streamSha := ((Sha256Stream.init.updateBytes (bigSample.extract 0 73)).updateBytes (bigSample.extract 73 200)).finalizeBytes
+  if streamSha != sha256Bytes bigSample then
+    IO.eprintln "[lean-sys-core] FAIL: Sha256Stream multi-chunk mismatch"
+    return 1
+
+  let creds : AwsSigV4Credentials := {
+    accessKeyId := "AKIAIOSFODNN7EXAMPLE"
+    secretAccessKey := "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
+    region := "us-east-1"
+    service := "s3"
+  }
+  let sigReq : AwsSigV4Request := {
+    method := "GET"
+    canonicalUri := "/test.txt"
+    queryParams := #[]
+    headers := #[("Host", "examplebucket.s3.amazonaws.com"), ("Range", "bytes=0-9")]
+    payloadSha256Hex := "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    amzDate := "20130524T000000Z"
+    dateStamp := "20130524"
+    signedAtEpoch := 1369353600
+    expiresSecs := 86400
+  }
+  let some signed := signSigV4Headers creds sigReq 1369353660
+    | do IO.eprintln "[lean-sys-core] FAIL: signSigV4Headers rejected valid vector"; return 1
+  let presignReq : AwsSigV4Request := { sigReq with headers := #[("Host", "examplebucket.s3.amazonaws.com")] }
+  let some presigned := presignS3Url creds "https://examplebucket.s3.amazonaws.com" presignReq 1369353660
+    | do IO.eprintln "[lean-sys-core] FAIL: presignS3Url rejected valid vector"; return 1
+  let dupHdrReq := { sigReq with headers := #[("Host", "examplebucket.s3.amazonaws.com"), ("X-Dup", "z"), ("x-dup", "a")] }
+  let some dupSigned := signSigV4Headers creds dupHdrReq 1369353660
+    | do IO.eprintln "[lean-sys-core] FAIL: signSigV4Headers duplicate header fold"; return 1
+  let some dupPresigned := presignS3Url creds "https://examplebucket.s3.amazonaws.com" dupHdrReq 1369353660
+    | do IO.eprintln "[lean-sys-core] FAIL: presignS3Url duplicate header fold"; return 1
+  if signed.signatureHex != "f0e8bdb87c964420e857bd35b5d6ed310bd44f0170aba48dd91039c6036bdb41" ||
+     presigned.signatureHex != "aeeed9bbccd4d02ee5c0109b86d86835f995330da4c265957d157751f604d404" ||
+     presigned.presignedUrl?.isNone ||
+     (dupSigned.canonicalRequest.splitOn "x-dup:z,a\n").length != 2 ||
+     dupPresigned.signedHeaders != "host;x-dup" ||
+     (signSigV4Headers creds { sigReq with headers := #[("Host", "bad\r\ninject")] } 1369353660).isSome ||
+     (signSigV4Headers creds sigReq 1369440001).isSome then
+    IO.eprintln s!"[lean-sys-core] FAIL: SigV4 verification failed: sig={signed.signatureHex}, presig={presigned.signatureHex}"
+    return 1
+
+  -- 4. P0.2 + P1.7: 256-bit streaming CAS + CoW Reflink materialization (`0644` writable target, `0444` CAS untouched)
+  let casRoot := s!"{testDir}/wave1-store"
+  let .ok sh ← openStore casRoot
+    | do IO.eprintln "[lean-sys-core] FAIL: openStore wave1"; return 1
+  let srcBlobPath := s!"{testDir}/large-src.bin"
+  let chunkA := ByteArray.mk (Array.replicate 8192 (0x5A : UInt8))
+  let .ok _ ← withFd srcBlobPath 4 (fun fd => writeAll fd chunkA true)
+    | do IO.eprintln "[lean-sys-core] FAIL: write large-src.bin"; return 1
+  let .ok key256 ← casPutFile256 sh srcBlobPath .sha256 4096
+    | do IO.eprintln "[lean-sys-core] FAIL: casPutFile256"; return 1
+  let .ok got256 ← casGet256 sh key256
+    | do IO.eprintln "[lean-sys-core] FAIL: casGet256"; return 1
+  if got256 != chunkA || !key256.startsWith "sha256:" then
+    IO.eprintln "[lean-sys-core] FAIL: casGet256 mismatch"
+    return 1
+  -- Regression: custom `.keyed256 tag` encodes `tag` into the returned key (`"blake256-<8hex>:<64hex>"`) and round-trips cleanly!
+  let .ok keyedKey ← casPut256 sh (ByteSource.ofByteSlice (ByteSlice.ofByteArray chunkA)) (.keyed256 0xCAFEBABE)
+    | do IO.eprintln "[lean-sys-core] FAIL: casPut256 custom keyed256"; return 1
+  let .ok gotKeyed ← casGet256 sh keyedKey
+    | do IO.eprintln "[lean-sys-core] FAIL: casGet256 custom keyed256"; return 1
+  let keyedMatTarget := s!"{testDir}/materialized-keyed.bin"
+  let .ok _ ← casMaterializeReflink sh keyedKey keyedMatTarget true
+    | do IO.eprintln "[lean-sys-core] FAIL: casMaterializeReflink custom keyed256"; return 1
+  if gotKeyed != chunkA || !keyedKey.startsWith "blake256-cafebabe:" then
+    IO.eprintln s!"[lean-sys-core] FAIL: custom keyed256 roundtrip mismatch: {keyedKey}"
+    return 1
+  -- Regression: wrong prefix (`blake256-deadbeef:` on a `0xCAFEBABE` object) MUST fail closed!
+  match ← casGet256 sh ("blake256-deadbeef:" ++ ((keyedKey.drop 18).toString)) with
+  | .error .einval => pure ()
+  | _ =>
+    IO.eprintln "[lean-sys-core] FAIL: casGet256 accepted wrong keyed256 domain tag!"
+    return 1
+  let matTarget := s!"{testDir}/materialized-writable.bin"
+  match ← casMaterializeReflink sh key256 matTarget true with
+  | .error e =>
+    IO.eprintln s!"[lean-sys-core] FAIL: casMaterializeReflink {repr e}"
+    return 1
+  | .ok _ =>
+    -- Mutate materialized file (`0644` writable) and verify immutable CAS blob still passes `casGet256`!
+    let .ok _ ← withFd matTarget 1 (fun fd => writeAll fd ("MUTATED".toUTF8) true)
+      | do IO.eprintln "[lean-sys-core] FAIL: materialized file was not writable!"; return 1
+    let .ok stillClean ← casGet256 sh key256
+      | do IO.eprintln "[lean-sys-core] FAIL: mutating materialized target corrupted 0444 CAS blob!"; return 1
+    if stillClean != chunkA then
+      IO.eprintln "[lean-sys-core] FAIL: CAS immutability violated after target mutation"
+      return 1
+
+  -- Regression: `preadByteArray` with reserved high-tag offset (`>= 1 <<< 62`) must fail closed with `#[]` (never pointer deref!)
+  let .ok hiTagRead ← withFd srcBlobPath 0 fun rfd => do pure (.ok (← preadByteArray rfd (0x4000000000000001 : UInt64) 4))
+    | do IO.eprintln "[lean-sys-core] FAIL: open srcBlobPath for hiTagRead"; return 1
+  if !hiTagRead.isEmpty then
+    IO.eprintln "[lean-sys-core] FAIL: preadByteArray allowed reserved pointer-tag offset"
+    return 1
+  -- Regression: `mmapMapShared` on empty/short file (`len > st_size`) must reject with `.error .einval` (no SIGBUS!)
+  let shortMmap ← withFd srcBlobPath 0 fun rfd => mmapMapShared rfd 65536 0 true
+  match shortMmap with
+  | .ok badReg =>
+    discard <| mmapUnmap badReg
+    IO.eprintln "[lean-sys-core] FAIL: mmapMapShared allowed mapping past regular file EOF"
+    return 1
+  | .error _ => pure ()
+
+  -- 5. P3.11 + P2.9: Persistent `MmapArena` (`0` syscalls per push/pop) + zero-copy `BorrowedSlice` across Hash/Codec/JsonRpc/Http/Auth
+  let arenaPath := s!"{testDir}/wave1.arena"
+  let .ok arena ← MmapArena.create arenaPath 4096 7
+    | do IO.eprintln "[lean-sys-core] FAIL: MmapArena.create"; return 1
+  let rpcWire := "{\"jsonrpc\":\"2.0\",\"id\":42,\"method\":\"ping\",\"params\":{\"n\":99}}"
+  let .ok pushed ← MmapArena.push arena (ByteSlice.ofString rpcWire)
+    | do IO.eprintln "[lean-sys-core] FAIL: MmapArena.push"; return 1
+  let .ok arena2 ← MmapArena.attach arenaPath 7
+    | do IO.eprintln "[lean-sys-core] FAIL: MmapArena.attach"; return 1
+  let .ok (some popped) ← MmapArena.pop? arena2 7
+    | do IO.eprintln "[lean-sys-core] FAIL: MmapArena.pop?"; return 1
+  if !pushed || popped != rpcWire.toUTF8 then
+    IO.eprintln "[lean-sys-core] FAIL: MmapArena roundtrip mismatch"
+    return 1
+
+  -- Scoped zero-copy `BorrowedSlice` directly over mapped `MmapRegion` memory (`0` ByteArray copies, pure `ViewSafeRet` lifetime + pin lock)
+  let rawHttpBytes := s!"POST /v1/rpc HTTP/1.1\r\nHost: unix\r\nContent-Length: {rpcWire.utf8ByteSize}\r\n\r\n{rpcWire}".toUTF8
+  let viewRegionPath := s!"{testDir}/wave1-view.region"
+  let .ok viewReg ← withFd viewRegionPath 4 fun vfd => do
+    let .ok _ ← ftruncateFd vfd 4096 | return .error .eio
+    mmapMapShared vfd 4096 0 false
+    | do IO.eprintln "[lean-sys-core] FAIL: mmapMapShared viewReg"; return 1
+  let _ ← mmapRegionWrite viewReg 512 rawHttpBytes
+  -- Regression: attempting `mmapUnmap` while `withPinnedAddr` holds an active pin MUST fail closed with `.error .einval`!
+  let pinBlocksUnmap ← viewReg.withPinnedAddr false 512 rawHttpBytes.size fun _ => do
+    match ← mmapUnmap viewReg with
+    | .ok () => pure (.error .eio)
+    | .error .einval => pure (.ok true)
+    | .error e => pure (.error e)
+  let viewOk ← viewReg.withView 512 rawHttpBytes.size fun bView =>
+    let bSrc := ByteSource.ofBorrowed bView
+    let sliceRef := ByteSlice.ofByteArray rawHttpBytes
+    if xxh64Borrowed bView != xxh64Slice sliceRef ||
+       sha256Source bSrc != sha256Bytes rawHttpBytes ||
+       !ctEqSource bSrc (ByteSource.ofByteSlice sliceRef) then
+      false
+    else
+      match parseRequestSourcePrefix bSrc none false with
+      | .error _ => false
+      | .ok (breq, _) =>
+        match parseRequestSource? breq.bodySource with
+        | none => false
+        | some parsedRpc =>
+          match parsedRpc.paramsTape with
+          | none => false
+          | some pt => parsedRpc.method == "ping" && BorrowedJsonTape.lookupNat? pt "n" == some 99
+  match pinBlocksUnmap, viewOk with
+  | .ok true, .ok true => pure ()
+  | _, _ =>
+    IO.eprintln "[lean-sys-core] FAIL: scoped MmapRegion.withView zero-copy verification failed"
+    return 1
+  discard <| mmapUnmap viewReg
+  discard <| MmapArena.close arena2
+  discard <| MmapArena.close arena
+  -- Regression: accessing `withView`, `withPayloadView`, or `MmapArena.pop?` after close/unmap fails closed with `.error .einval`!
+  match ← viewReg.withView 0 16 (fun v => v.getByteD 0), ← MmapArena.withPayloadView arena (fun v => v.getByteD 0), ← MmapArena.pop? arena 7 with
+  | .error .einval, .error .einval, .error .einval => pure ()
+  | _, _, _ =>
+    IO.eprintln "[lean-sys-core] FAIL: MmapArena/MmapRegion allowed use-after-close!"
+    return 1
+
+  -- 6. P3.11: Linux `io_uring` SQ/CQ shared-memory ring (`NOP` + `WRITE` + `READ` roundtrip on Linux)
+  match ← IoUring.setup 8 with
+  | .error .enosys | .error .eperm | .error .eopnotsupp => pure ()
+  | .error e =>
+    IO.eprintln s!"[lean-sys-core] FAIL: IoUring.setup unexpected error {repr e}"
+    return 1
+  | .ok ring =>
+    let nopRes ← IoUring.submitNop ring 0x12345678
+    -- Regression: enqueue sibling SQE `0x1111` (`ticket1`), then `submitNop` `0x2222`; `0x1111` completes ahead of `0x2222`
+    -- and MUST be preserved in `pendingCqes` rather than dropped when `0x2222` drains CQ!
+    let .ok ticket1 ← IoUring.enqueueNop ring 0x1111
+      | do IO.eprintln "[lean-sys-core] FAIL: IoUring.enqueueNop ticket1"; return 1
+    let oooSecond ← IoUring.submitNop ring 0x2222
+    let oooFirst ← IoUring.waitSubmittedCqe ring ticket1
+    let urFile := s!"{testDir}/uring-io.bin"
+    let urData := "io_uring_verified_payload_64b!".toUTF8
+    let ioOk ← withFd urFile 4 fun ufd => do
+      let .ok _ ← ftruncateFd ufd 4096 | return .error .eio
+      let .ok bufReg ← mmapMapShared ufd 4096 0 false | return .error .eio
+      let _ ← mmapRegionWrite bufReg 256 urData
+      -- Regression: colliding caller `userData = 0xAA02` across `enqueueNop` and `submitReadToRegion` MUST NOT cross-match CQEs,
+      -- and concurrent multi-thread `submitNop` / `waitSubmittedCqe` waiters MUST NOT lose wakeups across `pendingCqes` stashing!
+      let .ok collTicket ← IoUring.enqueueNop ring 0xAA02 | return .error .eio
+      let wRes ← IoUring.submitWriteFromRegion ring ufd 0 bufReg 256 urData.size 0xAA01
+      let rRes ← IoUring.submitReadToRegion ring ufd 0 bufReg 1024 urData.size 0xAA02
+      let collRes ← IoUring.waitSubmittedCqe ring collTicket
+      let concTaskA ← IO.asTask (prio := .dedicated) do
+        let mut ok := true
+        for k in [0:16] do
+          match ← IoUring.submitNop ring (0xBB00 + k.toUInt64) with
+          | .ok c => if c.userData != 0xBB00 + k.toUInt64 || c.res != 0 then ok := false
+          | .error _ => ok := false
+        return ok
+      let concTaskB ← IO.asTask (prio := .dedicated) do
+        let mut ok := true
+        for k in [0:16] do
+          match ← IoUring.submitNop ring (0xCC00 + k.toUInt64) with
+          | .ok c => if c.userData != 0xCC00 + k.toUInt64 || c.res != 0 then ok := false
+          | .error _ => ok := false
+        return ok
+      let concOk := (← IO.wait concTaskA).toOption == some true && (← IO.wait concTaskB).toOption == some true
+      let readBack ← mmapRegionRead bufReg 1024 urData.size
+      discard <| mmapUnmap bufReg
+      match wRes, rRes, collRes with
+      | .ok wcqe, .ok rcqe, .ok ccqe =>
+        if wcqe.userData == 0xAA01 && wcqe.res == urData.size.toInt32 &&
+           rcqe.userData == 0xAA02 && rcqe.res == urData.size.toInt32 &&
+           ccqe.userData == 0xAA02 && ccqe.res == 0 && concOk &&
+           readBack == urData then
+          return .ok ()
+        else
+          return .error .eio
+      | _, _, _ => return .error .eio
+    discard <| IoUring.close ring
+    -- Also verify `verifyIoUringRing` accepts `UInt32` modular wraparound (`sqHead = 0xFFFFFFFE, sqTail = 2`)
+    if verifyIoUringRing 0xFFFFFFFE 2 8 7 4 != 1 || verifyIoUringRing 5 2 8 7 1 != 0 then
+      IO.eprintln "[lean-sys-core] FAIL: verifyIoUringRing modular wraparound mismatch"
+      return 1
+    match nopRes, oooSecond, oooFirst, ioOk with
+    | .ok cqe, .ok c2, .ok c1, .ok () =>
+      if cqe.userData != 0x12345678 || cqe.res != 0 || c2.userData != 0x2222 || c1.userData != 0x1111 then
+        IO.eprintln "[lean-sys-core] FAIL: IoUring NOP / out-of-order CQE mismatch"
+        return 1
+    | _, _, _, _ =>
+      IO.eprintln "[lean-sys-core] FAIL: IoUring NOP/READ/WRITE failed"
+      return 1
+
+  -- 7. P0.3 + P1.6: `AF_UNIX` HTTP/1.1 + Non-Blocking Multi-FD `runMultiplexedReactor` (slow stalled client + fast sibling + subprocess reap)
+  -- Regression: `unixListen` MUST NOT unlink existing files or hijack active listeners (`EADDRINUSE`)!
+  let guardRegFile := s!"/tmp/lsys-guard-{← IO.monoNanosNow}.reg"
+  let _ ← withFd guardRegFile 4 (fun fd => writeAll fd "keep".toUTF8 false)
+  match ← unixListen guardRegFile 4 with
+  | .ok badFd =>
+    discard <| closeFd badFd
+    IO.eprintln "[lean-sys-core] FAIL: unixListen clobbered existing regular file!"
+    return 1
+  | .error _ =>
+    if !(← (System.FilePath.mk guardRegFile).pathExists) then
+      IO.eprintln "[lean-sys-core] FAIL: unixListen unlinked existing regular file!"
+      return 1
+    discard <| unlinkFile guardRegFile
+  let sockPath := s!"/tmp/lsys-{← IO.monoNanosNow}.sock"
+  let .ok uxListen ← unixListen sockPath 16
+    | do IO.eprintln "[lean-sys-core] FAIL: unixListen"; return 1
+  match ← unixListen sockPath 4 with
+  | .ok dupFd =>
+    discard <| closeFd dupFd
+    IO.eprintln "[lean-sys-core] FAIL: second unixListen hijacked active socket!"
+    return 1
+  | .error _ => pure ()
+  let .ok bgChild ← spawnProcessGroup "/bin/sh" #["-c", "exit 0"]
+    | do IO.eprintln "[lean-sys-core] FAIL: spawnProcessGroup for reactor"; return 1
+  let muxCfg : ReactorConfig := { maxConns := 16, maxKeepAliveReq := 8, maxIdleMs := 2500 }
+  let bigBodyStr := String.ofList (List.replicate 300000 'X')
+  let muxServer ← IO.asTask (prio := .dedicated) do
+    runMultiplexedReactor muxCfg uxListen 3
+      (fun req =>
+        if req.path == "/big" then
+          pure (HttpResponse.json 200 bigBodyStr)
+        else
+          pure (HttpResponse.json 200 s!"\{\"ok\":true,\"unix_path\":\"{req.path}\"}"))
+      #[bgChild] 3000
+  -- Open a slow/stalled client sending only partial headers so single-FD blocking servers would wedge!
+  let .ok slowClient ← unixConnect sockPath
+    | do IO.eprintln "[lean-sys-core] FAIL: unixConnect slow"; return 1
+  discard <| writeAll slowClient ("GET /slow HTTP/1.1\r\nHost: local".toUTF8) false
+  -- While `slowClient` sits mid-header, `requestUnix` on sibling connections (including 300 KB backpressure payload) must complete intact!
+  let uxRes1 ← requestUnix sockPath "GET" "/fast-1" (ByteSlice.ofString "") none 2000
+  let uxRes2 ← requestUnix sockPath "POST" "/fast-2" (ByteSlice.ofString "{}") none 2000
+  let uxBig  ← requestUnix sockPath "GET" "/big" (ByteSlice.ofString "") none 2500
+  discard <| closeFd slowClient
+  let muxOut ← IO.wait muxServer
+  discard <| closeFd uxListen
+  discard <| unlinkFile sockPath
+  match uxRes1, uxRes2, uxBig, muxOut with
+  | .ok b1, .ok b2, .ok bBig, .ok (reqsDone, reaped) =>
+    if reqsDone < 3 || reaped.size != 1 || bBig != bigBodyStr ||
+       (b1.splitOn "fast-1").length ≤ 1 || (b2.splitOn "fast-2").length ≤ 1 then
+      IO.eprintln s!"[lean-sys-core] FAIL: AF_UNIX / multiplexed reactor mismatch: reqs={reqsDone}, reaped={reaped.size}, bigLen={bBig.utf8ByteSize}"
+      return 1
+  | _, _, _, _ =>
+    IO.eprintln "[lean-sys-core] FAIL: AF_UNIX / multiplexed reactor IO failure"
+    return 1
+
+  -- 8. P0.4: Linux `cgroup v2` live metric reader + pre-`execve` child `cgroup.procs` placement + fail-closed check
+  match ← resolveSelfCgroupV2Dir with
+  | .error .enoent | .error .eopnotsupp => pure ()
+  | .error e =>
+    IO.eprintln s!"[lean-sys-core] FAIL: resolveSelfCgroupV2Dir {repr e}"
+    return 1
+  | .ok selfCg =>
+    match ← readCgroupV2Metrics selfCg with
+    | .error .enoent => pure ()
+    | .error e =>
+      IO.eprintln s!"[lean-sys-core] FAIL: readCgroupV2Metrics {repr e}"
+      return 1
+    | .ok m =>
+      if verifyCgroupV2Budget m.memoryCurrentBytes (m.memoryCurrentBytes + 1048576) 0 1 != 1 then
+        IO.eprintln "[lean-sys-core] FAIL: verifyCgroupV2Budget live metrics"
+        return 1
+  -- Synthetic writable cgroup dir verifies pre-execve child `cgroup.procs` write + live metric budget enforcement,
+  -- and unwritable/missing cgroup dir verifies fail-closed `.error .eacces` (exit 126 before `execve`).
+  let fakeCg := s!"{testDir}/fake-cg"
+  IO.FS.createDirAll fakeCg
+  let _ ← withFd s!"{fakeCg}/cgroup.procs" 4 (fun fd => writeAll fd ByteArray.empty false)
+  let _ ← withFd s!"{fakeCg}/memory.current" 4 (fun fd => writeAll fd "2097152\n".toUTF8 false)
+  let _ ← withFd s!"{fakeCg}/memory.events" 4 (fun fd => writeAll fd "low 0\nhigh 0\nmax 0\noom 0\noom_kill 0\n".toUTF8 false)
+  match ← runCgroupV2Group { maxRssBytes := 16777216, timeoutMs := 2000 } fakeCg "/bin/sh" #["-c", "exit 0"] with
+  | .error e =>
+    IO.eprintln s!"[lean-sys-core] FAIL: runCgroupV2Group writable {repr e}"
+    return 1
+  | .ok (sres, some m) =>
+    if sres.exitCode != 0 || m.memoryCurrentBytes != 2097152 || m.oomKillCount != 0 then
+      IO.eprintln "[lean-sys-core] FAIL: runCgroupV2Group result mismatch"
+      return 1
+  | .ok (_, none) =>
+    IO.eprintln "[lean-sys-core] FAIL: runCgroupV2Group missing metrics"
+    return 1
+  -- Regression: missing `cgroupDir` fails closed immediately (`.error .enoent`), and unwritable `cgroup.procs`
+  -- with valid metrics fails closed via child pre-`execve` exit 126 (`.error .eacces`)!
+  match ← runCgroupV2Group { maxRssBytes := 16777216, timeoutMs := 2000 } s!"{testDir}/missing-cg-dir" "/bin/sh" #["-c", "exit 0"] with
+  | .error .enoent | .error .eacces => pure ()
+  | other =>
+    IO.eprintln s!"[lean-sys-core] FAIL: runCgroupV2Group did not fail closed on missing cgroupDir: {repr other}"
+    return 1
+  let roCg := s!"{testDir}/ro-cg"
+  -- Create `roCg/cgroup.procs` as a directory (`EISDIR` even under `root` / `CAP_DAC_OVERRIDE`!) so pre-`execve` `open(..., O_WRONLY)` deterministically fails closed (child exits 126 -> `.error .eacces`).
+  IO.FS.createDirAll s!"{roCg}/cgroup.procs"
+  let _ ← withFd s!"{roCg}/memory.current" 4 (fun fd => writeAll fd "1024\n".toUTF8 false)
+  let _ ← withFd s!"{roCg}/memory.events" 4 (fun fd => writeAll fd "oom 0\noom_kill 0\n".toUTF8 false)
+  match ← runCgroupV2Group { maxRssBytes := 16777216, timeoutMs := 2000 } roCg "/bin/sh" #["-c", "exit 0"] with
+  | .error .eacces => pure ()
+  | other =>
+    IO.eprintln s!"[lean-sys-core] FAIL: runCgroupV2Group did not fail closed on unwritable cgroup.procs: {repr other}"
+    return 1
+
+  return 0
+
 def selfTestHttpHardening : IO UInt32 := do
   let hdrCase (hdrs : String) : ByteArray := s!"GET /v1/h HTTP/1.1\r\nHost: localhost\r\n{hdrs}\r\n".toUTF8
   let errOf (r : Except String HttpRequest) : String := match r with | .error e => e | .ok _ => "accepted"
@@ -90,7 +457,7 @@ def selfTestMmapBounds (testDir : String) : IO UInt32 := do
       let rdIn ← mmapReadShared fd 28 4
       let rdPast ← mmapReadShared fd 30 4
       let rdTagWrap ← mmapReadShared fd (1 <<< 62) 4
-      let rdRawWrap ← rawPreadBa fd.raw (((2 : UInt64) <<< 62) ||| 0x3FFFFFFFFFFFFFFE) 4
+      let rdRawWrap ← mmapReadShared fd 0x3FFFFFFFFFFFFFFE 4
       let ok := match inRange, pastEnd, farOff, wrapWrite, oobEmpty with
         | .ok 4, .error .einval, .error .einval, .error .einval, .error .einval =>
           rdIn == "abcd".toUTF8 && rdPast.isEmpty && rdTagWrap.isEmpty && rdRawWrap.isEmpty
@@ -714,7 +1081,10 @@ def runSelfTest : IO UInt32 := do
   let prematureEofRes ← httpClientRequest "127.0.0.1" slowPort "GET" "/partial-eof" (ByteSlice.ofString "") none 500
   discard <| IO.wait slowServerTask
   discard <| closeFd slowListenFd
+  let w1Rc ← selfTestWave1Features testDir
   IO.FS.removeDirAll pTest
+  if w1Rc != 0 then
+    return w1Rc
 
   match emptyTimeoutRes, partialTimeoutRes, prematureEofRes with
   | .error .eagain, .error .eagain, .error .eio => pure ()
@@ -735,7 +1105,7 @@ def runSelfTest : IO UInt32 := do
       IO.eprintln s!"[lean-sys-core] FAIL: unexpected HTTP/pipelined response (served={servedCount}): {respBody} / {pipeRespStr}"
       return 1
 
-  IO.println s!"\{ \"ok\": true, \"binary\": \"lean-sys-core\", \"c_abi_gates\": 33, \"fd_32bit_high\": true, \"hmac_sha256_rfc4231\": true, \"par_scheduler\": true, \"wal_torn_recovery\": true, \"wal_68mib_streaming\": true, \"cas_immutable\": true, \"sst_bloom\": true, \"table_range_scan\": true, \"auth_rotation\": true, \"proc_log\": true, \"proc_stat_scanner\": true, \"jsonrpc_2_0\": true, \"shm_ring_mmap\": true, \"mmap_seqlock\": true, \"jsonl_tape\": true, \"reactor_keepalive\": true, \"sandbox_landlock\": true, \"pgid_reaper\": true, \"http_loopback_port\": {boundPort} }"
+  IO.println s!"\{ \"ok\": true, \"binary\": \"lean-sys-core\", \"c_abi_gates\": 40, \"wave1_verified\": true, \"fd_32bit_high\": true, \"hmac_sha256_rfc4231\": true, \"par_scheduler\": true, \"wal_torn_recovery\": true, \"wal_68mib_streaming\": true, \"cas_immutable\": true, \"sst_bloom\": true, \"table_range_scan\": true, \"auth_rotation\": true, \"proc_log\": true, \"proc_stat_scanner\": true, \"jsonrpc_2_0\": true, \"shm_ring_mmap\": true, \"mmap_seqlock\": true, \"jsonl_tape\": true, \"reactor_keepalive\": true, \"sandbox_landlock\": true, \"pgid_reaper\": true, \"http_loopback_port\": {boundPort} }"
   return 0
 
 /-- Run deterministic micro-benchmarks for `lean-sys-core bench` and emit JSON metrics. -/
@@ -806,7 +1176,7 @@ def main (args : List String) : IO UInt32 := do
   | ["bench"] | ["--bench"] => LeanSys.Core.runBench 4000
   | ["bench", nStr] | ["--bench", nStr] => LeanSys.Core.runBench (nStr.toNat?.getD 4000)
   | ["--c-abi"] =>
-    IO.println "{\"ok\":true,\"exports\":[\"leansys_verify_slice_bounds\",\"leansys_verify_wal_frame\",\"leansys_verify_cas_digest\",\"leansys_check_http_bounds\",\"leansys_verify_jsonl_tape\",\"leansys_verify_ring_cursor\",\"leansys_verify_sst_block\",\"leansys_verify_poll_interest\",\"leansys_verify_rlimit_budget\",\"leansys_mix64_word\",\"leansys_verify_composite_key_order\",\"leansys_verify_token_auth\",\"leansys_verify_log_window\",\"leansys_verify_jsonrpc_frame\",\"leansys_gate_admit\",\"leansys_verify_mmap_seqlock\",\"leansys_verify_proc_stat_fields\",\"leansys_sse_frame_scan\",\"leansys_gfm_pipe_scan\",\"leansys_tag_scan\",\"leansys_transcript_index\",\"leansys_verify_par_chunk\",\"leansys_verify_arena_disjoint\",\"leansys_verify_snapshot_visibility\",\"leansys_verify_http_route_match\",\"leansys_verify_counterexample_triage\",\"leansys_verify_dag_wave_step\",\"leansys_verify_ios_jetsam_budget\",\"leansys_verify_worker_budget\",\"leansys_verify_page_aligned_buffer\",\"leansys_select_isa\",\"leansys_verify_isa_selection\",\"leansys_verify_fd_bounds\"]}"
+    IO.println "{\"ok\":true,\"exports\":[\"leansys_verify_slice_bounds\",\"leansys_verify_wal_frame\",\"leansys_verify_cas_digest\",\"leansys_check_http_bounds\",\"leansys_verify_jsonl_tape\",\"leansys_verify_ring_cursor\",\"leansys_verify_sst_block\",\"leansys_verify_poll_interest\",\"leansys_verify_rlimit_budget\",\"leansys_mix64_word\",\"leansys_verify_composite_key_order\",\"leansys_verify_token_auth\",\"leansys_verify_log_window\",\"leansys_verify_jsonrpc_frame\",\"leansys_gate_admit\",\"leansys_verify_mmap_seqlock\",\"leansys_verify_proc_stat_fields\",\"leansys_sse_frame_scan\",\"leansys_gfm_pipe_scan\",\"leansys_tag_scan\",\"leansys_transcript_index\",\"leansys_verify_par_chunk\",\"leansys_verify_arena_disjoint\",\"leansys_verify_snapshot_visibility\",\"leansys_verify_http_route_match\",\"leansys_verify_counterexample_triage\",\"leansys_verify_dag_wave_step\",\"leansys_verify_ios_jetsam_budget\",\"leansys_verify_worker_budget\",\"leansys_verify_page_aligned_buffer\",\"leansys_select_isa\",\"leansys_verify_isa_selection\",\"leansys_verify_fd_bounds\",\"leansys_verify_unix_path_bounds\",\"leansys_verify_cas_digest256\",\"leansys_verify_sigv4_envelope\",\"leansys_verify_cgroup_v2_budget\",\"leansys_verify_io_uring_ring\",\"leansys_verify_borrowed_view\",\"leansys_verify_step_reactor\"]}"
     return 0
   | _ =>
     IO.println "usage: lean-sys-core [self-test | bench | --c-abi]"

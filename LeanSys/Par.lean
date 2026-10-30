@@ -42,6 +42,12 @@ structure IsaLevel where
   sme2       : Bool    := false
   lse        : Bool    := false
   sha3       : Bool    := false
+  avx2       : Bool    := false
+  avx512f    : Bool    := false
+  avx512bwVl : Bool    := false
+  shaNi      : Bool    := false
+  vpclmulqdq : Bool    := false
+  avx512Full : Bool    := false
   deriving Repr, DecidableEq, Inhabited
 
 namespace IsaLevel
@@ -52,7 +58,9 @@ def le (a b : IsaLevel) : Bool :=
   (!a.neon || b.neon) && (!a.fp16 || b.fp16) && (!a.dotprod || b.dotprod) &&
   (!a.i8mm || b.i8mm) && (!a.bf16 || b.bf16) && (!a.sve2 || b.sve2) &&
   (!a.sveBitperm || b.sveBitperm) && (!a.sme2 || b.sme2) &&
-  (!a.lse || b.lse) && (!a.sha3 || b.sha3)
+  (!a.lse || b.lse) && (!a.sha3 || b.sha3) &&
+  (!a.avx2 || b.avx2) && (!a.avx512f || b.avx512f) && (!a.avx512bwVl || b.avx512bwVl) &&
+  (!a.shaNi || b.shaNi) && (!a.vpclmulqdq || b.vpclmulqdq) && (!a.avx512Full || b.avx512Full)
 
 /-- Greatest lower bound (intersection of capabilities) in the `IsaLevel` lattice. -/
 def meet (a b : IsaLevel) : IsaLevel where
@@ -67,6 +75,12 @@ def meet (a b : IsaLevel) : IsaLevel where
   sme2       := a.sme2 && b.sme2
   lse        := a.lse && b.lse
   sha3       := a.sha3 && b.sha3
+  avx2       := a.avx2 && b.avx2
+  avx512f    := a.avx512f && b.avx512f
+  avx512bwVl := a.avx512bwVl && b.avx512bwVl
+  shaNi      := a.shaNi && b.shaNi
+  vpclmulqdq := a.vpclmulqdq && b.vpclmulqdq
+  avx512Full := a.avx512Full && b.avx512Full
 
 /-- Least upper bound (union of capabilities) in the `IsaLevel` lattice. -/
 def join (a b : IsaLevel) : IsaLevel where
@@ -81,6 +95,12 @@ def join (a b : IsaLevel) : IsaLevel where
   sme2       := a.sme2 || b.sme2
   lse        := a.lse || b.lse
   sha3       := a.sha3 || b.sha3
+  avx2       := a.avx2 || b.avx2
+  avx512f    := a.avx512f || b.avx512f
+  avx512bwVl := a.avx512bwVl || b.avx512bwVl
+  shaNi      := a.shaNi || b.shaNi
+  vpclmulqdq := a.vpclmulqdq || b.vpclmulqdq
+  avx512Full := a.avx512Full || b.avx512Full
 
 /-- Architectural well-formedness invariant (`sveBitperm → sve2`, `sve2 → base ≥ v9_0`, `sme2 → base ≥ v9_2`). -/
 def wellFormed (a : IsaLevel) : Bool :=
@@ -99,7 +119,13 @@ def hwcapMask (a : IsaLevel) : UInt64 :=
   (if a.sveBitperm then (1 : UInt64) <<< 6 else 0) |||
   (if a.sme2       then (1 : UInt64) <<< 7 else 0) |||
   (if a.lse        then (1 : UInt64) <<< 8 else 0) |||
-  (if a.sha3       then (1 : UInt64) <<< 9 else 0)
+  (if a.sha3       then (1 : UInt64) <<< 9 else 0) |||
+  (if a.avx2       then (1 : UInt64) <<< 10 else 0) |||
+  (if a.avx512f    then (1 : UInt64) <<< 11 else 0) |||
+  (if a.avx512bwVl then (1 : UInt64) <<< 12 else 0) |||
+  (if a.shaNi      then (1 : UInt64) <<< 13 else 0) |||
+  (if a.vpclmulqdq then (1 : UInt64) <<< 14 else 0) |||
+  (if a.avx512Full then (1 : UInt64) <<< 15 else 0)
 
 theorem bool_imp_self (x : Bool) : (!x || x) = true := by cases x <;> rfl
 theorem bool_and_imp_left (x y : Bool) : (!(x && y) || x) = true := by cases x <;> cases y <;> rfl
@@ -264,21 +290,44 @@ def appleM4_A18 : IsaLevel :=
   { base := .v9_2, neon := true, fp16 := true, dotprod := true, i8mm := true, bf16 := true,
     sme2 := true, lse := true, sha3 := true }
 
+/-- AMD Zen 4 x86_64 server preset (`AVX2` + `AVX-512F/BW/VL` + `SHA-NI` + `VPCLMULQDQ`, variant `5`). -/
+def x86Zen4 : IsaLevel :=
+  { neon := false, avx2 := true, avx512f := true, avx512bwVl := true, shaNi := true, vpclmulqdq := true }
+
+/-- AMD Zen 5 x86_64 server preset (full-width 512-bit `AVX-512` + `SHA-NI` + `VPCLMULQDQ`, variant `6`). -/
+def x86Zen5 : IsaLevel :=
+  { neon := false, avx2 := true, avx512f := true, avx512bwVl := true, shaNi := true, vpclmulqdq := true, avx512Full := true }
+
+/-- Construct an x86_64 `IsaLevel` from Linux `/proc/cpuinfo` feature flags (`avx2`, `avx512f`, `avx512bw`, `avx512vl`, `sha_ni`, `vpclmulqdq`, `zen5FullWidth`). -/
+def ofX86CpuFeatures (avx2 avx512f avx512bw avx512vl shaNi vpclmulqdq zen5FullWidth : Bool) : IsaLevel :=
+  let bwVl := avx512f && avx512bw && avx512vl
+  { neon := false,
+    avx2 := avx2,
+    avx512f := avx512f,
+    avx512bwVl := bwVl,
+    shaNi := shaNi,
+    vpclmulqdq := vpclmulqdq,
+    avx512Full := bwVl && zen5FullWidth }
+
 /-- All canonical `IsaLevel` presets satisfy `wellFormed`. -/
 theorem presets_wellFormed :
     arm64Baseline.wellFormed = true ∧
     appleA15.wellFormed = true ∧
     appleA16_A17.wellFormed = true ∧
     tensorG3.wellFormed = true ∧
-    appleM4_A18.wellFormed = true := by decide
+    appleM4_A18.wellFormed = true ∧
+    x86Zen4.wellFormed = true ∧
+    x86Zen5.wellFormed = true := by decide
 
-/-- All canonical `IsaLevel` preset bitmasks match `isaVariantRequiredMask 0..4`. -/
+/-- All canonical `IsaLevel` preset bitmasks match `isaVariantRequiredMask 0..6`. -/
 theorem preset_masks_match_table :
     arm64Baseline.hwcapMask = isaVariantRequiredMask 0 ∧
     appleA15.hwcapMask = isaVariantRequiredMask 1 ∧
     appleA16_A17.hwcapMask = isaVariantRequiredMask 2 ∧
     tensorG3.hwcapMask = isaVariantRequiredMask 3 ∧
-    appleM4_A18.hwcapMask = isaVariantRequiredMask 4 := by decide
+    appleM4_A18.hwcapMask = isaVariantRequiredMask 4 ∧
+    x86Zen4.hwcapMask = isaVariantRequiredMask 5 ∧
+    x86Zen5.hwcapMask = isaVariantRequiredMask 6 := by decide
 
 end IsaLevel
 

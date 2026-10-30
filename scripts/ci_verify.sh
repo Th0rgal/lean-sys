@@ -14,16 +14,20 @@ python3 scripts/sync_docs_inventory.py --check
 echo "[1/5] Building lean-sys (supportInterpreter := false, libleanrt.a only)..."
 lake build
 
-echo "[2/5] Running lean-sys-core self-test (33 C-ABI gates + WAL/CAS/SST/Table/Auth/ProcLog/JsonRpc/ShmRing/Codec/Reactor/Sandbox)..."
+echo "[2/5] Running lean-sys-core self-test (40 C-ABI gates + WAL/CAS/Reflink/SigV4/Unix/CgroupV2/IoUring/MmapArena/Codec/Reactor/Sandbox)..."
 ./.lake/build/bin/lean-sys-core self-test
 
 echo "[3/5] Running lean-sys-core bench..."
 ./.lake/build/bin/lean-sys-core bench
 
-echo "[4/5] Auditing LeanSys/Spec.lean and LeanSys/Hash.lean via turbo-lean (0 vacuous, 0 trivial, 0 sorryAx)..."
+echo "[4/5] Auditing LeanSys/Spec.lean, LeanSys/Hash.lean, and LeanSys/Gate.lean via turbo-lean (0 vacuous, 0 trivial, 0 sorryAx)..."
 if command -v turbo-lean >/dev/null 2>&1; then
-  turbo-lean --json audit-spec LeanSys/Spec.lean | python3 -c "import json,sys; d=json.load(sys.stdin); assert d['ok'] and d['vacuous_specs']==0 and d['trivial_specs']==0 and d['tight_specs']>=24 and not d.get('horizontal_packing_warnings'), d; print(f'Spec.lean: {d[\"tight_specs\"]}/{d[\"total_specs_audited\"]} non_vacuous_and_tight')"
+  turbo-lean --json audit-spec LeanSys/Spec.lean | python3 -c "import json,sys; d=json.load(sys.stdin); assert d['ok'] and d['vacuous_specs']==0 and d['trivial_specs']==0 and d['tight_specs']>=51 and not d.get('horizontal_packing_warnings'), d; print(f'Spec.lean: {d[\"tight_specs\"]}/{d[\"total_specs_audited\"]} non_vacuous_and_tight')"
   turbo-lean --json audit-spec LeanSys/Hash.lean | python3 -c "import json,sys; d=json.load(sys.stdin); assert d['ok'] and d['vacuous_specs']==0 and d['trivial_specs']==0 and d['tight_specs']>=2, d; print(f'Hash.lean: {d[\"tight_specs\"]}/{d[\"total_specs_audited\"]} non_vacuous_and_tight')"
+  turbo-lean --json audit-spec LeanSys/Gate.lean | python3 -c "import json,sys; d=json.load(sys.stdin); assert d['ok'] and d['vacuous_specs']==0 and d['trivial_specs']==0 and d['tight_specs']>=2, d; print(f'Gate.lean: {d[\"tight_specs\"]}/{d[\"total_specs_audited\"]} non_vacuous_and_tight')"
+elif [ "${GITHUB_ACTIONS:-}" = "true" ] || [ "${REQUIRE_TURBO_LEAN:-}" = "1" ]; then
+  echo "ERROR: turbo-lean is required in CI to audit 55/55 tight specs!" >&2
+  exit 1
 fi
 
 echo "[5/5] Verifying TCB symbol hygiene and C shim LOC cap..."
@@ -60,5 +64,6 @@ if [ -n "$DUP_EXPORTS" ]; then
   echo "ERROR: Duplicate C-ABI @[export] symbols found in LeanSys: $DUP_EXPORTS" >&2
   exit 1
 fi
-SPEC_TIGHT="$(turbo-lean --json audit-spec LeanSys/Spec.lean | python3 -c "import json,sys; print(json.load(sys.stdin)['tight_specs'])" 2>/dev/null || echo 43)"
-echo "[lean-sys] ALL 5 CI GATES PASSED (${SPEC_TIGHT}/${SPEC_TIGHT} Spec.lean tight specs, 33 C-ABI exports, c/lean_sys_shim.c=${SHIM_LOC} LOC, TCB_CLEAN)"
+SPEC_TIGHT="$(turbo-lean --json audit-spec LeanSys/Spec.lean | python3 -c "import json,sys; print(json.load(sys.stdin)['tight_specs'])" 2>/dev/null || python3 -c "import sys; sys.path.insert(0, 'scripts'); import sync_docs_inventory as s; print(s.compute_inventory()['leansys_spec_tight'])")"
+CABI_COUNT="$(grep -rhoE 'export[[:space:]]+leansys_[A-Za-z0-9_]+' LeanSys/Spec.lean | wc -l | tr -d ' ')"
+echo "[lean-sys] ALL 5 CI GATES PASSED (${SPEC_TIGHT}/${SPEC_TIGHT} Spec.lean tight specs, ${CABI_COUNT} C-ABI exports, c/lean_sys_shim.c=${SHIM_LOC} LOC, TCB_CLEAN)"
