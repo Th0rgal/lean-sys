@@ -36,7 +36,7 @@ def compute_inventory() -> Dict[str, str]:
     spec_tight = len(spec_thms)
     hash_tight = len(hash_thms)
     gate_tight = len(gate_thms)
-    total_tight = spec_tight + hash_tight
+    total_tight = spec_tight + hash_tight + gate_tight
     cabi_exports = len(re.findall(r"@\[inline,\s*export\s+[A-Za-z0-9_]+\]", spec_text))
     shim_loc = sum(1 for _ in SHIM_PATH.open("r", encoding="utf-8"))
     return {

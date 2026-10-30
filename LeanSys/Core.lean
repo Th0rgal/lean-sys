@@ -120,6 +120,23 @@ def selfTestWave1Features (testDir : String) : IO UInt32 := do
   if got256 != chunkA || !key256.startsWith "sha256:" then
     IO.eprintln "[lean-sys-core] FAIL: casGet256 mismatch"
     return 1
+  -- Regression: custom `.keyed256 tag` encodes `tag` into the returned key (`"blake256-<8hex>:<64hex>"`) and round-trips cleanly!
+  let .ok keyedKey ← casPut256 sh (ByteSource.ofByteSlice (ByteSlice.ofByteArray chunkA)) (.keyed256 0xCAFEBABE)
+    | do IO.eprintln "[lean-sys-core] FAIL: casPut256 custom keyed256"; return 1
+  let .ok gotKeyed ← casGet256 sh keyedKey
+    | do IO.eprintln "[lean-sys-core] FAIL: casGet256 custom keyed256"; return 1
+  let keyedMatTarget := s!"{testDir}/materialized-keyed.bin"
+  let .ok _ ← casMaterializeReflink sh keyedKey keyedMatTarget true
+    | do IO.eprintln "[lean-sys-core] FAIL: casMaterializeReflink custom keyed256"; return 1
+  if gotKeyed != chunkA || !keyedKey.startsWith "blake256-cafebabe:" then
+    IO.eprintln s!"[lean-sys-core] FAIL: custom keyed256 roundtrip mismatch: {keyedKey}"
+    return 1
+  -- Regression: wrong prefix (`blake256-deadbeef:` on a `0xCAFEBABE` object) MUST fail closed!
+  match ← casGet256 sh ("blake256-deadbeef:" ++ ((keyedKey.drop 18).toString)) with
+  | .error .einval => pure ()
+  | _ =>
+    IO.eprintln "[lean-sys-core] FAIL: casGet256 accepted wrong keyed256 domain tag!"
+    return 1
   let matTarget := s!"{testDir}/materialized-writable.bin"
   match ← casMaterializeReflink sh key256 matTarget true with
   | .error e =>
@@ -219,31 +236,40 @@ def selfTestWave1Features (testDir : String) : IO UInt32 := do
     return 1
   | .ok ring =>
     let nopRes ← IoUring.submitNop ring 0x12345678
-    -- Regression: enqueue sibling SQE `0x1111`, then `submitNop` `0x2222`; `0x1111` completes ahead of `0x2222`
+    -- Regression: enqueue sibling SQE `0x1111` (`ticket1`), then `submitNop` `0x2222`; `0x1111` completes ahead of `0x2222`
     -- and MUST be preserved in `pendingCqes` rather than dropped when `0x2222` drains CQ!
-    let _ ← IoUring.enqueueNop ring 0x1111
+    let .ok ticket1 ← IoUring.enqueueNop ring 0x1111
+      | do IO.eprintln "[lean-sys-core] FAIL: IoUring.enqueueNop ticket1"; return 1
     let oooSecond ← IoUring.submitNop ring 0x2222
-    let oooFirst ← IoUring.waitSubmittedCqe ring 0x1111
+    let oooFirst ← IoUring.waitSubmittedCqe ring ticket1
     let urFile := s!"{testDir}/uring-io.bin"
     let urData := "io_uring_verified_payload_64b!".toUTF8
     let ioOk ← withFd urFile 4 fun ufd => do
       let .ok _ ← ftruncateFd ufd 4096 | return .error .eio
       let .ok bufReg ← mmapMapShared ufd 4096 0 false | return .error .eio
       let _ ← mmapRegionWrite bufReg 256 urData
+      -- Regression: colliding caller `userData = 0xAA02` across `enqueueNop` and `submitReadToRegion` MUST NOT cross-match CQEs!
+      let .ok collTicket ← IoUring.enqueueNop ring 0xAA02 | return .error .eio
       let wRes ← IoUring.submitWriteFromRegion ring ufd 0 bufReg 256 urData.size 0xAA01
       let rRes ← IoUring.submitReadToRegion ring ufd 0 bufReg 1024 urData.size 0xAA02
+      let collRes ← IoUring.waitSubmittedCqe ring collTicket
       let readBack ← mmapRegionRead bufReg 1024 urData.size
       discard <| mmapUnmap bufReg
-      match wRes, rRes with
-      | .ok wcqe, .ok rcqe =>
+      match wRes, rRes, collRes with
+      | .ok wcqe, .ok rcqe, .ok ccqe =>
         if wcqe.userData == 0xAA01 && wcqe.res == urData.size.toInt32 &&
            rcqe.userData == 0xAA02 && rcqe.res == urData.size.toInt32 &&
+           ccqe.userData == 0xAA02 && ccqe.res == 0 &&
            readBack == urData then
           return .ok ()
         else
           return .error .eio
-      | _, _ => return .error .eio
+      | _, _, _ => return .error .eio
     discard <| IoUring.close ring
+    -- Also verify `verifyIoUringRing` accepts `UInt32` modular wraparound (`sqHead = 0xFFFFFFFE, sqTail = 2`)
+    if verifyIoUringRing 0xFFFFFFFE 2 8 7 4 != 1 || verifyIoUringRing 5 2 8 7 1 != 0 then
+      IO.eprintln "[lean-sys-core] FAIL: verifyIoUringRing modular wraparound mismatch"
+      return 1
     match nopRes, oooSecond, oooFirst, ioOk with
     | .ok cqe, .ok c2, .ok c1, .ok () =>
       if cqe.userData != 0x12345678 || cqe.res != 0 || c2.userData != 0x2222 || c1.userData != 0x1111 then
@@ -254,9 +280,28 @@ def selfTestWave1Features (testDir : String) : IO UInt32 := do
       return 1
 
   -- 7. P0.3 + P1.6: `AF_UNIX` HTTP/1.1 + Non-Blocking Multi-FD `runMultiplexedReactor` (slow stalled client + fast sibling + subprocess reap)
+  -- Regression: `unixListen` MUST NOT unlink existing files or hijack active listeners (`EADDRINUSE`)!
+  let guardRegFile := s!"/tmp/lsys-guard-{← IO.monoNanosNow}.reg"
+  let _ ← withFd guardRegFile 4 (fun fd => writeAll fd "keep".toUTF8 false)
+  match ← unixListen guardRegFile 4 with
+  | .ok badFd =>
+    discard <| closeFd badFd
+    IO.eprintln "[lean-sys-core] FAIL: unixListen clobbered existing regular file!"
+    return 1
+  | .error _ =>
+    if !(← (System.FilePath.mk guardRegFile).pathExists) then
+      IO.eprintln "[lean-sys-core] FAIL: unixListen unlinked existing regular file!"
+      return 1
+    discard <| unlinkFile guardRegFile
   let sockPath := s!"/tmp/lsys-{← IO.monoNanosNow}.sock"
   let .ok uxListen ← unixListen sockPath 16
     | do IO.eprintln "[lean-sys-core] FAIL: unixListen"; return 1
+  match ← unixListen sockPath 4 with
+  | .ok dupFd =>
+    discard <| closeFd dupFd
+    IO.eprintln "[lean-sys-core] FAIL: second unixListen hijacked active socket!"
+    return 1
+  | .error _ => pure ()
   let .ok bgChild ← spawnProcessGroup "/bin/sh" #["-c", "exit 0"]
     | do IO.eprintln "[lean-sys-core] FAIL: spawnProcessGroup for reactor"; return 1
   let muxCfg : ReactorConfig := { maxConns := 16, maxKeepAliveReq := 8, maxIdleMs := 2500 }
@@ -333,9 +378,8 @@ def selfTestWave1Features (testDir : String) : IO UInt32 := do
     IO.eprintln s!"[lean-sys-core] FAIL: runCgroupV2Group did not fail closed on missing cgroupDir: {repr other}"
     return 1
   let roCg := s!"{testDir}/ro-cg"
-  IO.FS.createDirAll roCg
-  let _ ← withFd s!"{roCg}/cgroup.procs" 4 (fun fd => writeAll fd ByteArray.empty false)
-  discard <| chmodReadOnly s!"{roCg}/cgroup.procs"
+  -- Create `roCg/cgroup.procs` as a directory (`EISDIR` even under `root` / `CAP_DAC_OVERRIDE`!) so pre-`execve` `open(..., O_WRONLY)` deterministically fails closed (child exits 126 -> `.error .eacces`).
+  IO.FS.createDirAll s!"{roCg}/cgroup.procs"
   let _ ← withFd s!"{roCg}/memory.current" 4 (fun fd => writeAll fd "1024\n".toUTF8 false)
   let _ ← withFd s!"{roCg}/memory.events" 4 (fun fd => writeAll fd "oom 0\noom_kill 0\n".toUTF8 false)
   match ← runCgroupV2Group { maxRssBytes := 16777216, timeoutMs := 2000 } roCg "/bin/sh" #["-c", "exit 0"] with

@@ -608,35 +608,57 @@ def reflinkFile (src dst : String) : IO (SysResult Unit) := do
   | .ok _ => pure (.ok ())
   | .error e => pure (.error e)
 
-/-- Pure value-only return typeclass for `MmapRegion.withView` / `MmapArena.withPayloadView`.
-    Constructor is `private` (`private mk ::`) so external callers cannot forge instances for `BorrowedSlice`,
-    `ByteSource`, `BorrowedJsonTape`, `BorrowedRpcRequest`, `BorrowedHttpRequest`, or function closures (`α → β`),
-    and the callback `BorrowedSlice → α` is pure (not `IO`), making it impossible in safe Lean to stash a `BorrowedSlice`
-    into an external `IO.Ref` or smuggle it out of its pinned `MmapRegion.withView` lifetime scope. -/
-class ViewSafeRet (α : Type) : Prop where
-  private mk ::
-  isValue : True := trivial
+/-- Closed value-only return type universe (`Type`, NOT an open typeclass) for `MmapRegion.withView` / `MmapArena.withPayloadView`.
+    Because `ViewSafeTy` is a closed inductive GADTs family (with zero constructors for `BorrowedSlice`, `ByteSource`,
+    `BorrowedJsonTape`, `BorrowedRpcRequest`, `BorrowedHttpRequest`, or function closures `α → β`), NO external module
+    can ever construct `ViewSafeTy BorrowedSlice` via notation, `instance`, `constructor`, or any safe Lean tactic! -/
+inductive ViewSafeTy : Type → Type 1 where
+  | unit      : ViewSafeTy Unit
+  | bool      : ViewSafeTy Bool
+  | nat       : ViewSafeTy Nat
+  | int       : ViewSafeTy Int
+  | uint8     : ViewSafeTy UInt8
+  | uint16    : ViewSafeTy UInt16
+  | uint32    : ViewSafeTy UInt32
+  | uint64    : ViewSafeTy UInt64
+  | usize     : ViewSafeTy USize
+  | int32     : ViewSafeTy Int32
+  | int64     : ViewSafeTy Int64
+  | string    : ViewSafeTy String
+  | byteArray : ViewSafeTy ByteArray
+  | byteSlice : ViewSafeTy ByteSlice
+  | errno     : ViewSafeTy Errno
+  | option    : ViewSafeTy α → ViewSafeTy (Option α)
+  | prod      : ViewSafeTy α → ViewSafeTy β → ViewSafeTy (α × β)
+  | except    : ViewSafeTy ε → ViewSafeTy α → ViewSafeTy (Except ε α)
+  | array     : ViewSafeTy α → ViewSafeTy (Array α)
+  | list      : ViewSafeTy α → ViewSafeTy (List α)
 
-instance : ViewSafeRet Unit := ⟨trivial⟩
-instance : ViewSafeRet Bool := ⟨trivial⟩
-instance : ViewSafeRet Nat := ⟨trivial⟩
-instance : ViewSafeRet Int := ⟨trivial⟩
-instance : ViewSafeRet UInt8 := ⟨trivial⟩
-instance : ViewSafeRet UInt16 := ⟨trivial⟩
-instance : ViewSafeRet UInt32 := ⟨trivial⟩
-instance : ViewSafeRet UInt64 := ⟨trivial⟩
-instance : ViewSafeRet USize := ⟨trivial⟩
-instance : ViewSafeRet Int32 := ⟨trivial⟩
-instance : ViewSafeRet Int64 := ⟨trivial⟩
-instance : ViewSafeRet String := ⟨trivial⟩
-instance : ViewSafeRet ByteArray := ⟨trivial⟩
-instance : ViewSafeRet ByteSlice := ⟨trivial⟩
-instance : ViewSafeRet Errno := ⟨trivial⟩
-instance [ViewSafeRet α] : ViewSafeRet (Option α) := ⟨trivial⟩
-instance [ViewSafeRet α] [ViewSafeRet β] : ViewSafeRet (α × β) := ⟨trivial⟩
-instance [ViewSafeRet ε] [ViewSafeRet α] : ViewSafeRet (Except ε α) := ⟨trivial⟩
-instance [ViewSafeRet α] : ViewSafeRet (Array α) := ⟨trivial⟩
-instance [ViewSafeRet α] : ViewSafeRet (List α) := ⟨trivial⟩
+/-- Convenience synthesis class backed by a closed `ViewSafeTy α` GADT witness: even if an external module writes
+    `instance : ViewSafeRet BorrowedSlice := ...`, it MUST supply a `ViewSafeTy BorrowedSlice`, which is uninhabited (`Empty`)! -/
+class ViewSafeRet (α : Type) : Type 1 where
+  ty : ViewSafeTy α
+
+instance : ViewSafeRet Unit := ⟨.unit⟩
+instance : ViewSafeRet Bool := ⟨.bool⟩
+instance : ViewSafeRet Nat := ⟨.nat⟩
+instance : ViewSafeRet Int := ⟨.int⟩
+instance : ViewSafeRet UInt8 := ⟨.uint8⟩
+instance : ViewSafeRet UInt16 := ⟨.uint16⟩
+instance : ViewSafeRet UInt32 := ⟨.uint32⟩
+instance : ViewSafeRet UInt64 := ⟨.uint64⟩
+instance : ViewSafeRet USize := ⟨.usize⟩
+instance : ViewSafeRet Int32 := ⟨.int32⟩
+instance : ViewSafeRet Int64 := ⟨.int64⟩
+instance : ViewSafeRet String := ⟨.string⟩
+instance : ViewSafeRet ByteArray := ⟨.byteArray⟩
+instance : ViewSafeRet ByteSlice := ⟨.byteSlice⟩
+instance : ViewSafeRet Errno := ⟨.errno⟩
+instance [h : ViewSafeRet α] : ViewSafeRet (Option α) := ⟨.option h.ty⟩
+instance [ha : ViewSafeRet α] [hb : ViewSafeRet β] : ViewSafeRet (α × β) := ⟨.prod ha.ty hb.ty⟩
+instance [he : ViewSafeRet ε] [ha : ViewSafeRet α] : ViewSafeRet (Except ε α) := ⟨.except he.ty ha.ty⟩
+instance [h : ViewSafeRet α] : ViewSafeRet (Array α) := ⟨.array h.ty⟩
+instance [h : ViewSafeRet α] : ViewSafeRet (List α) := ⟨.list h.ty⟩
 
 /-- Persistent `MAP_SHARED` arena handle (`baseAddr`, `lenBytes`) with `private` constructor & OS-mutex-synchronized
     `(closed, pins)` state (`Std.Mutex (Bool × Nat)`): external callers cannot forge addresses, enlarge `lenBytes`,
@@ -670,20 +692,34 @@ private def releasePin (r : MmapRegion) : IO Unit :=
     set (closed, pins - 1)
 
 /-- Scoped DMA pin over `[relOff, relOff + subLen)` of a live `MmapRegion`: validates bounds via `leansys_verify_borrowed_view`,
-    holds an atomic pin throughout `k` so concurrent `mmapUnmap` fails closed, and never exposes manual `releasePin`. -/
-def withPinnedAddr {α : Type} (r : MmapRegion) (needWritable : Bool) (relOff subLen : Nat)
-    (k : UInt64 → IO (SysResult α)) : IO (SysResult α) := do
+    holds an atomic pin throughout `k`, and takes a continuation returning `(SysResult α × Bool)` where the second boolean
+    is `true` iff it is safe to release the pin now (`false` leaks the pin on abnormal kernel DMA wait failure to prevent `munmap` UAF). -/
+def withPinnedAddrRetain {α : Type} (r : MmapRegion) (needWritable : Bool) (relOff subLen : Nat)
+    (k : UInt64 → IO (SysResult α × Bool)) : IO (SysResult α) := do
   if needWritable && r.readOnly then
     return .error .einval
   match ← r.acquirePin with
   | .error e => return .error e
   | .ok base =>
-    try
-      if Spec.verifyBorrowedView base.toUInt64 r.lenBytes.toUInt64 relOff.toUInt64 subLen.toUInt64 != 1 then
-        return .error .einval
-      k (base.toUInt64 + relOff.toUInt64)
-    finally
+    if Spec.verifyBorrowedView base.toUInt64 r.lenBytes.toUInt64 relOff.toUInt64 subLen.toUInt64 != 1 then
       r.releasePin
+      return .error .einval
+    let releaseRef ← IO.mkRef false
+    try
+      let (res, canRelease) ← k (base.toUInt64 + relOff.toUInt64)
+      releaseRef.set canRelease
+      return res
+    finally
+      if ← releaseRef.get then
+        r.releasePin
+
+/-- Scoped DMA pin over `[relOff, relOff + subLen)` of a live `MmapRegion`: validates bounds via `leansys_verify_borrowed_view`,
+    holds an atomic pin throughout `k` so concurrent `mmapUnmap` fails closed, and never exposes manual `releasePin`. -/
+def withPinnedAddr {α : Type} (r : MmapRegion) (needWritable : Bool) (relOff subLen : Nat)
+    (k : UInt64 → IO (SysResult α)) : IO (SysResult α) :=
+  r.withPinnedAddrRetain needWritable relOff subLen fun addr => do
+    let res ← k addr
+    return (res, true)
 
 end MmapRegion
 

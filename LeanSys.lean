@@ -80,6 +80,7 @@ namespace Os
   abbrev ShmRing := LeanSys.Mmap.ShmRing
   abbrev MmapArena := LeanSys.Mmap.MmapArena
   abbrev IoUring := LeanSys.Mmap.IoUring
+  abbrev IoUringTicket := LeanSys.Mmap.IoUringTicket
   abbrev IoUringCqe := LeanSys.Mmap.IoUringCqe
   abbrev LogChunk := LeanSys.ProcLog.LogChunk
   abbrev readLogChunk := LeanSys.ProcLog.readLogChunk

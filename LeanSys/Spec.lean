@@ -1657,15 +1657,14 @@ theorem cgroup_v2_budget_rejects_oom_or_overrun (c : CgroupV2BudgetCheck)
 /--
   Unboxed C-ABI Linux `io_uring` SQ/CQ Ring Descriptor & Submission Gate (`leansys_verify_io_uring_ring`):
   Certifies power-of-two non-zero ring capacity (`0 < ringEntries && ringEntries ≤ 4096 && (ringEntries &&& (ringEntries - 1)) == 0`),
-  `ringMask == ringEntries - 1`, queue occupancy `sqTail - sqHead ≤ ringEntries`,
-  and batch submission capacity `toSubmit ≤ ringEntries - (sqTail - sqHead)` with `sqHead ≤ sqTail`.
+  `ringMask == ringEntries - 1`, modular `UInt32` queue occupancy `sqTail - sqHead ≤ ringEntries`
+  (preserving wraparound across `UInt32.max`), and batch submission capacity `toSubmit ≤ ringEntries - (sqTail - sqHead)`.
 -/
 @[inline, export leansys_verify_io_uring_ring]
 def verifyIoUringRing (sqHead sqTail ringEntries ringMask toSubmit : UInt32) : UInt8 :=
   if 0 < ringEntries && ringEntries ≤ 4096 &&
      (ringEntries &&& (ringEntries - 1)) == 0 &&
      ringMask == ringEntries - 1 &&
-     sqHead ≤ sqTail &&
      sqTail - sqHead ≤ ringEntries &&
      toSubmit ≤ ringEntries - (sqTail - sqHead) then 1 else 0
 
@@ -1681,7 +1680,6 @@ def ioUringRingSafe (u : IoUringRingCheck) : Bool :=
   0 < u.ringCfg.1 && u.ringCfg.1 ≤ 4096 &&
   (u.ringCfg.1 &&& (u.ringCfg.1 - 1)) == 0 &&
   u.ringCfg.2 == u.ringCfg.1 - 1 &&
-  u.cursors.1 ≤ u.cursors.2 &&
   u.cursors.2 - u.cursors.1 ≤ u.ringCfg.1 &&
   u.submit ≤ u.ringCfg.1 - (u.cursors.2 - u.cursors.1)
 

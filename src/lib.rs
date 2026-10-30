@@ -1226,8 +1226,10 @@ mod tests {
             true
         ));
 
-        // Linux io_uring SQ/CQ ring
+        // Linux io_uring SQ/CQ ring (including UInt32 modular wraparound)
         assert!(verify_io_uring_ring(2, 5, 8, 7, 4));
+        assert!(verify_io_uring_ring(u32::MAX - 1, 2, 8, 7, 4));
+        assert!(!verify_io_uring_ring(5, 2, 8, 7, 1));
         assert!(!verify_io_uring_ring(2, 5, 8, 7, 6));
         assert!(!verify_io_uring_ring(0, 0, 6, 5, 1));
 

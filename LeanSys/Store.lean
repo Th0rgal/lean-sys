@@ -543,6 +543,55 @@ private def initCasStream (algo : CasAlgo256) : Sha256Stream :=
   | .sha256 => Sha256Stream.init
   | .keyed256 tag => Sha256Stream.initDomain tag
 
+/-- Format a 32-bit unsigned integer as an 8-character lowercase hex string. -/
+private def uint32ToHex8 (v : UInt32) : String := Id.run do
+  let hexChars := "0123456789abcdef".toUTF8
+  let mut out := ByteArray.emptyWithCapacity 8
+  for i in [0:8] do
+    let shift := ((7 - i) * 4).toUInt32
+    let nib := ((v >>> shift) &&& 0xF).toNat
+    out := out.push (hexChars.get! nib)
+  return String.fromUTF8! out
+
+/-- Parse an exact 8-character hex string into `Option UInt32`. -/
+private def parseHex8? (s : String) : Option UInt32 := Id.run do
+  let bytes := s.toUTF8
+  if bytes.size != 8 then return none
+  let mut acc : UInt32 := 0
+  for i in [0:8] do
+    let c := bytes.get! i
+    if 48 ≤ c && c ≤ 57 then
+      acc := (acc <<< 4) ||| (c - 48).toUInt32
+    else if 97 ≤ c && c ≤ 102 then
+      acc := (acc <<< 4) ||| (c - 97 + 10).toUInt32
+    else if 65 ≤ c && c ≤ 70 then
+      acc := (acc <<< 4) ||| (c - 65 + 10).toUInt32
+    else
+      return none
+  return some acc
+
+/-- Canonical prefix for a 256-bit CAS key (`"sha256:"`, `"blake256:"` for default tag `0x424C4B33`, or `"blake256-<8hex>:"`). -/
+private def casPrefix256 (algo : CasAlgo256) : String :=
+  match algo with
+  | .sha256 => "sha256:"
+  | .keyed256 tag =>
+    if tag == 0x424C4B33 then "blake256:" else s!"blake256-{uint32ToHex8 tag}:"
+
+/-- Parse a CAS key into `(CasAlgo256, cleanHex)` failing closed (`none`) on unknown or malformed prefixes. -/
+private def parseCasKey256OrRaw? (key : String) : Option (CasAlgo256 × String) :=
+  match key.splitOn ":" with
+  | [raw] => some (.sha256, raw)
+  | ["sha256", rest] => some (.sha256, rest)
+  | ["blake256", rest] => some (.keyed256 0x424C4B33, rest)
+  | [pref, rest] =>
+    if pref.startsWith "blake256-" && pref.utf8ByteSize == 17 then
+      match parseHex8? ((pref.drop 9).toString) with
+      | some tag => some (.keyed256 tag, rest)
+      | none => none
+    else
+      none
+  | _ => none
+
 /-- Stream-verify an open file at `path` in bounded `chunkBytes` (default `1 MiB`) `pread` windows without loading
     the full blob into RAM, returning its 256-bit `Digest256`. -/
 def computeFileDigest256 (path : String) (algo : CasAlgo256 := .sha256) (chunkBytes : Nat := 1048576) : IO (SysResult Digest256) := do
@@ -613,7 +662,7 @@ def casPutFile256 (h : Handle) (srcFilePath : String) (algo : CasAlgo256 := .sha
     if verifyCasDigest256 dig.w0 dig.w1 dig.w2 dig.w3 dig.w0 dig.w1 dig.w2 dig.w3 pathSep != 1 then
       discard <| unlinkFile tmpPath
       return .error .einval
-    let prefixTag := match algo with | .sha256 => "sha256:" | .keyed256 _ => "blake256:"
+    let prefixTag := casPrefix256 algo
     let dstPath := (System.FilePath.mk h.casDir / hex64).toString
     if ← (System.FilePath.mk dstPath).pathExists then
       match ← verifyCasFile256 dstPath dig pathSep algo chunkBytes with
@@ -642,7 +691,7 @@ def casPut256 (h : Handle) (src : ByteSource) (algo : CasAlgo256 := .sha256) : I
   let pathSep := hasPathTraversal hex64
   if verifyCasDigest256 dig.w0 dig.w1 dig.w2 dig.w3 dig.w0 dig.w1 dig.w2 dig.w3 pathSep != 1 then
     return .error .einval
-  let prefixTag := match algo with | .sha256 => "sha256:" | .keyed256 _ => "blake256:"
+  let prefixTag := casPrefix256 algo
   let dstPath := (System.FilePath.mk h.casDir / hex64).toString
   if ← (System.FilePath.mk dstPath).pathExists then
     match ← verifyCasFile256 dstPath dig pathSep algo with
@@ -672,10 +721,8 @@ def casPut256 (h : Handle) (src : ByteSource) (algo : CasAlgo256 := .sha256) : I
 /-- Verify and read a 256-bit CAS object (`"sha256:<64-hex>"` or raw 64-char hex) in a single `withFd` pass
     via `leansys_verify_cas_digest256` (zero TOCTOU reopen, exact `fstat` byte-count check). -/
 def casGet256 (h : Handle) (key : String) : IO (SysResult ByteArray) := do
-  let (algo, cleanHex) := match key.splitOn ":" with
-    | ["blake256", rest] => (CasAlgo256.keyed256, rest)
-    | [_, rest] => (CasAlgo256.sha256, rest)
-    | _ => (CasAlgo256.sha256, key)
+  let some (algo, cleanHex) := parseCasKey256OrRaw? key
+    | return .error .einval
   let pathSep := hasPathTraversal cleanHex
   if pathSep != 0 then
     return .error .einval
@@ -741,10 +788,8 @@ private def verifyMaterializedTmp (tmpTarget : String) (cleanKey : String)
     typed `Errno` unless `allowCopyFallback == true`, in which case it streams `pread` chunks + `fsync` + digest check + `rename`. -/
 def casMaterializeReflink (h : Handle) (hexKey : String) (targetPath : String)
     (allowCopyFallback : Bool := false) : IO (SysResult ReflinkOutcome) := do
-  let (algo256, cleanKey) := match hexKey.splitOn ":" with
-    | ["blake256", rest] => (CasAlgo256.keyed256, rest)
-    | [_, rest] => (CasAlgo256.sha256, rest)
-    | _ => (CasAlgo256.sha256, hexKey)
+  let some (algo256, cleanKey) := parseCasKey256OrRaw? hexKey
+    | return .error .einval
   let pathSep := hasPathTraversal cleanKey
   if pathSep != 0 then
     return .error .einval
