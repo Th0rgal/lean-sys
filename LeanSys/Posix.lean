@@ -122,6 +122,9 @@ opaque rawNetListen (host : @& String) (port : UInt16) (backlog : UInt32) : IO U
 @[extern "leansys_net_accept_poll"]
 opaque rawNetAcceptPoll (listenFd : UInt32) (timeoutMs : UInt32) (pollOnly : UInt8) : IO UInt64
 
+@[extern "leansys_ptr_read"]
+opaque rawPtrRead (ptr : USize) (cap : USize) (off : USize) (word64 : UInt8) : UInt64
+
 /-! ## Zero-Copy ByteSlice over Borrowed `ByteArray` -/
 
 /-- Validated zero-copy view `[off, off + len)` inside `ba : ByteArray`. -/
@@ -184,12 +187,124 @@ def fnv1a64 (s : ByteSlice) : UInt64 := Id.run do
 
 end ByteSlice
 
+/-! ## Zero-Copy External Pointer View (`BorrowedSlice` / `RawByteView`) & `ByteSource` -/
+
+/-- Validated external `(ptr, len)` view over `mmap`, `io_uring`, or Rust `&[u8]` memory without `ByteArray` copying. -/
+structure BorrowedSlice where
+  ptr : USize
+  len : USize
+  deriving Repr, DecidableEq, Inhabited
+
+/-- Canonical alias for raw external `(ptr, len)` byte views across C-ABI boundaries. -/
+abbrev RawByteView := BorrowedSlice
+
+namespace BorrowedSlice
+
+/-- Construct a `BorrowedSlice` gated by `leansys_verify_borrowed_view` (`ptr != 0` and no 64-bit wraparound). -/
+@[inline]
+def mkChecked? (ptr : USize) (len : USize) : Option BorrowedSlice :=
+  if Spec.verifyBorrowedView ptr.toUInt64 len.toUInt64 0 len.toUInt64 == 1 then
+    some { ptr := ptr, len := len }
+  else
+    none
+
+/-- Sub-slice `[relOff, relOff + subLen)` gated by `leansys_verify_borrowed_view`. -/
+@[inline]
+def subView? (v : BorrowedSlice) (relOff subLen : Nat) : Option BorrowedSlice :=
+  if relOff.toUSize.toNat == relOff && subLen.toUSize.toNat == subLen &&
+     Spec.verifyBorrowedView v.ptr.toUInt64 v.len.toUInt64 relOff.toUInt64 subLen.toUInt64 == 1 then
+    some { ptr := v.ptr + relOff.toUSize, len := subLen.toUSize }
+  else
+    none
+
+/-- Bounds-checked single-byte load via `leansys_ptr_read` (returns `fallback` when out-of-bounds or null). -/
+@[inline]
+def getByteD (v : BorrowedSlice) (idx : Nat) (fallback : UInt8 := 0) : UInt8 :=
+  if idx < v.len.toNat && Spec.verifyBorrowedView v.ptr.toUInt64 v.len.toUInt64 idx.toUInt64 1 == 1 then
+    (rawPtrRead v.ptr v.len idx.toUSize 0).toUInt8
+  else
+    fallback
+
+/-- Bounds-checked unaligned 64-bit little-endian load via `leansys_ptr_read`. -/
+@[inline]
+def getWord64LE (v : BorrowedSlice) (byteOff : Nat) : UInt64 :=
+  if byteOff + 8 ≤ v.len.toNat && Spec.verifyBorrowedView v.ptr.toUInt64 v.len.toUInt64 byteOff.toUInt64 8 == 1 then
+    rawPtrRead v.ptr v.len byteOff.toUSize 1
+  else
+    0
+
+/-- Materialize into a `ByteArray` only when crossing an owning boundary. -/
+def toByteArray (v : BorrowedSlice) : ByteArray := Id.run do
+  let n := v.len.toNat
+  let mut out := ByteArray.emptyWithCapacity n
+  let mut i := 0
+  while i < n do
+    out := out.push (v.getByteD i)
+    i := i + 1
+  return out
+
+/-- Decode a UTF-8 `BorrowedSlice` into a `String` at owning boundaries. -/
+@[inline]
+def toStringLossy (v : BorrowedSlice) : String :=
+  String.fromUTF8! v.toByteArray
+
+end BorrowedSlice
+
+/-- Unified zero-copy byte-view abstraction over Lean `ByteSlice` and external `BorrowedSlice` pointers. -/
+inductive ByteSource where
+  | heap (slice : ByteSlice)
+  | borrowed (view : BorrowedSlice)
+  deriving Inhabited
+
+namespace ByteSource
+
+@[inline]
+def ofByteSlice (s : ByteSlice) : ByteSource := .heap s
+
+@[inline]
+def ofByteArray (ba : ByteArray) : ByteSource := .heap (ByteSlice.ofByteArray ba)
+
+@[inline]
+def ofBorrowed (v : BorrowedSlice) : ByteSource := .borrowed v
+
+@[inline]
+def size (src : ByteSource) : Nat :=
+  match src with
+  | .heap s => s.len
+  | .borrowed v => v.len.toNat
+
+@[inline]
+def getByteD (src : ByteSource) (idx : Nat) (fallback : UInt8 := 0) : UInt8 :=
+  match src with
+  | .heap s => s.getByteD idx fallback
+  | .borrowed v => v.getByteD idx fallback
+
+@[inline]
+def subSource? (src : ByteSource) (relOff subLen : Nat) : Option ByteSource :=
+  match src with
+  | .heap s => (s.subSlice? relOff subLen).map .heap
+  | .borrowed v => (v.subView? relOff subLen).map .borrowed
+
+@[inline]
+def toByteArray (src : ByteSource) : ByteArray :=
+  match src with
+  | .heap s => s.toByteArray
+  | .borrowed v => v.toByteArray
+
+@[inline]
+def toStringLossy (src : ByteSource) : String :=
+  match src with
+  | .heap s => s.toStringLossy
+  | .borrowed v => v.toStringLossy
+
+end ByteSource
+
 /-! ## Typed Resource Descriptors & Bracketed Lifecycle Combinators -/
 
 /-- Linear file descriptor wrapper (`fd : UInt32`). -/
 structure Fd where
   raw : UInt32
-  deriving Repr, DecidableEq
+  deriving Repr, DecidableEq, Inhabited
 
 /-- Exclusive advisory file lock handle (`flock(LOCK_EX)`). -/
 structure DirLock where
@@ -431,5 +546,186 @@ def pollReadable (fd : Fd) (timeoutMs : UInt32 := 2000) : IO (SysResult Unit) :=
   match decodePackedWord w with
   | .error e => pure (.error e)
   | .ok _ => pure (.ok ())
+
+/-- Toggle `O_NONBLOCK` on an open descriptor via `fcntl(F_GETFL / F_SETFL)` (`wr = 10` in `leansys_open_flock`). -/
+def setNonBlocking (fd : Fd) (enable : Bool := true) : IO (SysResult Unit) := do
+  let w ← rawOpenFlock "" 10 (if enable then 1 else 0) fd.raw
+  match decodePackedWord w with
+  | .ok _ => pure (.ok ())
+  | .error e => pure (.error e)
+
+/-- Unlink `path` (`unlink(2)`, `op = 6` in `leansys_fs_clone_or_link`). -/
+def unlinkFile (path : String) : IO (SysResult Unit) := do
+  let w ← rawFsCloneOrLink path "" 6
+  match decodePackedWord w with
+  | .ok _ => pure (.ok ())
+  | .error e => pure (.error e)
+
+/-- Copy-on-Write filesystem reflink (`ioctl(FICLONE)` on Linux, `clonefile(2)` on macOS; `op = 5`).
+    Creates an independent writable `0644` destination without mutating the `0444` CAS blob's inode mode.
+    Returns `.error .eopnotsupp` or `.error .exdev` when the underlying filesystem does not support CoW reflinks. -/
+def reflinkFile (src dst : String) : IO (SysResult Unit) := do
+  let w ← rawFsCloneOrLink src dst 5
+  match decodePackedWord w with
+  | .ok _ => pure (.ok ())
+  | .error e => pure (.error e)
+
+/-- Persistent `MAP_SHARED` arena handle (`baseAddr`, `lenBytes`) mapped once and unmapped on close. -/
+structure MmapRegion where
+  baseAddr : USize
+  lenBytes : USize
+  readOnly : Bool
+  deriving Repr, DecidableEq
+
+/-- Create a persistent `MAP_SHARED` mapping of `fd` at `fileOffset` of size `lenBytes` (`mode = 4` in `leansys_write_all`). -/
+def mmapMapShared (fd : Fd) (lenBytes : Nat) (fileOffset : Nat := 0) (readOnly : Bool := false) : IO (SysResult MmapRegion) := do
+  if lenBytes == 0 || lenBytes.toUSize.toNat != lenBytes || fileOffset.toUSize.toNat != fileOffset || fd.raw >= 0x80000000 then
+    return .error .einval
+  let taggedFd : UInt32 := if readOnly then fd.raw ||| (0x80000000 : UInt32) else fd.raw
+  let w ← rawWriteAll taggedFd ByteArray.empty fileOffset.toUSize lenBytes.toUSize 4
+  match decodePackedWord w with
+  | .error e => pure (.error e)
+  | .ok addr =>
+    if Spec.verifyBorrowedView addr lenBytes.toUInt64 0 lenBytes.toUInt64 == 1 then
+      pure (.ok { baseAddr := addr.toUSize, lenBytes := lenBytes.toUSize, readOnly := readOnly })
+    else
+      let _ ← rawWriteAll 0 ByteArray.empty addr.toUSize lenBytes.toUSize 5
+      pure (.error .einval)
+
+/-- Unmap a persistent `MmapRegion` via `munmap(2)` (`mode = 5` in `leansys_write_all`). -/
+def mmapUnmap (reg : MmapRegion) : IO (SysResult Unit) := do
+  if reg.baseAddr == 0 || reg.lenBytes == 0 then
+    return .error .einval
+  let w ← rawWriteAll 0 ByteArray.empty reg.baseAddr reg.lenBytes 5
+  match decodePackedWord w with
+  | .ok _ => pure (.ok ())
+  | .error e => pure (.error e)
+
+/-- Obtain a zero-copy `BorrowedSlice` over `[relOff, relOff + subLen)` of a mapped `MmapRegion`. -/
+@[inline]
+def MmapRegion.view? (reg : MmapRegion) (relOff : Nat := 0) (subLen : Nat := reg.lenBytes.toNat) : Option BorrowedSlice :=
+  let full : BorrowedSlice := { ptr := reg.baseAddr, len := reg.lenBytes }
+  full.subView? relOff subLen
+
+/-- Write `ba` into `[relOff, relOff + ba.size)` of a writable `MmapRegion` with full memory barrier (`mode = 8`). -/
+def mmapRegionWrite (reg : MmapRegion) (relOff : Nat) (ba : ByteArray) : IO (SysResult Nat) := do
+  if reg.readOnly || relOff >= 0x100000000 ||
+     Spec.verifyBorrowedView reg.baseAddr.toUInt64 reg.lenBytes.toUInt64 relOff.toUInt64 ba.size.toUInt64 != 1 then
+    return .error .einval
+  let w ← rawWriteAll relOff.toUInt32 ba reg.baseAddr ba.size.toUSize 8
+  match decodePackedWord w with
+  | .ok n => pure (.ok n.toNat)
+  | .error e => pure (.error e)
+
+/-- Read `len` bytes from `[relOff, relOff + len)` of an `MmapRegion` with full memory barrier (`tg = 1` in `leansys_pread_ba`). -/
+def mmapRegionRead (reg : MmapRegion) (relOff : Nat) (len : Nat) : IO ByteArray := do
+  if relOff >= 0x100000000 ||
+     Spec.verifyBorrowedView reg.baseAddr.toUInt64 reg.lenBytes.toUInt64 relOff.toUInt64 len.toUInt64 != 1 then
+    return ByteArray.empty
+  let base64 := reg.baseAddr.toUInt64
+  if base64 >= (1 : UInt64) <<< 62 then
+    return ByteArray.empty
+  let tagged : UInt64 := ((1 : UInt64) <<< 62) ||| base64
+  rawPreadBa relOff.toUInt32 tagged len.toUSize
+
+/-- Linux `io_uring_setup(entries, paramsBuf)` (`mode = 6` in `leansys_write_all`).
+    `paramsBuf` must be a 120-byte zeroed `ByteArray`; on success returns `(ringFd, populatedParamsBuf)`. -/
+def ioUringSetupRaw (entries : UInt32) : IO (SysResult (Fd × ByteArray)) := do
+  if entries == 0 || entries > 4096 || (entries &&& (entries - 1)) != 0 then
+    return .error .einval
+  let mut params := ByteArray.emptyWithCapacity 120
+  for _ in [0:120] do
+    params := params.push 0
+  let w ← rawWriteAll entries params 0 120 6
+  match decodePackedWord w with
+  | .error e => pure (.error e)
+  | .ok fdWord =>
+    match decodeFdWord fdWord with
+    | .error e => pure (.error e)
+    | .ok fd => pure (.ok (fd, params))
+
+/-- Linux `io_uring_enter(ringFd, toSubmit, minComplete, flags)` (`mode = 7` in `leansys_write_all`). -/
+def ioUringEnterRaw (ringFd : Fd) (toSubmit minComplete : UInt32) (flags : UInt16 := 1) : IO (SysResult UInt32) := do
+  if ringFd.raw >= 0x10000 then
+    return .error .einval
+  let packedFdFlags : UInt32 := (ringFd.raw &&& (0xFFFF : UInt32)) ||| (flags.toUInt32 <<< 16)
+  let w ← rawWriteAll packedFdFlags ByteArray.empty toSubmit.toUSize minComplete.toUSize 7
+  match decodePackedWord w with
+  | .error e => pure (.error e)
+  | .ok submitted => pure (.ok submitted.toUInt32)
+
+/-- Multi-FD readiness multiplexer (`poll(2)`, `mode = 9` in `leansys_write_all`) over up to 62 descriptors.
+    Packs `struct pollfd { int fd; short events; short revents; }` (8 bytes LE per slot) and returns the subset
+    of indices with `POLLIN | POLLHUP | POLLERR` ready, or `.ok #[]` on timeout (`EAGAIN`). -/
+def pollFdSet (fds : Array Fd) (timeoutMs : UInt32 := 50) (pollOutMask : UInt64 := 0) : IO (SysResult (Array Nat)) := do
+  if fds.size == 0 then
+    return .ok #[]
+  if fds.size > 62 || Spec.verifyPollInterest fds.size.toUInt32 62 0 1 0 (timeoutMs + 1) != 1 then
+    return .error .einval
+  let mut buf := ByteArray.emptyWithCapacity (fds.size * 8)
+  for idx in [0:fds.size] do
+    let raw := (fds[idx]!).raw
+    let ev : UInt16 := if ((pollOutMask >>> idx.toUInt64) &&& 1) == 1 then 5 else 1 -- POLLIN=1, POLLOUT=4
+    buf := buf.push (raw &&& 0xFF).toUInt8
+    buf := buf.push ((raw >>> 8) &&& 0xFF).toUInt8
+    buf := buf.push ((raw >>> 16) &&& 0xFF).toUInt8
+    buf := buf.push ((raw >>> 24) &&& 0xFF).toUInt8
+    buf := buf.push (ev &&& 0xFF).toUInt8
+    buf := buf.push ((ev >>> 8) &&& 0xFF).toUInt8
+    buf := buf.push 0
+    buf := buf.push 0
+  let w ← rawWriteAll timeoutMs buf 0 fds.size.toUSize 9
+  match decodePackedWord w with
+  | .error .eagain => pure (.ok #[])
+  | .error e => pure (.error e)
+  | .ok mask =>
+    let mut ready : Array Nat := #[]
+    for idx in [0:fds.size] do
+      if ((mask >>> idx.toUInt64) &&& 1) == 1 then
+        ready := ready.push idx
+    pure (.ok ready)
+
+/-- Validate an absolute `AF_UNIX` path via `leansys_verify_unix_path_bounds`. -/
+@[inline]
+def checkUnixPath (socketPath : String) : Bool := Id.run do
+  let utf8 := socketPath.toUTF8
+  let startsSlash := utf8.size > 0 && utf8.get! 0 == 47
+  let mut noNull : UInt8 := 1
+  for i in [0:utf8.size] do
+    if utf8.get! i == 0 then
+      noNull := 0
+  return startsSlash && Spec.verifyUnixPathBounds utf8.size.toUInt64 noNull == 1
+
+/-- Bind and listen on an `AF_UNIX` `SOCK_STREAM | SOCK_CLOEXEC` domain socket (`port = 0` in `leansys_net_listen`). -/
+def unixListen (socketPath : String) (backlog : UInt32 := 64) : IO (SysResult Fd) := do
+  if !checkUnixPath socketPath then
+    return .error .einval
+  let w ← rawNetListen socketPath 0 (if backlog == 0 then 16 else backlog)
+  match decodePackedWord w with
+  | .error e => pure (.error e)
+  | .ok packed => pure (decodeFdWord (packed &&& 0xFFFFFFFF))
+
+/-- Connect an `AF_UNIX` `SOCK_STREAM | SOCK_CLOEXEC` client socket (`port = 0, backlog = 0` in `leansys_net_listen`). -/
+def unixConnect (socketPath : String) : IO (SysResult Fd) := do
+  if !checkUnixPath socketPath then
+    return .error .einval
+  let w ← rawNetListen socketPath 0 0
+  match decodePackedWord w with
+  | .error e => pure (.error e)
+  | .ok fdWord => pure (decodeFdWord fdWord)
+
+/-- Spawn an isolated process group (`setpgid(0, 0)`) atomically placing the child into `cgroupProcsPath` (`cgroup v2`
+    `cgroup.procs`) and optionally applying Landlock (`roPath`, `rwPath`) in the child BEFORE `execve`.
+    If `cgroupProcsPath` cannot be opened or written, the child fails closed with exit status `126`. -/
+def spawnProcessGroupWithCgroupAndLandlock (cmd : String) (args : Array String)
+    (cgroupProcsPath : String := "") (roPath : String := "") (rwPath : String := "")
+    (confineLandlock : Bool := false) : IO (SysResult ChildGroup) := do
+  let hasCg := !cgroupProcsPath.isEmpty
+  let fullArgs := if hasCg then #[cgroupProcsPath] ++ args else args
+  let flags : UInt8 := (if confineLandlock then 1 else 0) ||| (if hasCg then 2 else 0)
+  let w ← rawSpawnGroup cmd fullArgs roPath rwPath flags
+  match decodePackedWord w with
+  | .ok pid => pure (.ok ⟨pid.toUInt32⟩)
+  | .error e => pure (.error e)
 
 end LeanSys.Posix

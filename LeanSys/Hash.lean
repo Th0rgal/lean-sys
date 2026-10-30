@@ -86,6 +86,50 @@ def xxh64Slice (s : ByteSlice) (seed : UInt64 := 0x9E3779B97F4A7C15) : UInt64 :=
 def xxh64String (str : String) (seed : UInt64 := 0x9E3779B97F4A7C15) : UInt64 :=
   xxh64Slice (ByteSlice.ofString str) seed
 
+/-- 8-byte little-endian `UInt64` load from an external `BorrowedSlice` at `off` (zero heap copy). -/
+@[inline]
+def readWord64Borrowed (v : BorrowedSlice) (off : Nat) : UInt64 :=
+  if off + 8 ≤ v.len.toNat then
+    v.getWord64LE off
+  else
+    (v.getByteD off).toUInt64 |||
+    ((v.getByteD (off + 1)).toUInt64 <<< 8) |||
+    ((v.getByteD (off + 2)).toUInt64 <<< 16) |||
+    ((v.getByteD (off + 3)).toUInt64 <<< 24) |||
+    ((v.getByteD (off + 4)).toUInt64 <<< 32) |||
+    ((v.getByteD (off + 5)).toUInt64 <<< 40) |||
+    ((v.getByteD (off + 6)).toUInt64 <<< 48) |||
+    ((v.getByteD (off + 7)).toUInt64 <<< 56)
+
+/-- Zero-copy 64-bit word-strided hash over an external `BorrowedSlice` (`mmap` / `io_uring` / C-ABI `&[u8]`)
+    producing bit-identical output to `xxh64Slice` without allocating a `ByteArray`. -/
+def xxh64Borrowed (v : BorrowedSlice) (seed : UInt64 := 0x9E3779B97F4A7C15) : UInt64 := Id.run do
+  let n := v.len.toNat
+  let mut acc : UInt64 := seed ^^^ (n.toUInt64 * 0xBF58476D1CE4E5B9)
+  let mut i : Nat := 0
+  while i + 32 ≤ n do
+    let a1 := mix64Word acc (v.getWord64LE i)
+    let a2 := mix64Word a1 (v.getWord64LE (i + 8))
+    let a3 := mix64Word a2 (v.getWord64LE (i + 16))
+    acc := mix64Word a3 (v.getWord64LE (i + 24))
+    i := i + 32
+  while i + 8 ≤ n do
+    acc := mix64Word acc (v.getWord64LE i)
+    i := i + 8
+  let rem := n - i
+  if rem != 0 then
+    let w := readWord64Borrowed v i
+    acc := mix64Word acc (w &&& ((1 <<< (rem.toUInt64 * 8)) - 1))
+  let fin := mix64Word acc (n.toUInt64 ^^^ 0x94D049BB133111EB)
+  return if fin == 0 then 1 else fin
+
+/-- Zero-copy 64-bit word-strided hash over any `ByteSource` (`ByteSlice` or `BorrowedSlice`). -/
+@[inline]
+def xxh64Source (src : ByteSource) (seed : UInt64 := 0x9E3779B97F4A7C15) : UInt64 :=
+  match src with
+  | .heap s => xxh64Slice s seed
+  | .borrowed v => xxh64Borrowed v seed
+
 /-- Compute the 3-bit probe mask in a 64-bit Bloom filter word for a given 64-bit hash `h`. -/
 @[inline]
 def bloomProbeMask (h : UInt64) : UInt64 :=

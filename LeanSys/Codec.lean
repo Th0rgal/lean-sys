@@ -400,4 +400,151 @@ def indexTranscriptTurns (s : ByteSlice) : Array TranscriptTurnSpan := Id.run do
       prevDigest := dig
   return out
 
+
+/-! ## Zero-Copy `BorrowedSlice` / `ByteSource` JSON Tape Indexer (`BorrowedJsonTape`) -/
+
+/-- Zero-copy indexed JSON object view over any `ByteSource` (`ByteSlice` or external `BorrowedSlice`). -/
+structure BorrowedJsonTape where
+  root    : ByteSource
+  entries : Array JsonTapeEntry
+
+namespace BorrowedJsonTape
+
+@[inline]
+private def skipWsSrc (src : ByteSource) (i limit : Nat) : Nat := Id.run do
+  let mut p := i
+  while p < limit do
+    let c := src.getByteD p
+    if c == 32 || c == 9 || c == 10 || c == 13 then
+      p := p + 1
+    else
+      break
+  return p
+
+@[inline]
+private def scanQuotedSrc (src : ByteSource) (start limit : Nat) : Option Nat := Id.run do
+  let mut p := start
+  while p < limit do
+    let c := src.getByteD p
+    if c == 92 then p := p + 2
+    else if c == 34 then return some p
+    else p := p + 1
+  return none
+
+private def scanRawValueSrc (src : ByteSource) (start limit : Nat) : Nat × UInt32 := Id.run do
+  let mut p := start
+  let mut depth : UInt32 := 0
+  let mut maxDepth : UInt32 := 1
+  let mut inStr := false
+  while p < limit do
+    let c := src.getByteD p
+    if inStr then
+      if c == 92 then p := p + 2
+      else if c == 34 then inStr := false; p := p + 1
+      else p := p + 1
+    else
+      if c == 34 then inStr := true; p := p + 1
+      else if c == 123 || c == 91 then
+        depth := depth + 1
+        if depth > maxDepth then maxDepth := depth
+        p := p + 1
+      else if c == 125 || c == 93 then
+        if depth == 0 then break
+        depth := depth - 1
+        p := p + 1
+      else if depth == 0 && (c == 44 || c == 32 || c == 9 || c == 10 || c == 13) then
+        break
+      else
+        p := p + 1
+  return (p, maxDepth)
+
+/-- Build a zero-copy `BorrowedJsonTape` directly over a `ByteSource` (`BorrowedSlice` or `ByteSlice`)
+    without allocating a backing `ByteArray`, gating every span via `leansys_verify_jsonl_tape`. -/
+def indexSource (src : ByteSource) : BorrowedJsonTape := Id.run do
+  let limit := src.size
+  let mut entries : Array JsonTapeEntry := Array.mkEmpty 16
+  let mut p := skipWsSrc src 0 limit
+  if p < limit && src.getByteD p == 123 then
+    p := p + 1
+  while p < limit do
+    p := skipWsSrc src p limit
+    if p ≥ limit then break
+    let c := src.getByteD p
+    if c == 125 then break
+    if c == 44 then p := skipWsSrc src (p + 1) limit
+    if p ≥ limit || src.getByteD p != 34 then
+      p := p + 1
+    else
+      let keyStart := p + 1
+      match scanQuotedSrc src keyStart limit with
+      | none => break
+      | some keyEnd =>
+        let keyLen := keyEnd - keyStart
+        p := skipWsSrc src (keyEnd + 1) limit
+        if p ≥ limit || src.getByteD p != 58 then break
+        p := skipWsSrc src (p + 1) limit
+        if p ≥ limit then break
+        if src.getByteD p == 34 then
+          let valStart := p + 1
+          match scanQuotedSrc src valStart limit with
+          | none => break
+          | some valEnd =>
+            let valLen := valEnd - valStart
+            if verifyJsonlTape keyStart.toUInt64 keyLen.toUInt64 valStart.toUInt64 valLen.toUInt64 limit.toUInt64 1 == 1 then
+              entries := entries.push { keyOff := keyStart, keyLen := keyLen, valOff := valStart, valLen := valLen, isString := true }
+            p := valEnd + 1
+        else
+          let valStart := p
+          let (valEnd, maxDepth) := scanRawValueSrc src valStart limit
+          let valLen := valEnd - valStart
+          if valLen > 0 && verifyJsonlTape keyStart.toUInt64 keyLen.toUInt64 valStart.toUInt64 valLen.toUInt64 limit.toUInt64 maxDepth == 1 then
+            entries := entries.push { keyOff := keyStart, keyLen := keyLen, valOff := valStart, valLen := valLen, isString := false }
+          p := if valEnd > p then valEnd else p + 1
+  return { root := src, entries := entries }
+
+@[inline]
+def indexBorrowed (v : BorrowedSlice) : BorrowedJsonTape :=
+  indexSource (ByteSource.ofBorrowed v)
+
+private def keyEqSrc (src : ByteSource) (off len : Nat) (key : String) : Bool := Id.run do
+  let ku := key.toUTF8
+  if ku.size != len then return false
+  for i in [0:len] do
+    if src.getByteD (off + i) != ku.get! i then return false
+  return true
+
+def findEntry? (tape : BorrowedJsonTape) (key : String) : Option JsonTapeEntry := Id.run do
+  for e in tape.entries do
+    if keyEqSrc tape.root e.keyOff e.keyLen key then
+      return some e
+  return none
+
+/-- Lookup a sub-`ByteSource` `(subView, isString)` without copying the root buffer. -/
+def lookupSource? (tape : BorrowedJsonTape) (key : String) : Option (ByteSource × Bool) := do
+  let e ← findEntry? tape key
+  let sub ← tape.root.subSource? e.valOff e.valLen
+  some (sub, e.isString)
+
+/-- Materialize only the matched field's UTF-8 string value. -/
+def lookupString? (tape : BorrowedJsonTape) (key : String) : Option String := do
+  let (sub, _) ← lookupSource? tape key
+  some sub.toStringLossy
+
+/-- Parse an unsigned `Nat` directly from the `ByteSource` value span (`0` allocations). -/
+def lookupNat? (tape : BorrowedJsonTape) (key : String) : Option Nat := Id.run do
+  match findEntry? tape key with
+  | none => return none
+  | some e =>
+    if e.valLen == 0 then return none
+    let mut acc : Nat := 0
+    for i in [0:e.valLen] do
+      let b := tape.root.getByteD (e.valOff + i)
+      if 48 ≤ b && b ≤ 57 then
+        acc := acc * 10 + (b - 48).toNat
+      else
+        return none
+    return some acc
+
+end BorrowedJsonTape
+
 end LeanSys.Codec

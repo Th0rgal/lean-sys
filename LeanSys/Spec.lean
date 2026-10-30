@@ -181,6 +181,60 @@ structure ProtocolRefinementSpec (WireMsg AbsMsg : Type) where
   absSafe : AbsMsg → Bool
   refines_safe : ∀ w, wireGate w = true → ∃ a, decodeAbs w = some a ∧ absSafe a = true
 
+/-- Pure functional state-machine & effect-command ring (`StepReactorSpec`). -/
+structure StepReactorSpec (State InboundEvent OutboundEffect : Type) where
+  inv : State → Prop
+  effectSafe : OutboundEffect → Bool
+  step : State × InboundEvent → State × Array OutboundEffect
+  preserves_inv : ∀ s ev, inv s → inv (step (s, ev)).1
+  emits_safe : ∀ s ev eff, inv s → eff ∈ (step (s, ev)).2.toList → effectSafe eff = true
+
+/-- Fold a deterministic batch of inbound events through a `StepReactorSpec`, accumulating outbound effect batches. -/
+def runReactorTrace (R : StepReactorSpec State Ev Eff) : State → List Ev → State × List (Array Eff)
+  | s, [] => (s, [])
+  | s, ev :: rest =>
+    let (sNext, effs) := R.step (s, ev)
+    let (sFinal, batches) := runReactorTrace R sNext rest
+    (sFinal, effs :: batches)
+
+/-- Every multi-event trace executed through `runReactorTrace` preserves `R.inv`. -/
+theorem StepReactorSpec.trace_preserves_inv (R : StepReactorSpec State Ev Eff)
+    (evs : List Ev) (s : State) (h_init : R.inv s) :
+    R.inv (runReactorTrace R s evs).1 := by
+  induction evs generalizing s with
+  | nil => exact h_init
+  | cons ev rest ih =>
+    simp only [runReactorTrace]
+    exact ih (R.step (s, ev)).1 (R.preserves_inv s ev h_init)
+
+/-- Composable `LinearLeaseSpec`: monotonic fencing-epoch lease state transition rejecting stale writers. -/
+structure LinearLeaseSpec (State Cmd : Type) where
+  currentEpoch : State → UInt64
+  cmdEpoch     : Cmd → UInt64
+  applyLease   : State → Cmd → State
+  monotonic_epoch : ∀ s c, cmdEpoch c > currentEpoch s → currentEpoch (applyLease s c) ≥ cmdEpoch c
+
+/-- Composable `IdempotentOutboxSpec`: deduplicating effect outbox keyed by monotonic/unique delivery IDs. -/
+structure IdempotentOutboxSpec (State Key Eff : Type) where
+  seenKey     : State → Key → Bool
+  recordKey   : State → Key → State × Option Eff
+  idempotent_skip : ∀ s k, seenKey s k = true → (recordKey s k).2 = none ∧ (recordKey s k).1 = s
+
+/-- Composable `ConservedResource` / `QuotaCircuitSpec`: bounded resource accounting (`used + free == total ∧ used ≤ cap`). -/
+structure ConservedResource where
+  usedAndFree : UInt64 × UInt64
+  totalAndCap : UInt64 × UInt64
+  deriving Repr, DecidableEq
+
+/-- Composable `QuotaCircuitSpec`: resource circuit-breaker gate preserving conservation & cap bounds. -/
+structure QuotaCircuitSpec (State Req : Type) where
+  projectRes : State → ConservedResource
+  admitReq   : State → Req → Bool
+  applyReq   : State → Req → State
+  conserves_budget : ∀ s r, admitReq s r = true →
+    (projectRes s).usedAndFree.1 ≤ (projectRes s).totalAndCap.2 →
+    (projectRes (applyReq s r)).usedAndFree.1 ≤ (projectRes (applyReq s r)).totalAndCap.2
+
 /-! ## Layer II: Declarative Systems Corollaries (≤ 3 Lines Each) -/
 
 /-- Layer II Bundle 1: Zero-copy slice bounds gate (`off + len ≤ cap`). -/
@@ -1305,11 +1359,13 @@ def isaVariantRequiredMask (variantId : UInt8) : UInt64 :=
   else if variantId == 2 then 0x31F
   else if variantId == 3 then 0x37F
   else if variantId == 4 then 0x39F
+  else if variantId == 5 then 0x7C00
+  else if variantId == 6 then 0xFC00
   else 0xFFFFFFFFFFFFFFFF
 
 /--
   Unboxed C-ABI Capability-Checked Runtime ISA Variant Selector (`leansys_select_isa`):
-  Returns `requestedVariantId` if and only if `0 < requestedVariantId ≤ maxVariantId ≤ 4`,
+  Returns `requestedVariantId` if and only if `0 < requestedVariantId ≤ maxVariantId ≤ 6`,
   `requiredMask == isaVariantRequiredMask requestedVariantId` (rejecting forged masks),
   and every capability bit in `requiredMask` is present in `detectedHwCaps`
   (`(detectedHwCaps &&& requiredMask) == requiredMask`); otherwise deterministically falls back
@@ -1318,20 +1374,20 @@ def isaVariantRequiredMask (variantId : UInt8) : UInt64 :=
 @[inline, export leansys_select_isa]
 def selectIsaVariant (detectedHwCaps requiredMask : UInt64)
     (requestedVariantId maxVariantId : UInt8) : UInt8 :=
-  if 0 < requestedVariantId && requestedVariantId ≤ maxVariantId && maxVariantId ≤ 4 &&
+  if 0 < requestedVariantId && requestedVariantId ≤ maxVariantId && maxVariantId ≤ 6 &&
      requiredMask == isaVariantRequiredMask requestedVariantId &&
      (detectedHwCaps &&& requiredMask) == requiredMask then requestedVariantId else 0
 
 /--
   Unboxed C-ABI Runtime ISA Selection Gate (`leansys_verify_isa_selection`):
-  Certifies that `selectedVariantId ≤ maxVariantId ≤ 4`, `requiredMask == isaVariantRequiredMask selectedVariantId`,
+  Certifies that `selectedVariantId ≤ maxVariantId ≤ 6`, `requiredMask == isaVariantRequiredMask selectedVariantId`,
   and any non-baseline variant (`selectedVariantId != 0`) has its canonical `requiredMask`
   fully supported by `detectedHwCaps`.
 -/
 @[inline, export leansys_verify_isa_selection]
 def verifyIsaSelection (detectedHwCaps requiredMask : UInt64)
     (selectedVariantId maxVariantId : UInt8) : UInt8 :=
-  if selectedVariantId ≤ maxVariantId && maxVariantId ≤ 4 &&
+  if selectedVariantId ≤ maxVariantId && maxVariantId ≤ 6 &&
      requiredMask == isaVariantRequiredMask selectedVariantId &&
      (selectedVariantId == 0 || (detectedHwCaps &&& requiredMask) == requiredMask) then 1 else 0
 
@@ -1344,7 +1400,7 @@ structure IsaSelectionCheck where
 /-- Layer II Bundle 34: Capability-checked runtime ISA selection gate (`leansys_verify_isa_selection`). -/
 @[inline]
 def isaSelectionSafe (s : IsaSelectionCheck) : Bool :=
-  s.selAndMax.1 ≤ s.selAndMax.2 && s.selAndMax.2 ≤ 4 &&
+  s.selAndMax.1 ≤ s.selAndMax.2 && s.selAndMax.2 ≤ 6 &&
   s.capsAndReq.2 == isaVariantRequiredMask s.selAndMax.1 &&
   (s.selAndMax.1 == 0 || (s.capsAndReq.1 &&& s.capsAndReq.2) == s.capsAndReq.2)
 
@@ -1370,7 +1426,7 @@ theorem isa_selection_rejects_unsupported_or_oob (s : IsaSelectionCheck)
 
 /-- Corollary 34b: `selectIsaVariant` always produces a variant ID whose canonical mask is admitted by `verifyIsaSelection`. -/
 theorem select_isa_variant_always_admitted (detectedHwCaps requiredMask : UInt64)
-    (reqVar maxVar : UInt8) (hMax : (maxVar ≤ 4) = true) :
+    (reqVar maxVar : UInt8) (hMax : (maxVar ≤ 6) = true) :
     let sel := selectIsaVariant detectedHwCaps requiredMask reqVar maxVar
     verifyIsaSelection detectedHwCaps (isaVariantRequiredMask sel) sel maxVar = 1 := by
   dsimp only
@@ -1427,5 +1483,318 @@ theorem fd_bounds_preserves_full_uint32 (fd : UInt32) (h_pos : fd ≤ 0x7FFFFFFF
     apply UInt64.le_iff_toNat_le.mpr
     simpa [UInt32.toNat_toUInt64] using hn
   simp [hle]
+
+
+/--
+  Unboxed C-ABI `AF_UNIX` `sockaddr_un.sun_path` Bounds & NUL-Safety Gate (`leansys_verify_unix_path_bounds`):
+  Certifies that an absolute Unix domain socket path is non-empty, fits strictly inside the portable
+  POSIX `sun_path` NUL-terminated buffer (`1 ≤ pathLen ≤ 103`, portable across Linux 108-byte and BSD/macOS 104-byte `sun_path`),
+  and contains zero interior NUL bytes (`noInteriorNull == 1`).
+-/
+@[inline, export leansys_verify_unix_path_bounds]
+def verifyUnixPathBounds (pathLen : UInt64) (noInteriorNull : UInt8) : UInt8 :=
+  if 0 < pathLen && pathLen ≤ 103 && noInteriorNull == 1 then 1 else 0
+
+/-- `AF_UNIX` path bounds check parameters (≤ 3 fields). -/
+structure UnixPathBoundsCheck where
+  pathLen        : UInt64
+  noInteriorNull : UInt8
+  deriving Repr, DecidableEq
+
+/-- Layer II Bundle 36: `AF_UNIX` socket path length & NUL-injection safety gate (`leansys_verify_unix_path_bounds`). -/
+def unixPathBoundsMetaSpec : MetaGateSpec Unit UnixPathBoundsCheck where
+  inv _ := True
+  gate _ u := verifyUnixPathBounds u.pathLen u.noInteriorNull == 1
+  step _ _ := ()
+  safe _ u := (0 < u.pathLen && u.pathLen ≤ 103 && u.noInteriorNull == 1)
+  preserves_inv _ _ _ h := h
+  ensures_safe _ u h := by
+    unfold verifyUnixPathBounds at h
+    split at h
+    · assumption
+    · contradiction
+
+/-- Corollary 36: `verifyUnixPathBounds` rejects empty, overlong (`> 103`), or NUL-injected `AF_UNIX` paths. -/
+theorem unix_path_bounds_rejects_overflow_or_null (u : UnixPathBoundsCheck)
+    (h_bad : (0 < u.pathLen && u.pathLen ≤ 103 && u.noInteriorNull == 1) = false) :
+    (verifyUnixPathBounds u.pathLen u.noInteriorNull == 1) = false :=
+  unixPathBoundsMetaSpec.rejects_unsafe () u h_bad
+
+/--
+  Unboxed C-ABI Constant-Time 256-Bit Cryptographic CAS Digest & Path-Safety Gate (`leansys_verify_cas_digest256`):
+  Accumulates bitwise XOR differences across all four 64-bit limbs without short-circuiting on limb mismatch,
+  rejecting all-zero digests, any 256-bit mismatch, and any path-traversal separator (`hasPathSep != 0`).
+-/
+@[inline, export leansys_verify_cas_digest256]
+def verifyCasDigest256 (e0 e1 e2 e3 c0 c1 c2 c3 : UInt64) (hasPathSep : UInt8) : UInt8 :=
+  if ((e0 ||| e1 ||| e2 ||| e3) != 0) &&
+     (((e0 ^^^ c0) ||| (e1 ^^^ c1) ||| (e2 ^^^ c2) ||| (e3 ^^^ c3)) == 0) &&
+     (hasPathSep == 0) then 1 else 0
+
+/-- 256-bit cryptographic CAS digest check parameters (≤ 3 fields via tuple packing). -/
+structure CasDigest256Check where
+  expected : UInt64 × UInt64 × UInt64 × UInt64
+  computed : UInt64 × UInt64 × UInt64 × UInt64
+  pathSep  : UInt8
+  deriving Repr, DecidableEq
+
+@[inline]
+def casDigest256Safe (d : CasDigest256Check) : Bool :=
+  ((d.expected.1 ||| d.expected.2.1 ||| d.expected.2.2.1 ||| d.expected.2.2.2) != 0) &&
+  (((d.expected.1 ^^^ d.computed.1) ||| (d.expected.2.1 ^^^ d.computed.2.1) |||
+    (d.expected.2.2.1 ^^^ d.computed.2.2.1) ||| (d.expected.2.2.2 ^^^ d.computed.2.2.2)) == 0) &&
+  (d.pathSep == 0)
+
+/-- Layer II Bundle 37: Constant-time 256-bit CAS digest & path-traversal gate (`leansys_verify_cas_digest256`). -/
+def casDigest256MetaSpec : MetaGateSpec Unit CasDigest256Check where
+  inv _ := True
+  gate _ d :=
+    verifyCasDigest256 d.expected.1 d.expected.2.1 d.expected.2.2.1 d.expected.2.2.2
+      d.computed.1 d.computed.2.1 d.computed.2.2.1 d.computed.2.2.2 d.pathSep == 1
+  step _ _ := ()
+  safe _ d := casDigest256Safe d
+  preserves_inv _ _ _ h := h
+  ensures_safe _ d h := by
+    unfold verifyCasDigest256 at h
+    unfold casDigest256Safe
+    split at h
+    · assumption
+    · contradiction
+
+/-- Corollary 37: `verifyCasDigest256` rejects zero digests, any 256-bit limb mismatch, or path traversal. -/
+theorem cas_digest256_rejects_mismatch_or_traversal (d : CasDigest256Check)
+    (h_bad : casDigest256Safe d = false) :
+    (verifyCasDigest256 d.expected.1 d.expected.2.1 d.expected.2.2.1 d.expected.2.2.2
+      d.computed.1 d.computed.2.1 d.computed.2.2.1 d.computed.2.2.2 d.pathSep == 1) = false :=
+  casDigest256MetaSpec.rejects_unsafe () d h_bad
+
+/--
+  Unboxed C-ABI AWS Signature V4 (`AWS4-HMAC-SHA256`) Canonical Envelope & Presigned Expiry Gate (`leansys_verify_sigv4_envelope`):
+  Certifies that canonical headers and query parameters contain zero CR/LF/NUL/colon injection (`noHeaderCtl == 1`),
+  `host` is included in `SignedHeaders` (`hostSigned == 1`), `signedHeaderCount > 0 && signedHeaderCount ≤ 32`,
+  presigned TTL lies within S3 bounds (`0 < expiresSecs && expiresSecs ≤ 604800`),
+  and `nowEpoch < signedAtEpoch + expiresSecs` without 64-bit wraparound.
+-/
+@[inline, export leansys_verify_sigv4_envelope]
+def verifySigV4Envelope (signedAtEpoch nowEpoch expiresSecs : UInt64)
+    (signedHeaderCount : UInt32) (noHeaderCtl hostSigned : UInt8) : UInt8 :=
+  if noHeaderCtl == 1 && hostSigned == 1 &&
+     0 < signedHeaderCount && signedHeaderCount ≤ 32 &&
+     0 < expiresSecs && expiresSecs ≤ 604800 &&
+     signedAtEpoch ≤ 0xFFFFFFFFFFFFFFFF - expiresSecs &&
+     nowEpoch < signedAtEpoch + expiresSecs then 1 else 0
+
+/-- AWS SigV4 canonical envelope check parameters (≤ 3 fields via tuple packing). -/
+structure SigV4EnvelopeCheck where
+  epochs  : UInt64 × UInt64 × UInt64
+  hdrCnt  : UInt32
+  flags   : UInt8 × UInt8
+  deriving Repr, DecidableEq
+
+@[inline]
+def sigV4EnvelopeSafe (v : SigV4EnvelopeCheck) : Bool :=
+  v.flags.1 == 1 && v.flags.2 == 1 &&
+  0 < v.hdrCnt && v.hdrCnt ≤ 32 &&
+  0 < v.epochs.2.2 && v.epochs.2.2 ≤ 604800 &&
+  v.epochs.1 ≤ 0xFFFFFFFFFFFFFFFF - v.epochs.2.2 &&
+  v.epochs.2.1 < v.epochs.1 + v.epochs.2.2
+
+/-- Layer II Bundle 38: AWS SigV4 header-injection-free & presigned TTL bounds gate (`leansys_verify_sigv4_envelope`). -/
+def sigV4EnvelopeMetaSpec : MetaGateSpec Unit SigV4EnvelopeCheck where
+  inv _ := True
+  gate _ v := verifySigV4Envelope v.epochs.1 v.epochs.2.1 v.epochs.2.2 v.hdrCnt v.flags.1 v.flags.2 == 1
+  step _ _ := ()
+  safe _ v := sigV4EnvelopeSafe v
+  preserves_inv _ _ _ h := h
+  ensures_safe _ v h := by
+    unfold verifySigV4Envelope at h
+    unfold sigV4EnvelopeSafe
+    split at h
+    · assumption
+    · contradiction
+
+/-- Corollary 38: `verifySigV4Envelope` rejects header control-byte injection, unsigned `host`, or expired/overlong TTLs. -/
+theorem sigv4_envelope_rejects_injection_or_expired (v : SigV4EnvelopeCheck)
+    (h_bad : sigV4EnvelopeSafe v = false) :
+    (verifySigV4Envelope v.epochs.1 v.epochs.2.1 v.epochs.2.2 v.hdrCnt v.flags.1 v.flags.2 == 1) = false :=
+  sigV4EnvelopeMetaSpec.rejects_unsafe () v h_bad
+
+/--
+  Unboxed C-ABI Linux `cgroup v2` Memory & OOM-Kill Budget Gate (`leansys_verify_cgroup_v2_budget`):
+  Certifies that live `memory.current` (`memCurrentBytes ≤ memMaxBytes`), `memory.events` `oom_kill == 0`,
+  and `cgroupAttached == 1` hold simultaneously.
+-/
+@[inline, export leansys_verify_cgroup_v2_budget]
+def verifyCgroupV2Budget (memCurrentBytes memMaxBytes oomKillCount : UInt64) (cgroupAttached : UInt8) : UInt8 :=
+  if cgroupAttached == 1 && oomKillCount == 0 && memCurrentBytes ≤ memMaxBytes then 1 else 0
+
+/-- Linux `cgroup v2` memory & OOM-kill check parameters (≤ 3 fields via tuple packing). -/
+structure CgroupV2BudgetCheck where
+  memCurAndMax   : UInt64 × UInt64
+  oomKillCount   : UInt64
+  cgroupAttached : UInt8
+  deriving Repr, DecidableEq
+
+/-- Layer II Bundle 39: Linux `cgroup v2` live memory & OOM-kill enforcement gate (`leansys_verify_cgroup_v2_budget`). -/
+def cgroupV2BudgetMetaSpec : MetaGateSpec Unit CgroupV2BudgetCheck where
+  inv _ := True
+  gate _ c := verifyCgroupV2Budget c.memCurAndMax.1 c.memCurAndMax.2 c.oomKillCount c.cgroupAttached == 1
+  step _ _ := ()
+  safe _ c := (c.cgroupAttached == 1 && c.oomKillCount == 0 && c.memCurAndMax.1 ≤ c.memCurAndMax.2)
+  preserves_inv _ _ _ h := h
+  ensures_safe _ c h := by
+    unfold verifyCgroupV2Budget at h
+    split at h
+    · assumption
+    · contradiction
+
+/-- Corollary 39: `verifyCgroupV2Budget` rejects unattached cgroups, nonzero `oom_kill`, or memory overruns. -/
+theorem cgroup_v2_budget_rejects_oom_or_overrun (c : CgroupV2BudgetCheck)
+    (h_bad : (c.cgroupAttached == 1 && c.oomKillCount == 0 && c.memCurAndMax.1 ≤ c.memCurAndMax.2) = false) :
+    (verifyCgroupV2Budget c.memCurAndMax.1 c.memCurAndMax.2 c.oomKillCount c.cgroupAttached == 1) = false :=
+  cgroupV2BudgetMetaSpec.rejects_unsafe () c h_bad
+
+/--
+  Unboxed C-ABI Linux `io_uring` SQ/CQ Ring Descriptor & Submission Gate (`leansys_verify_io_uring_ring`):
+  Certifies power-of-two non-zero ring capacity (`0 < ringEntries && ringEntries ≤ 4096 && (ringEntries &&& (ringEntries - 1)) == 0`),
+  `ringMask == ringEntries - 1`, queue occupancy `sqTail - sqHead ≤ ringEntries`,
+  and batch submission capacity `toSubmit ≤ ringEntries - (sqTail - sqHead)` with `sqHead ≤ sqTail`.
+-/
+@[inline, export leansys_verify_io_uring_ring]
+def verifyIoUringRing (sqHead sqTail ringEntries ringMask toSubmit : UInt32) : UInt8 :=
+  if 0 < ringEntries && ringEntries ≤ 4096 &&
+     (ringEntries &&& (ringEntries - 1)) == 0 &&
+     ringMask == ringEntries - 1 &&
+     sqHead ≤ sqTail &&
+     sqTail - sqHead ≤ ringEntries &&
+     toSubmit ≤ ringEntries - (sqTail - sqHead) then 1 else 0
+
+/-- Linux `io_uring` SQ/CQ ring check parameters (≤ 3 fields via tuple packing). -/
+structure IoUringRingCheck where
+  cursors : UInt32 × UInt32
+  ringCfg : UInt32 × UInt32
+  submit  : UInt32
+  deriving Repr, DecidableEq
+
+@[inline]
+def ioUringRingSafe (u : IoUringRingCheck) : Bool :=
+  0 < u.ringCfg.1 && u.ringCfg.1 ≤ 4096 &&
+  (u.ringCfg.1 &&& (u.ringCfg.1 - 1)) == 0 &&
+  u.ringCfg.2 == u.ringCfg.1 - 1 &&
+  u.cursors.1 ≤ u.cursors.2 &&
+  u.cursors.2 - u.cursors.1 ≤ u.ringCfg.1 &&
+  u.submit ≤ u.ringCfg.1 - (u.cursors.2 - u.cursors.1)
+
+/-- Layer II Bundle 40: Linux `io_uring` SQ/CQ power-of-two mask & submission capacity gate (`leansys_verify_io_uring_ring`). -/
+def ioUringRingMetaSpec : MetaGateSpec Unit IoUringRingCheck where
+  inv _ := True
+  gate _ u := verifyIoUringRing u.cursors.1 u.cursors.2 u.ringCfg.1 u.ringCfg.2 u.submit == 1
+  step _ _ := ()
+  safe _ u := ioUringRingSafe u
+  preserves_inv _ _ _ h := h
+  ensures_safe _ u h := by
+    unfold verifyIoUringRing at h
+    unfold ioUringRingSafe
+    split at h
+    · assumption
+    · contradiction
+
+/-- Corollary 40: `verifyIoUringRing` rejects non-power-of-two rings, forged masks, or SQ overflows. -/
+theorem io_uring_ring_rejects_overflow_or_bad_mask (u : IoUringRingCheck)
+    (h_bad : ioUringRingSafe u = false) :
+    (verifyIoUringRing u.cursors.1 u.cursors.2 u.ringCfg.1 u.ringCfg.2 u.submit == 1) = false :=
+  ioUringRingMetaSpec.rejects_unsafe () u h_bad
+
+/--
+  Unboxed C-ABI Zero-Copy Borrowed-Pointer View Gate (`leansys_verify_borrowed_view`):
+  Certifies that an external borrowed `(ptrAddr, viewLen)` buffer is non-null,
+  does not wrap the 64-bit address space (`ptrAddr ≤ 0xFFFFFFFFFFFFFFFF - viewLen`),
+  and satisfies `[relOff, relOff + subLen) ⊆ [0, viewLen]`.
+-/
+@[inline, export leansys_verify_borrowed_view]
+def verifyBorrowedView (ptrAddr viewLen relOff subLen : UInt64) : UInt8 :=
+  if ptrAddr != 0 && ptrAddr ≤ 0xFFFFFFFFFFFFFFFF - viewLen &&
+     relOff ≤ viewLen && subLen ≤ viewLen - relOff then 1 else 0
+
+/-- External borrowed pointer slice check parameters (≤ 3 fields via tuple packing). -/
+structure BorrowedViewCheck where
+  ptrAndCap : UInt64 × UInt64
+  offAndLen : UInt64 × UInt64
+  deriving Repr, DecidableEq
+
+@[inline]
+def borrowedViewSafe (b : BorrowedViewCheck) : Bool :=
+  b.ptrAndCap.1 != 0 &&
+  b.ptrAndCap.1 ≤ 0xFFFFFFFFFFFFFFFF - b.ptrAndCap.2 &&
+  b.offAndLen.1 ≤ b.ptrAndCap.2 &&
+  b.offAndLen.2 ≤ b.ptrAndCap.2 - b.offAndLen.1
+
+/-- Layer II Bundle 41: Zero-copy external borrowed slice non-null & address-wraparound gate (`leansys_verify_borrowed_view`). -/
+def borrowedViewMetaSpec : MetaGateSpec Unit BorrowedViewCheck where
+  inv _ := True
+  gate _ b := verifyBorrowedView b.ptrAndCap.1 b.ptrAndCap.2 b.offAndLen.1 b.offAndLen.2 == 1
+  step _ _ := ()
+  safe _ b := borrowedViewSafe b
+  preserves_inv _ _ _ h := h
+  ensures_safe _ b h := by
+    unfold verifyBorrowedView at h
+    unfold borrowedViewSafe
+    split at h
+    · assumption
+    · contradiction
+
+/-- Corollary 41: `verifyBorrowedView` rejects null pointers, address-space wraparound, or out-of-bounds sub-views. -/
+theorem borrowed_view_rejects_null_or_oob (b : BorrowedViewCheck)
+    (h_bad : borrowedViewSafe b = false) :
+    (verifyBorrowedView b.ptrAndCap.1 b.ptrAndCap.2 b.offAndLen.1 b.offAndLen.2 == 1) = false :=
+  borrowedViewMetaSpec.rejects_unsafe () b h_bad
+
+/--
+  Unboxed C-ABI StepReactor Monotonic Lease, Idempotency & Quota Step Gate (`leansys_verify_step_reactor`):
+  Composes `LinearLeaseSpec` (`cmdEpoch ≥ minEpoch`), `IdempotentOutboxSpec` (`alreadySeen == 0`),
+  and `QuotaCircuitSpec` (`usedAfter ≤ quotaCap ∧ activeConns ≤ maxConns ≤ 1024`) in a single O(1) gate.
+-/
+@[inline, export leansys_verify_step_reactor]
+def verifyStepReactor (cmdEpoch minEpoch usedAfter quotaCap : UInt64)
+    (activeConns maxConns : UInt32) (alreadySeen : UInt8) : UInt8 :=
+  if alreadySeen == 0 && cmdEpoch >= minEpoch &&
+     usedAfter ≤ quotaCap && activeConns ≤ maxConns && maxConns ≤ 1024 then 1 else 0
+
+/-- StepReactor composite transition check parameters (≤ 3 fields via tuple packing). -/
+structure StepReactorCheck where
+  epochsAndQuota : UInt64 × UInt64 × UInt64 × UInt64
+  conns          : UInt32 × UInt32
+  alreadySeen    : UInt8
+  deriving Repr, DecidableEq
+
+@[inline]
+def stepReactorSafe (r : StepReactorCheck) : Bool :=
+  r.alreadySeen == 0 &&
+  r.epochsAndQuota.1 >= r.epochsAndQuota.2.1 &&
+  r.epochsAndQuota.2.2.1 ≤ r.epochsAndQuota.2.2.2 &&
+  r.conns.1 ≤ r.conns.2 && r.conns.2 ≤ 1024
+
+/-- Layer II Bundle 42: Composed StepReactor lease-epoch, idempotency, and quota admission gate (`leansys_verify_step_reactor`). -/
+def stepReactorMetaSpec : MetaGateSpec Unit StepReactorCheck where
+  inv _ := True
+  gate _ r :=
+    verifyStepReactor r.epochsAndQuota.1 r.epochsAndQuota.2.1
+      r.epochsAndQuota.2.2.1 r.epochsAndQuota.2.2.2 r.conns.1 r.conns.2 r.alreadySeen == 1
+  step _ _ := ()
+  safe _ r := stepReactorSafe r
+  preserves_inv _ _ _ h := h
+  ensures_safe _ r h := by
+    unfold verifyStepReactor at h
+    unfold stepReactorSafe
+    split at h
+    · assumption
+    · contradiction
+
+/-- Corollary 42: `verifyStepReactor` rejects duplicate outbox keys, stale lease epochs, or quota/connection overruns. -/
+theorem step_reactor_rejects_stale_dup_or_over_quota (r : StepReactorCheck)
+    (h_bad : stepReactorSafe r = false) :
+    (verifyStepReactor r.epochsAndQuota.1 r.epochsAndQuota.2.1
+      r.epochsAndQuota.2.2.1 r.epochsAndQuota.2.2.2 r.conns.1 r.conns.2 r.alreadySeen == 1) = false :=
+  stepReactorMetaSpec.rejects_unsafe () r h_bad
 
 end LeanSys.Spec

@@ -1,5 +1,6 @@
-//! Zero-dependency typed Rust bindings to all 33 formally verified unboxed C-ABI
+//! Zero-dependency typed Rust bindings to all 40 formally verified unboxed C-ABI
 //! safety gates in `LeanSys/Spec.lean` (`0 import Lean`, `0 sorryAx`).
+#![allow(clippy::too_many_arguments)]
 
 extern "C" {
     pub fn leansys_verify_slice_bounds(off: u64, len: u64, cap: u64) -> u8;
@@ -238,6 +239,61 @@ extern "C" {
     ) -> u8;
 
     pub fn leansys_verify_fd_bounds(raw_word: u64, fd_out: u32) -> u8;
+
+    pub fn leansys_verify_unix_path_bounds(path_len: u64, no_interior_null: u8) -> u8;
+
+    pub fn leansys_verify_cas_digest256(
+        e0: u64,
+        e1: u64,
+        e2: u64,
+        e3: u64,
+        c0: u64,
+        c1: u64,
+        c2: u64,
+        c3: u64,
+        has_path_sep: u8,
+    ) -> u8;
+
+    pub fn leansys_verify_sigv4_envelope(
+        signed_at_epoch: u64,
+        now_epoch: u64,
+        expires_secs: u64,
+        signed_header_count: u32,
+        no_header_ctl: u8,
+        host_signed: u8,
+    ) -> u8;
+
+    pub fn leansys_verify_cgroup_v2_budget(
+        mem_current_bytes: u64,
+        mem_max_bytes: u64,
+        oom_kill_count: u64,
+        cgroup_attached: u8,
+    ) -> u8;
+
+    pub fn leansys_verify_io_uring_ring(
+        sq_head: u32,
+        sq_tail: u32,
+        ring_entries: u32,
+        ring_mask: u32,
+        to_submit: u32,
+    ) -> u8;
+
+    pub fn leansys_verify_borrowed_view(
+        ptr_addr: u64,
+        view_len: u64,
+        rel_off: u64,
+        sub_len: u64,
+    ) -> u8;
+
+    pub fn leansys_verify_step_reactor(
+        cmd_epoch: u64,
+        min_epoch: u64,
+        used_after: u64,
+        quota_cap: u64,
+        active_conns: u32,
+        max_conns: u32,
+        already_seen: u8,
+    ) -> u8;
 }
 
 pub const WAL_MAGIC: u32 = 0x4C53_5953;
@@ -485,7 +541,9 @@ pub fn sse_frame_scan(
     last_byte: u8,
 ) -> bool {
     unsafe {
-        leansys_sse_frame_scan(frame_off, frame_len, chunk_len, field_kind, next_byte, last_byte) == 1
+        leansys_sse_frame_scan(
+            frame_off, frame_len, chunk_len, field_kind, next_byte, last_byte,
+        ) == 1
     }
 }
 
@@ -534,12 +592,7 @@ pub fn transcript_index(
 }
 
 #[inline]
-pub fn verify_par_chunk(
-    chunk_start: u64,
-    chunk_end: u64,
-    total_len: u64,
-    min_grain: u64,
-) -> bool {
+pub fn verify_par_chunk(chunk_start: u64, chunk_end: u64, total_len: u64, min_grain: u64) -> bool {
     unsafe { leansys_verify_par_chunk(chunk_start, chunk_end, total_len, min_grain) == 1 }
 }
 
@@ -555,7 +608,11 @@ pub fn verify_arena_disjoint(
 }
 
 #[inline]
-pub fn verify_snapshot_visibility(entry_seq: u64, max_snapshot_seq: u64, is_tombstone: bool) -> bool {
+pub fn verify_snapshot_visibility(
+    entry_seq: u64,
+    max_snapshot_seq: u64,
+    is_tombstone: bool,
+) -> bool {
     unsafe {
         leansys_verify_snapshot_visibility(entry_seq, max_snapshot_seq, u8::from(is_tombstone)) == 1
     }
@@ -714,12 +771,211 @@ pub fn verify_fd_bounds(raw_word: u64, fd_out: u32) -> bool {
     unsafe { leansys_verify_fd_bounds(raw_word, fd_out) == 1 }
 }
 
+/// Zero-cost `#[repr(transparent)]` domain newtypes preventing positional primitive-argument mixups.
+#[repr(transparent)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Epoch(pub u64);
+
+#[repr(transparent)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ByteLen(pub u64);
+
+#[repr(transparent)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+pub struct PosixFd(pub u32);
+
+#[repr(transparent)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+pub struct IsaVariant(pub u8);
+
+/// `#[repr(C)]` 256-bit cryptographic digest limbs (`4 * u64` big-endian words).
+#[repr(C)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+pub struct Digest256Limbs {
+    pub w0: u64,
+    pub w1: u64,
+    pub w2: u64,
+    pub w3: u64,
+}
+
+impl Digest256Limbs {
+    #[inline]
+    pub fn from_be_bytes(bytes: &[u8; 32]) -> Self {
+        Self {
+            w0: u64::from_be_bytes(bytes[0..8].try_into().unwrap()),
+            w1: u64::from_be_bytes(bytes[8..16].try_into().unwrap()),
+            w2: u64::from_be_bytes(bytes[16..24].try_into().unwrap()),
+            w3: u64::from_be_bytes(bytes[24..32].try_into().unwrap()),
+        }
+    }
+}
+
+/// `#[repr(C)]` zero-copy external `(ptr, len)` byte view matching `LeanSys.Posix.BorrowedSlice` / `RawByteView`.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct RawByteView {
+    pub ptr: usize,
+    pub len: usize,
+}
+
+impl RawByteView {
+    /// Construct a certified `RawByteView` from a Rust `&[u8]` slice via `leansys_verify_borrowed_view`.
+    #[inline]
+    pub fn from_slice(slice: &[u8]) -> Option<Self> {
+        let ptr = slice.as_ptr() as usize;
+        let len = slice.len();
+        if verify_borrowed_view(ptr as u64, len as u64, 0, len as u64) {
+            Some(Self { ptr, len })
+        } else {
+            None
+        }
+    }
+
+    #[inline]
+    pub fn sub_view(&self, rel_off: usize, sub_len: usize) -> Option<Self> {
+        if verify_borrowed_view(
+            self.ptr as u64,
+            self.len as u64,
+            rel_off as u64,
+            sub_len as u64,
+        ) {
+            Some(Self {
+                ptr: self.ptr + rel_off,
+                len: sub_len,
+            })
+        } else {
+            None
+        }
+    }
+}
+
+#[inline]
+pub fn verify_unix_path_bounds(path_len: u64, no_interior_null: bool) -> bool {
+    unsafe { leansys_verify_unix_path_bounds(path_len, u8::from(no_interior_null)) == 1 }
+}
+
+/// Safe `&[u8]` wrapper checking `AF_UNIX` path bytes (`/` prefix, `<= 103` bytes, no interior `NUL`).
+#[inline]
+pub fn verify_unix_socket_path(path: &[u8]) -> bool {
+    let starts_slash = path.first() == Some(&b'/');
+    let no_null = !path.contains(&0);
+    starts_slash && verify_unix_path_bounds(path.len() as u64, no_null)
+}
+
+#[inline]
+pub fn verify_cas_digest256(
+    expected: Digest256Limbs,
+    computed: Digest256Limbs,
+    has_path_sep: bool,
+) -> bool {
+    unsafe {
+        leansys_verify_cas_digest256(
+            expected.w0,
+            expected.w1,
+            expected.w2,
+            expected.w3,
+            computed.w0,
+            computed.w1,
+            computed.w2,
+            computed.w3,
+            u8::from(has_path_sep),
+        ) == 1
+    }
+}
+
+#[inline]
+pub fn verify_sigv4_envelope(
+    signed_at: Epoch,
+    now: Epoch,
+    expires_secs: u64,
+    signed_header_count: u32,
+    no_header_ctl: bool,
+    host_signed: bool,
+) -> bool {
+    unsafe {
+        leansys_verify_sigv4_envelope(
+            signed_at.0,
+            now.0,
+            expires_secs,
+            signed_header_count,
+            u8::from(no_header_ctl),
+            u8::from(host_signed),
+        ) == 1
+    }
+}
+
+#[inline]
+pub fn verify_cgroup_v2_budget(
+    mem_current: ByteLen,
+    mem_max: ByteLen,
+    oom_kill_count: u64,
+    cgroup_attached: bool,
+) -> bool {
+    unsafe {
+        leansys_verify_cgroup_v2_budget(
+            mem_current.0,
+            mem_max.0,
+            oom_kill_count,
+            u8::from(cgroup_attached),
+        ) == 1
+    }
+}
+
+#[inline]
+pub fn verify_io_uring_ring(
+    sq_head: u32,
+    sq_tail: u32,
+    ring_entries: u32,
+    ring_mask: u32,
+    to_submit: u32,
+) -> bool {
+    unsafe {
+        leansys_verify_io_uring_ring(sq_head, sq_tail, ring_entries, ring_mask, to_submit) == 1
+    }
+}
+
+#[inline]
+pub fn verify_borrowed_view(ptr_addr: u64, view_len: u64, rel_off: u64, sub_len: u64) -> bool {
+    unsafe { leansys_verify_borrowed_view(ptr_addr, view_len, rel_off, sub_len) == 1 }
+}
+
+/// Safe `&[u8]` sub-slice validator backed by `leansys_verify_borrowed_view`.
+#[inline]
+pub fn verify_slice_subview(buf: &[u8], rel_off: usize, sub_len: usize) -> Option<&[u8]> {
+    let view = RawByteView::from_slice(buf)?;
+    let _sub = view.sub_view(rel_off, sub_len)?;
+    Some(&buf[rel_off..rel_off + sub_len])
+}
+
+#[inline]
+pub fn verify_step_reactor(
+    cmd_epoch: Epoch,
+    min_epoch: Epoch,
+    used_after: ByteLen,
+    quota_cap: ByteLen,
+    active_conns: u32,
+    max_conns: u32,
+    already_seen: bool,
+) -> bool {
+    unsafe {
+        leansys_verify_step_reactor(
+            cmd_epoch.0,
+            min_epoch.0,
+            used_after.0,
+            quota_cap.0,
+            active_conns,
+            max_conns,
+            u8::from(already_seen),
+        ) == 1
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn all_33_cabi_gates_enforce_tight_bounds() {
+    fn all_40_cabi_gates_enforce_tight_bounds() {
         assert!(verify_slice_bounds(4, 8, 12));
         assert!(!verify_slice_bounds(5, 8, 12));
 
@@ -831,9 +1087,19 @@ mod tests {
         assert!(!verify_dag_wave_step(1, 4, 8, 16, 4, 4));
         assert!(!verify_dag_wave_step(0, 12, 8, 16, 4, 4));
 
-        assert!(verify_ios_jetsam_budget(4_194_304, 65_536, 134_217_728, 16_383, false));
-        assert!(verify_ios_jetsam_budget(4_194_304, 65_536, 25_165_824, 16_383, true));
-        assert!(!verify_ios_jetsam_budget(4_194_304, 65_536, 33_554_432, 16_383, true));
+        assert!(verify_ios_jetsam_budget(
+            4_194_304,
+            65_536,
+            134_217_728,
+            16_383,
+            false
+        ));
+        assert!(verify_ios_jetsam_budget(
+            4_194_304, 65_536, 25_165_824, 16_383, true
+        ));
+        assert!(!verify_ios_jetsam_budget(
+            4_194_304, 65_536, 33_554_432, 16_383, true
+        ));
 
         assert!(verify_worker_budget(4, 6, 24, 4096, 1));
         assert!(!verify_worker_budget(4, 8, 24, 4096, 1));
@@ -869,5 +1135,120 @@ mod tests {
         assert!(verify_fd_bounds(0x7FFF_FFFF, 0x7FFF_FFFF));
         assert!(!verify_fd_bounds(0x8000_0000, 0x8000_0000));
         assert!(!verify_fd_bounds(70_000, 4_464));
+
+        // x86_64 Zen 4 (variant 5 = 0x7C00) & Zen 5 (variant 6 = 0xFC00) ISA selection
+        assert_eq!(select_isa(0x7C00, 0x7C00, 5, 6), 5);
+        assert_eq!(select_isa(0xFC00, 0xFC00, 6, 6), 6);
+        assert_eq!(select_isa(0x7C00, 0xFC00, 6, 6), 0);
+        assert!(verify_isa_selection(0xFC00, 0xFC00, 6, 6));
+
+        // AF_UNIX bounds
+        assert!(verify_unix_socket_path(b"/tmp/leansys.sock"));
+        assert!(!verify_unix_socket_path(b"relative.sock"));
+        assert!(!verify_unix_socket_path(b"/tmp/bad\0path.sock"));
+        assert!(!verify_unix_path_bounds(104, true));
+
+        // 256-bit CAS digest
+        let d1 = Digest256Limbs::from_be_bytes(&[0xAB; 32]);
+        let d2 = Digest256Limbs::from_be_bytes(&[0xAC; 32]);
+        let dz = Digest256Limbs::from_be_bytes(&[0u8; 32]);
+        assert!(verify_cas_digest256(d1, d1, false));
+        assert!(!verify_cas_digest256(d1, d2, false));
+        assert!(!verify_cas_digest256(d1, d1, true));
+        assert!(!verify_cas_digest256(dz, dz, false));
+
+        // AWS SigV4 envelope
+        assert!(verify_sigv4_envelope(
+            Epoch(1000),
+            Epoch(1200),
+            900,
+            3,
+            true,
+            true
+        ));
+        assert!(!verify_sigv4_envelope(
+            Epoch(1000),
+            Epoch(2000),
+            900,
+            3,
+            true,
+            true
+        ));
+        assert!(!verify_sigv4_envelope(
+            Epoch(1000),
+            Epoch(1200),
+            900,
+            3,
+            false,
+            true
+        ));
+        assert!(!verify_sigv4_envelope(
+            Epoch(1000),
+            Epoch(1200),
+            900,
+            3,
+            true,
+            false
+        ));
+
+        // Linux cgroup v2 budget
+        assert!(verify_cgroup_v2_budget(
+            ByteLen(1024),
+            ByteLen(4096),
+            0,
+            true
+        ));
+        assert!(!verify_cgroup_v2_budget(
+            ByteLen(1024),
+            ByteLen(4096),
+            1,
+            true
+        ));
+        assert!(!verify_cgroup_v2_budget(
+            ByteLen(8192),
+            ByteLen(4096),
+            0,
+            true
+        ));
+
+        // Linux io_uring SQ/CQ ring
+        assert!(verify_io_uring_ring(2, 5, 8, 7, 4));
+        assert!(!verify_io_uring_ring(2, 5, 8, 7, 6));
+        assert!(!verify_io_uring_ring(0, 0, 6, 5, 1));
+
+        // Zero-copy BorrowedView & safe slice wrapper
+        let sample = b"hello-zero-copy-slice";
+        assert_eq!(verify_slice_subview(sample, 6, 9), Some(&b"zero-copy"[..]));
+        assert_eq!(verify_slice_subview(sample, 16, 10), None);
+        assert!(!verify_borrowed_view(0, 16, 0, 4));
+
+        // StepReactor composite gate
+        assert!(verify_step_reactor(
+            Epoch(10),
+            Epoch(9),
+            ByteLen(512),
+            ByteLen(1024),
+            4,
+            62,
+            false
+        ));
+        assert!(!verify_step_reactor(
+            Epoch(8),
+            Epoch(9),
+            ByteLen(512),
+            ByteLen(1024),
+            4,
+            62,
+            false
+        ));
+        assert!(!verify_step_reactor(
+            Epoch(10),
+            Epoch(9),
+            ByteLen(512),
+            ByteLen(1024),
+            4,
+            62,
+            true
+        ));
     }
 }

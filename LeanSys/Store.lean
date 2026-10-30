@@ -14,6 +14,7 @@
 import LeanSys.Spec
 import LeanSys.Posix
 import LeanSys.Hash
+import LeanSys.Auth
 import Std.Data.HashMap
 
 namespace LeanSys.Store
@@ -21,6 +22,7 @@ namespace LeanSys.Store
 open LeanSys.Spec
 open LeanSys.Posix
 open LeanSys.Hash
+open LeanSys.Auth (Digest256 Sha256Stream)
 
 /-! ## Binary Little-Endian Packing Helpers (`UInt32` / `UInt64`) -/
 
@@ -519,5 +521,243 @@ def casMaterialize (h : Handle) (hexKey : String) (targetPath : String) : IO (Sy
     match ← withFd tmpTarget 4 (fun fd => writeAll fd bytes true) (exclusive := 2) with
     | .error e => pure (.error e)
     | .ok _ => atomicRename tmpTarget targetPath
+
+
+/-! ## Streaming 256-Bit Cryptographic CAS & CoW Reflink Materialization (`casPutStream256`, `casMaterializeReflink`) -/
+
+/-- Cryptographic 256-bit CAS algorithm selector (`sha256` standard FIPS 180-4, `keyed256` domain-separated 256-bit stream). -/
+inductive CasAlgo256 where
+  | sha256
+  | keyed256 (domainTag : UInt32 := 0x424C4B33)
+  deriving Repr, DecidableEq, Inhabited
+
+/-- Materialization receipt indicating whether CoW reflink (`FICLONE` / `clonefile`) or caller-authorized copy ran. -/
+inductive ReflinkOutcome where
+  | reflinked
+  | copiedFallback
+  deriving Repr, DecidableEq
+
+@[inline]
+private def initCasStream (algo : CasAlgo256) : Sha256Stream :=
+  match algo with
+  | .sha256 => Sha256Stream.init
+  | .keyed256 tag => Sha256Stream.initDomain tag
+
+/-- Stream-verify an open file at `path` in bounded `chunkBytes` (default `1 MiB`) `pread` windows without loading
+    the full blob into RAM, returning its 256-bit `Digest256`. -/
+def computeFileDigest256 (path : String) (algo : CasAlgo256 := .sha256) (chunkBytes : Nat := 1048576) : IO (SysResult Digest256) := do
+  let step := Nat.max 4096 (Nat.min chunkBytes 4194304)
+  withFd path 0 fun fd => do
+    match ← fstatSize fd with
+    | .error e => pure (.error e)
+    | .ok totalSz =>
+      let mut st := initCasStream algo
+      let mut off : UInt64 := 0
+      while off < totalSz do
+        let rem := (totalSz - off).toNat
+        let want := Nat.min step rem
+        let chunk ← preadByteArray fd off want
+        if chunk.size == 0 then
+          return .error .eio
+        st := st.updateBytes chunk
+        off := off + chunk.size.toUInt64
+      pure (.ok st.finalizeDigest256)
+
+/-- Verify a 256-bit CAS blob on disk via bounded `pread` streaming + `leansys_verify_cas_digest256` (constant-time 4-limb XOR). -/
+def verifyCasFile256 (casPath : String) (expected : Digest256) (pathSep : UInt8)
+    (algo : CasAlgo256 := .sha256) (chunkBytes : Nat := 1048576) : IO (SysResult Unit) := do
+  if pathSep != 0 then
+    return .error .einval
+  match ← computeFileDigest256 casPath algo chunkBytes with
+  | .error e => pure (.error e)
+  | .ok computed =>
+    if verifyCasDigest256 expected.w0 expected.w1 expected.w2 expected.w3
+         computed.w0 computed.w1 computed.w2 computed.w3 pathSep == 1 then
+      pure (.ok ())
+    else
+      pure (.error .einval)
+
+/-- Stream-ingest `srcFilePath` into the immutable `0444` CAS using bounded `1–4 MiB` `pread` chunks,
+    returning `"sha256:<64-hex>"` (or `"blake256:<64-hex>"`), gated by `leansys_verify_cas_digest256`. -/
+def casPutFile256 (h : Handle) (srcFilePath : String) (algo : CasAlgo256 := .sha256)
+    (chunkBytes : Nat := 1048576) : IO (SysResult String) := do
+  let step := Nat.max 4096 (Nat.min chunkBytes 4194304)
+  let nonce ← IO.monoNanosNow
+  let tmpPath := (System.FilePath.mk h.casDir / s!"ingest.{nonce}.tmp").toString
+  let res ← withFd srcFilePath 0 fun sfd => do
+    match ← fstatSize sfd with
+    | .error e => pure (.error e)
+    | .ok totalSz =>
+      withFd tmpPath 4 (exclusive := 2) fun dfd => do
+        let mut st := initCasStream algo
+        let mut off : UInt64 := 0
+        while off < totalSz do
+          let want := Nat.min step (totalSz - off).toNat
+          let chunk ← preadByteArray sfd off want
+          if chunk.size == 0 then
+            return .error .eio
+          st := st.updateBytes chunk
+          match ← writeAll dfd chunk false with
+          | .error e => return .error e
+          | .ok _ => off := off + chunk.size.toUInt64
+        match ← writeAll dfd ByteArray.empty true with
+        | .error e => pure (.error e)
+        | .ok _ => pure (.ok st.finalizeDigest256)
+  match res with
+  | .error e =>
+    discard <| unlinkFile tmpPath
+    return .error e
+  | .ok dig =>
+    let hex64 := dig.toHexLower
+    let pathSep := hasPathTraversal hex64
+    if verifyCasDigest256 dig.w0 dig.w1 dig.w2 dig.w3 dig.w0 dig.w1 dig.w2 dig.w3 pathSep != 1 then
+      discard <| unlinkFile tmpPath
+      return .error .einval
+    let prefixTag := match algo with | .sha256 => "sha256:" | .keyed256 _ => "blake256:"
+    let dstPath := (System.FilePath.mk h.casDir / hex64).toString
+    if ← (System.FilePath.mk dstPath).pathExists then
+      match ← verifyCasFile256 dstPath dig pathSep algo chunkBytes with
+      | .ok () =>
+        discard <| unlinkFile tmpPath
+        discard <| chmodReadOnly dstPath
+        return .ok (prefixTag ++ hex64)
+      | .error _ => pure ()
+    match ← chmodReadOnly tmpPath with
+    | .error e =>
+      discard <| unlinkFile tmpPath
+      return .error e
+    | .ok () =>
+      match ← atomicRename tmpPath dstPath with
+      | .error e =>
+        discard <| unlinkFile tmpPath
+        return .error e
+      | .ok () =>
+        return .ok (prefixTag ++ hex64)
+
+/-- Put a `ByteSource` (`ByteSlice` or `BorrowedSlice`) into the 256-bit CAS (`"sha256:<64-hex>"`). -/
+def casPut256 (h : Handle) (src : ByteSource) (algo : CasAlgo256 := .sha256) : IO (SysResult String) := do
+  let st := (initCasStream algo).updateSource src
+  let dig := st.finalizeDigest256
+  let hex64 := dig.toHexLower
+  let pathSep := hasPathTraversal hex64
+  if verifyCasDigest256 dig.w0 dig.w1 dig.w2 dig.w3 dig.w0 dig.w1 dig.w2 dig.w3 pathSep != 1 then
+    return .error .einval
+  let prefixTag := match algo with | .sha256 => "sha256:" | .keyed256 _ => "blake256:"
+  let dstPath := (System.FilePath.mk h.casDir / hex64).toString
+  if ← (System.FilePath.mk dstPath).pathExists then
+    match ← verifyCasFile256 dstPath dig pathSep algo with
+    | .ok () =>
+      discard <| chmodReadOnly dstPath
+      return .ok (prefixTag ++ hex64)
+    | .error _ => pure ()
+  let nonce ← IO.monoNanosNow
+  let tmpPath := s!"{dstPath}.{nonce}.256.tmp"
+  let bytes := src.toByteArray
+  match ← withFd tmpPath 4 (fun fd => writeAll fd bytes true) (exclusive := 2) with
+  | .error e =>
+    discard <| unlinkFile tmpPath
+    return .error e
+  | .ok _ =>
+    match ← chmodReadOnly tmpPath with
+    | .error e =>
+      discard <| unlinkFile tmpPath
+      return .error e
+    | .ok () =>
+      match ← atomicRename tmpPath dstPath with
+      | .error e =>
+        discard <| unlinkFile tmpPath
+        return .error e
+      | .ok () => return .ok (prefixTag ++ hex64)
+
+/-- Verify and read a 256-bit CAS object (`"sha256:<64-hex>"` or raw 64-char hex) via `leansys_verify_cas_digest256`. -/
+def casGet256 (h : Handle) (key : String) : IO (SysResult ByteArray) := do
+  let (algo, cleanHex) := match key.splitOn ":" with
+    | ["blake256", rest] => (CasAlgo256.keyed256, rest)
+    | [_, rest] => (CasAlgo256.sha256, rest)
+    | _ => (CasAlgo256.sha256, key)
+  let pathSep := hasPathTraversal cleanHex
+  let some expected := Digest256.ofHex? cleanHex
+    | return .error .einval
+  let casPath := (System.FilePath.mk h.casDir / cleanHex).toString
+  match ← verifyCasFile256 casPath expected pathSep algo with
+  | .error e => pure (.error e)
+  | .ok () =>
+    withFd casPath 0 fun fd => do
+      match ← fstatSize fd with
+      | .error e => pure (.error e)
+      | .ok sz => preadByteArray fd 0 sz.toNat >>= (pure ∘ .ok)
+
+/-- Stream-copy `srcPath` to `tmpTarget` in `1 MiB` `pread` chunks with `0644` writable mode + `fsync`. -/
+private def streamCopyWritable (srcPath tmpTarget : String) (chunkBytes : Nat := 1048576) : IO (SysResult Unit) := do
+  let step := Nat.max 4096 (Nat.min chunkBytes 4194304)
+  withFd srcPath 0 fun sfd => do
+    match ← fstatSize sfd with
+    | .error e => pure (.error e)
+    | .ok totalSz =>
+      withFd tmpTarget 4 (exclusive := 2) fun dfd => do
+        let mut off : UInt64 := 0
+        while off < totalSz do
+          let want := Nat.min step (totalSz - off).toNat
+          let chunk ← preadByteArray sfd off want
+          if chunk.size == 0 then
+            return .error .eio
+          match ← writeAll dfd chunk false with
+          | .error e => return .error e
+          | .ok _ => off := off + chunk.size.toUInt64
+        match ← writeAll dfd ByteArray.empty true with
+        | .error e => pure (.error e)
+        | .ok _ => pure (.ok ())
+
+/-- Materialize an immutable `0444` CAS object (`16-hex` 64-bit OR `64-hex` 256-bit key) to `targetPath`
+    as an independent writable (`0644`) file via CoW reflink (`FICLONE` / `clonefile`) + atomic `rename`.
+    NEVER hardlinks `0444` CAS blobs. When the filesystem returns `.eopnotsupp` or `.exdev`, fails with that
+    typed `Errno` unless `allowCopyFallback == true`, in which case it streams `pread` chunks + `fsync` + `rename`. -/
+def casMaterializeReflink (h : Handle) (hexKey : String) (targetPath : String)
+    (allowCopyFallback : Bool := false) : IO (SysResult ReflinkOutcome) := do
+  let (algo256, cleanKey) := match hexKey.splitOn ":" with
+    | ["blake256", rest] => (CasAlgo256.keyed256, rest)
+    | [_, rest] => (CasAlgo256.sha256, rest)
+    | _ => (CasAlgo256.sha256, hexKey)
+  let pathSep := hasPathTraversal cleanKey
+  let casPath := (System.FilePath.mk h.casDir / cleanKey).toString
+  let verified : SysResult Unit ←
+    if cleanKey.utf8ByteSize == 64 then
+      match Digest256.ofHex? cleanKey with
+      | none => pure (.error .einval)
+      | some exp256 => verifyCasFile256 casPath exp256 pathSep algo256
+    else
+      match parseHex16? cleanKey with
+      | none => pure (.error .einval)
+      | some exp64 =>
+        match ← readVerifiedCasBlob casPath exp64 pathSep with
+        | .ok _ => pure (.ok ())
+        | .error e => pure (.error e)
+  match verified with
+  | .error e => return .error e
+  | .ok () =>
+    let nonce ← IO.monoNanosNow
+    let tmpTarget := s!"{targetPath}.{nonce}.reflink.tmp"
+    match ← reflinkFile casPath tmpTarget with
+    | .ok () =>
+      match ← atomicRename tmpTarget targetPath with
+      | .ok () => return .ok .reflinked
+      | .error e =>
+        discard <| unlinkFile tmpTarget
+        return .error e
+    | .error e =>
+      discard <| unlinkFile tmpTarget
+      if allowCopyFallback && (e == .eopnotsupp || e == .exdev || e == .enosys || e == .einval) then
+        match ← streamCopyWritable casPath tmpTarget with
+        | .error ce =>
+          discard <| unlinkFile tmpTarget
+          return .error ce
+        | .ok () =>
+          match ← atomicRename tmpTarget targetPath with
+          | .ok () => return .ok .copiedFallback
+          | .error re =>
+            discard <| unlinkFile tmpTarget
+            return .error re
+      else
+        return .error e
 
 end LeanSys.Store

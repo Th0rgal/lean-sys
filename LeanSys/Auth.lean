@@ -318,4 +318,455 @@ def validateLease (lease : ScopedLease) (secret : String) (previousSecret? : Opt
       if ctEqString lease.nodeId expectedNode && ctEqString lease.scope expectedScope then 1 else 0
     verifyTokenAuth matchCur hasPrev matchPrev scopeOk nowEpoch lease.expiresAt == 1
 
+
+/-! ## Zero-Copy `BorrowedSlice` / `ByteSource` Constant-Time & Streaming SHA-256 + AWS SigV4 (`AWS4-HMAC-SHA256`) -/
+
+/-- Constant-time equality across any two `ByteSource` views (`ByteSlice` or `BorrowedSlice`). -/
+def ctEqSource (a b : ByteSource) : Bool := Id.run do
+  let na := a.size
+  let nb := b.size
+  if na != nb then
+    return false
+  let mut diff : UInt8 := 0
+  for i in [0:na] do
+    diff := diff ||| (a.getByteD i ^^^ b.getByteD i)
+  return diff == 0
+
+/-- 256-bit cryptographic digest unpacked into four big-endian 64-bit limbs for `leansys_verify_cas_digest256`. -/
+structure Digest256 where
+  w0 : UInt64
+  w1 : UInt64
+  w2 : UInt64
+  w3 : UInt64
+  deriving Repr, DecidableEq, Inhabited
+
+namespace Digest256
+
+@[inline]
+private def readLimb64BE (ba : ByteArray) (off : Nat) : UInt64 :=
+  ((byteAt ba off).toUInt64 <<< 56) |||
+  ((byteAt ba (off + 1)).toUInt64 <<< 48) |||
+  ((byteAt ba (off + 2)).toUInt64 <<< 40) |||
+  ((byteAt ba (off + 3)).toUInt64 <<< 32) |||
+  ((byteAt ba (off + 4)).toUInt64 <<< 24) |||
+  ((byteAt ba (off + 5)).toUInt64 <<< 16) |||
+  ((byteAt ba (off + 6)).toUInt64 <<< 8) |||
+  (byteAt ba (off + 7)).toUInt64
+
+@[inline]
+private def pushLimb64BE (ba : ByteArray) (v : UInt64) : ByteArray :=
+  ba.push ((v >>> 56) &&& 0xFF).toUInt8
+    |>.push ((v >>> 48) &&& 0xFF).toUInt8
+    |>.push ((v >>> 40) &&& 0xFF).toUInt8
+    |>.push ((v >>> 32) &&& 0xFF).toUInt8
+    |>.push ((v >>> 24) &&& 0xFF).toUInt8
+    |>.push ((v >>> 16) &&& 0xFF).toUInt8
+    |>.push ((v >>> 8) &&& 0xFF).toUInt8
+    |>.push (v &&& 0xFF).toUInt8
+
+/-- Decode a 32-byte `ByteArray` into `Digest256`. -/
+def ofBytes32? (ba : ByteArray) : Option Digest256 :=
+  if ba.size == 32 then
+    some {
+      w0 := readLimb64BE ba 0
+      w1 := readLimb64BE ba 8
+      w2 := readLimb64BE ba 16
+      w3 := readLimb64BE ba 24
+    }
+  else
+    none
+
+/-- Encode `Digest256` to a 32-byte big-endian `ByteArray`. -/
+def toBytes32 (d : Digest256) : ByteArray :=
+  let b := ByteArray.emptyWithCapacity 32
+  pushLimb64BE (pushLimb64BE (pushLimb64BE (pushLimb64BE b d.w0) d.w1) d.w2) d.w3
+
+/-- Encode `Digest256` to a 64-char lowercase hexadecimal ASCII string. -/
+@[inline]
+def toHexLower (d : Digest256) : String :=
+  bytesToHexLower d.toBytes32
+
+@[inline]
+private def hexVal? (b : UInt8) : Option UInt8 :=
+  if 48 ≤ b && b ≤ 57 then some (b - 48)
+  else if 97 ≤ b && b ≤ 102 then some (b - 87)
+  else if 65 ≤ b && b ≤ 70 then some (b - 55)
+  else none
+
+/-- Parse a 64-char hex string into `Digest256` (rejecting non-hex or path-traversal strings). -/
+def ofHex? (hex : String) : Option Digest256 := Id.run do
+  let u := hex.toUTF8
+  if u.size != 64 then
+    return none
+  let mut out := ByteArray.emptyWithCapacity 32
+  for i in [0:32] do
+    match hexVal? (u.get! (i * 2)), hexVal? (u.get! (i * 2 + 1)) with
+    | some hi, some lo => out := out.push ((hi <<< 4) ||| lo)
+    | _, _ => return none
+  return ofBytes32? out
+
+end Digest256
+
+/-- Incremental FIPS 180-4 SHA-256 streaming state (`O(1)` memory across multi-GiB `pread` chunks). -/
+structure Sha256Stream where
+  h0 : UInt32 := 0x6a09e667
+  h1 : UInt32 := 0xbb67ae85
+  h2 : UInt32 := 0x3c6ef372
+  h3 : UInt32 := 0xa54ff53a
+  h4 : UInt32 := 0x510e527f
+  h5 : UInt32 := 0x9b05688c
+  h6 : UInt32 := 0x1f83d9ab
+  h7 : UInt32 := 0x5be0cd19
+  tail : ByteArray := ByteArray.empty
+  totalBytes : UInt64 := 0
+
+namespace Sha256Stream
+
+def init : Sha256Stream := {}
+
+/-- Keyed 256-bit streaming MAC/CAS mode (domain-separated IV for fast keyed/BLAKE-style 256-bit stream tags). -/
+def initDomain (domainTag : UInt32) : Sha256Stream :=
+  { h0 := 0x6a09e667 ^^^ domainTag, h7 := 0x5be0cd19 ^^^ (rotr32 domainTag 13) }
+
+private def compressBlock (st : Sha256Stream) (src : ByteSource) (base : Nat) : Sha256Stream := Id.run do
+  let mut w : Array UInt32 := Array.mkEmpty 64
+  for t in [0:16] do
+    let p := base + t * 4
+    let wt : UInt32 :=
+      ((src.getByteD p).toUInt32 <<< 24) |||
+      ((src.getByteD (p + 1)).toUInt32 <<< 16) |||
+      ((src.getByteD (p + 2)).toUInt32 <<< 8) |||
+      (src.getByteD (p + 3)).toUInt32
+    w := w.push wt
+  for t in [16:64] do
+    let w15 := w[t - 15]!
+    let w2  := w[t - 2]!
+    let s0  := rotr32 w15 7 ^^^ rotr32 w15 18 ^^^ (w15 >>> 3)
+    let s1  := rotr32 w2 17 ^^^ rotr32 w2 19 ^^^ (w2 >>> 10)
+    w := w.push (w[t - 16]! + s0 + w[t - 7]! + s1)
+  let mut a := st.h0
+  let mut b := st.h1
+  let mut c := st.h2
+  let mut d := st.h3
+  let mut e := st.h4
+  let mut f := st.h5
+  let mut g := st.h6
+  let mut h := st.h7
+  for t in [0:64] do
+    let bigS1 := rotr32 e 6 ^^^ rotr32 e 11 ^^^ rotr32 e 25
+    let ch    := (e &&& f) ^^^ ((~~~e) &&& g)
+    let temp1 := h + bigS1 + ch + sha256K[t]! + w[t]!
+    let bigS0 := rotr32 a 2 ^^^ rotr32 a 13 ^^^ rotr32 a 22
+    let maj   := (a &&& b) ^^^ (a &&& c) ^^^ (b &&& c)
+    let temp2 := bigS0 + maj
+    h := g
+    g := f
+    f := e
+    e := d + temp1
+    d := c
+    c := b
+    b := a
+    a := temp1 + temp2
+  return { st with
+    h0 := st.h0 + a, h1 := st.h1 + b, h2 := st.h2 + c, h3 := st.h3 + d,
+    h4 := st.h4 + e, h5 := st.h5 + f, h6 := st.h6 + g, h7 := st.h7 + h }
+
+/-- Feed a `ByteSource` chunk (`ByteSlice` or zero-copy `BorrowedSlice`) into `Sha256Stream`. -/
+def updateSource (st : Sha256Stream) (chunk : ByteSource) : Sha256Stream := Id.run do
+  let n := chunk.size
+  if n == 0 then
+    return st
+  let mut cur := { st with totalBytes := st.totalBytes + n.toUInt64 }
+  let mut pos := 0
+  if cur.tail.size > 0 then
+    let need := 64 - cur.tail.size
+    if n < need then
+      let mut t := cur.tail
+      for i in [0:n] do
+        t := t.push (chunk.getByteD i)
+      return { cur with tail := t }
+    else
+      let mut blk := cur.tail
+      for i in [0:need] do
+        blk := blk.push (chunk.getByteD i)
+      cur := compressBlock { cur with tail := ByteArray.empty } (ByteSource.ofByteArray blk) 0
+      pos := need
+  while pos + 64 ≤ n do
+    cur := compressBlock cur chunk pos
+    pos := pos + 64
+  if pos < n then
+    let mut rem := ByteArray.emptyWithCapacity (n - pos)
+    for i in [pos:n] do
+      rem := rem.push (chunk.getByteD i)
+    cur := { cur with tail := rem }
+  return cur
+
+@[inline]
+def updateBytes (st : Sha256Stream) (ba : ByteArray) : Sha256Stream :=
+  st.updateSource (ByteSource.ofByteArray ba)
+
+/-- Finalize `Sha256Stream` into a 32-byte FIPS 180-4 SHA-256 digest. -/
+def finalizeBytes (st : Sha256Stream) : ByteArray := Id.run do
+  let bitLen : UInt64 := st.totalBytes * 8
+  let tLen := st.tail.size
+  let rem := (tLen + 9) % 64
+  let padZeros := if rem == 0 then 0 else 64 - rem
+  let mut fin := ByteArray.emptyWithCapacity (tLen + 1 + padZeros + 8)
+  if tLen > 0 then
+    fin := st.tail.copySlice 0 fin 0 tLen false
+  fin := fin.push 0x80
+  for _ in [0:padZeros] do
+    fin := fin.push 0x00
+  fin := pushWord32BE fin ((bitLen >>> 32) &&& 0xFFFFFFFF).toUInt32
+  fin := pushWord32BE fin (bitLen &&& 0xFFFFFFFF).toUInt32
+  let mut cur := st
+  let blocks := fin.size / 64
+  for b in [0:blocks] do
+    cur := compressBlock cur (ByteSource.ofByteArray fin) (b * 64)
+  let mut out := ByteArray.emptyWithCapacity 32
+  out := pushWord32BE out cur.h0
+  out := pushWord32BE out cur.h1
+  out := pushWord32BE out cur.h2
+  out := pushWord32BE out cur.h3
+  out := pushWord32BE out cur.h4
+  out := pushWord32BE out cur.h5
+  out := pushWord32BE out cur.h6
+  out := pushWord32BE out cur.h7
+  return out
+
+/-- Finalize `Sha256Stream` into unpacked 4×64-bit `Digest256` limbs. -/
+def finalizeDigest256 (st : Sha256Stream) : Digest256 :=
+  { w0 := (st.finalizeBytes |> Digest256.ofBytes32? |>.getD default).w0
+    w1 := (st.finalizeBytes |> Digest256.ofBytes32? |>.getD default).w1
+    w2 := (st.finalizeBytes |> Digest256.ofBytes32? |>.getD default).w2
+    w3 := (st.finalizeBytes |> Digest256.ofBytes32? |>.getD default).w3 }
+
+end Sha256Stream
+
+/-- Compute SHA-256 directly over any `ByteSource` (`ByteSlice` or zero-copy `BorrowedSlice`). -/
+@[inline]
+def sha256Source (src : ByteSource) : ByteArray :=
+  (Sha256Stream.init.updateSource src).finalizeBytes
+
+/-! ## Pure-Lean Deterministic AWS Signature Version 4 (`AWS4-HMAC-SHA256`) & S3 Presigned URLs -/
+
+/-- AWS SigV4 credential & endpoint scope. -/
+structure AwsSigV4Credentials where
+  accessKeyId     : String
+  secretAccessKey : String
+  region          : String
+  service         : String := "s3"
+  sessionToken?   : Option String := none
+  deriving Repr, DecidableEq
+
+/-- AWS SigV4 request descriptor. `amzDate` uses ISO-8601 basic format `YYYYMMDDTHHMMSSZ`; `dateStamp` is `YYYYMMDD`. -/
+structure AwsSigV4Request where
+  method          : String
+  canonicalUri    : String
+  queryParams     : Array (String × String) := #[]
+  headers         : Array (String × String) := #[]
+  payloadSha256Hex : String := "UNSIGNED-PAYLOAD"
+  amzDate         : String
+  dateStamp       : String
+  signedAtEpoch   : UInt64
+  expiresSecs     : UInt64 := 900
+  deriving Repr
+
+/-- Signed AWS SigV4 output (`Authorization` header, canonical request, string-to-sign, and hex signature). -/
+structure AwsSigV4Signed where
+  canonicalRequest : String
+  stringToSign     : String
+  signedHeaders    : String
+  signatureHex     : String
+  authHeader       : String
+  presignedUrl?    : Option String := none
+  deriving Repr, DecidableEq
+
+@[inline]
+private def isUnreservedUriByte (b : UInt8) : Bool :=
+  (65 ≤ b && b ≤ 90) || (97 ≤ b && b ≤ 122) || (48 ≤ b && b ≤ 57) ||
+  b == 45 || b == 95 || b == 46 || b == 126
+
+/-- RFC 3986 / AWS SigV4 `UriEncode` (`encodeSlash = false` preserves `/` in object paths). -/
+def awsUriEncode (s : String) (encodeSlash : Bool := true) : String := Id.run do
+  let hexU := "0123456789ABCDEF".toUTF8
+  let u := s.toUTF8
+  let mut out := ByteArray.emptyWithCapacity (u.size * 3)
+  for i in [0:u.size] do
+    let b := u.get! i
+    if isUnreservedUriByte b || (!encodeSlash && b == 47) then
+      out := out.push b
+    else
+      out := out.push 37
+      out := out.push (hexU.get! ((b >>> 4).toNat &&& 0xF))
+      out := out.push (hexU.get! (b.toNat &&& 0xF))
+  return String.fromUTF8! out
+
+/-- Trim ASCII leading/trailing spaces and collapse interior whitespace runs per AWS SigV4 `Trimall`. -/
+def awsTrimHeaderVal (s : String) : String := Id.run do
+  let u := s.toUTF8
+  let mut start := 0
+  while start < u.size && (u.get! start == 32 || u.get! start == 9) do
+    start := start + 1
+  let mut stop := u.size
+  while stop > start && (u.get! (stop - 1) == 32 || u.get! (stop - 1) == 9) do
+    stop := stop - 1
+  let mut out := ByteArray.emptyWithCapacity (stop - start)
+  let mut prevSpace := false
+  for i in [start:stop] do
+    let b := u.get! i
+    if b == 32 || b == 9 then
+      if !prevSpace then
+        out := out.push 32
+        prevSpace := true
+    else
+      out := out.push b
+      prevSpace := false
+  return String.fromUTF8! out
+
+private def asciiLower (s : String) : String := Id.run do
+  let u := s.toUTF8
+  let mut out := ByteArray.emptyWithCapacity u.size
+  for i in [0:u.size] do
+    let b := u.get! i
+    out := out.push (if 65 ≤ b && b ≤ 90 then b + 32 else b)
+  return String.fromUTF8! out
+
+/-- Check that header names contain no CR/LF/NUL/colon/space and header/query values contain no CR/LF/NUL. -/
+def sigV4NoControlBytes (headers queryParams : Array (String × String)) : Bool := Id.run do
+  for (k, v) in headers do
+    let ku := k.toUTF8
+    if ku.size == 0 then return false
+    for i in [0:ku.size] do
+      let b := ku.get! i
+      if b ≤ 32 || b == 58 || b == 127 then return false
+    let vu := v.toUTF8
+    for i in [0:vu.size] do
+      let b := vu.get! i
+      if b == 0 || b == 10 || b == 13 then return false
+  for (qk, qv) in queryParams do
+    for u in #[qk.toUTF8, qv.toUTF8] do
+      for i in [0:u.size] do
+        let b := u.get! i
+        if b == 0 || b == 10 || b == 13 then return false
+  return true
+
+private def sortStringPairs (xs : Array (String × String)) : Array (String × String) :=
+  xs.qsort fun a b => if a.1 == b.1 then a.2 < b.2 else a.1 < b.1
+
+/-- Derive the 32-byte AWS SigV4 signing key `HMAC(HMAC(HMAC(HMAC("AWS4" ++ secret, dateStamp), region), service), "aws4_request")`. -/
+def deriveSigV4SigningKey (creds : AwsSigV4Credentials) (dateStamp : String) : ByteArray :=
+  let kSecret := ("AWS4" ++ creds.secretAccessKey).toUTF8
+  let kDate   := hmacSha256Bytes kSecret dateStamp.toUTF8
+  let kRegion := hmacSha256Bytes kDate creds.region.toUTF8
+  let kSvc    := hmacSha256Bytes kRegion creds.service.toUTF8
+  hmacSha256Bytes kSvc "aws4_request".toUTF8
+
+/-- Deterministically sign an HTTP/S3 request with `AWS4-HMAC-SHA256`, gated by `leansys_verify_sigv4_envelope`. -/
+def signSigV4Headers (creds : AwsSigV4Credentials) (req : AwsSigV4Request) (nowEpoch : UInt64) : Option AwsSigV4Signed := Id.run do
+  if creds.accessKeyId.isEmpty || creds.secretAccessKey.isEmpty || req.dateStamp.utf8ByteSize != 8 then
+    return none
+  let extraTok : Array (String × String) :=
+    match creds.sessionToken? with
+    | some tok => #[("x-amz-security-token", tok)]
+    | none => #[]
+  let allHeaders := req.headers ++ #[("x-amz-date", req.amzDate)] ++ extraTok
+  let noCtl : UInt8 := if sigV4NoControlBytes allHeaders req.queryParams then 1 else 0
+  let normHeaders := sortStringPairs (allHeaders.map fun (k, v) => (asciiLower k, awsTrimHeaderVal v))
+  let mut dedupHeaders : Array (String × String) := #[]
+  for (k, v) in normHeaders do
+    if dedupHeaders.size > 0 && (dedupHeaders[dedupHeaders.size - 1]!).1 == k then
+      let prev := dedupHeaders[dedupHeaders.size - 1]!
+      dedupHeaders := dedupHeaders.set! (dedupHeaders.size - 1) (k, prev.2 ++ "," ++ v)
+    else
+      dedupHeaders := dedupHeaders.push (k, v)
+  let mut hasHost : UInt8 := 0
+  for (k, _) in dedupHeaders do
+    if k == "host" then hasHost := 1
+  if verifySigV4Envelope req.signedAtEpoch nowEpoch req.expiresSecs dedupHeaders.size.toUInt32 noCtl hasHost != 1 then
+    return none
+  let encQuery := sortStringPairs (req.queryParams.map fun (k, v) => (awsUriEncode k true, awsUriEncode v true))
+  let canonicalQuery := String.intercalate "&" (encQuery.toList.map fun (k, v) => k ++ "=" ++ v)
+  let canonicalHeaders := String.join (dedupHeaders.toList.map fun (k, v) => k ++ ":" ++ v ++ "
+")
+  let signedHeaders := String.intercalate ";" (dedupHeaders.toList.map Prod.fst)
+  let canonUri := if req.canonicalUri.isEmpty then "/" else awsUriEncode req.canonicalUri false
+  let canonicalRequest :=
+    req.method ++ "
+" ++ canonUri ++ "
+" ++ canonicalQuery ++ "
+" ++
+    canonicalHeaders ++ "
+" ++ signedHeaders ++ "
+" ++ req.payloadSha256Hex
+  let scope := req.dateStamp ++ "/" ++ creds.region ++ "/" ++ creds.service ++ "/aws4_request"
+  let canonHashHex := bytesToHexLower (sha256Bytes canonicalRequest.toUTF8)
+  let stringToSign := "AWS4-HMAC-SHA256
+" ++ req.amzDate ++ "
+" ++ scope ++ "
+" ++ canonHashHex
+  let signingKey := deriveSigV4SigningKey creds req.dateStamp
+  let sigHex := bytesToHexLower (hmacSha256Bytes signingKey stringToSign.toUTF8)
+  let authHdr :=
+    "AWS4-HMAC-SHA256 Credential=" ++ creds.accessKeyId ++ "/" ++ scope ++
+    ", SignedHeaders=" ++ signedHeaders ++ ", Signature=" ++ sigHex
+  return some {
+    canonicalRequest := canonicalRequest
+    stringToSign := stringToSign
+    signedHeaders := signedHeaders
+    signatureHex := sigHex
+    authHeader := authHdr
+  }
+
+/-- Deterministically generate an S3 `X-Amz-Signature` presigned URL (`UNSIGNED-PAYLOAD`), gated by `leansys_verify_sigv4_envelope`. -/
+def presignS3Url (creds : AwsSigV4Credentials) (schemeHost : String) (req : AwsSigV4Request) (nowEpoch : UInt64) : Option AwsSigV4Signed := Id.run do
+  if creds.accessKeyId.isEmpty || creds.secretAccessKey.isEmpty || req.dateStamp.utf8ByteSize != 8 then
+    return none
+  let scope := req.dateStamp ++ "/" ++ creds.region ++ "/" ++ creds.service ++ "/aws4_request"
+  let normHeaders := sortStringPairs (req.headers.map fun (k, v) => (asciiLower k, awsTrimHeaderVal v))
+  let mut hasHost : UInt8 := 0
+  for (k, _) in normHeaders do
+    if k == "host" then hasHost := 1
+  let signedHeaders := String.intercalate ";" (normHeaders.toList.map Prod.fst)
+  let baseQuery : Array (String × String) := #[
+    ("X-Amz-Algorithm", "AWS4-HMAC-SHA256"),
+    ("X-Amz-Credential", creds.accessKeyId ++ "/" ++ scope),
+    ("X-Amz-Date", req.amzDate),
+    ("X-Amz-Expires", toString req.expiresSecs),
+    ("X-Amz-SignedHeaders", signedHeaders)
+  ] ++ (match creds.sessionToken? with | some t => #[("X-Amz-Security-Token", t)] | none => #[])
+  let allQuery := req.queryParams ++ baseQuery
+  let noCtl : UInt8 := if sigV4NoControlBytes req.headers allQuery then 1 else 0
+  if verifySigV4Envelope req.signedAtEpoch nowEpoch req.expiresSecs normHeaders.size.toUInt32 noCtl hasHost != 1 then
+    return none
+  let encQuery := sortStringPairs (allQuery.map fun (k, v) => (awsUriEncode k true, awsUriEncode v true))
+  let canonicalQuery := String.intercalate "&" (encQuery.toList.map fun (k, v) => k ++ "=" ++ v)
+  let canonicalHeaders := String.join (normHeaders.toList.map fun (k, v) => k ++ ":" ++ v ++ "
+")
+  let canonUri := if req.canonicalUri.isEmpty then "/" else awsUriEncode req.canonicalUri false
+  let canonicalRequest :=
+    req.method ++ "
+" ++ canonUri ++ "
+" ++ canonicalQuery ++ "
+" ++
+    canonicalHeaders ++ "
+" ++ signedHeaders ++ "
+UNSIGNED-PAYLOAD"
+  let canonHashHex := bytesToHexLower (sha256Bytes canonicalRequest.toUTF8)
+  let stringToSign := "AWS4-HMAC-SHA256
+" ++ req.amzDate ++ "
+" ++ scope ++ "
+" ++ canonHashHex
+  let signingKey := deriveSigV4SigningKey creds req.dateStamp
+  let sigHex := bytesToHexLower (hmacSha256Bytes signingKey stringToSign.toUTF8)
+  let fullUrl := schemeHost ++ canonUri ++ "?" ++ canonicalQuery ++ "&X-Amz-Signature=" ++ sigHex
+  return some {
+    canonicalRequest := canonicalRequest
+    stringToSign := stringToSign
+    signedHeaders := signedHeaders
+    signatureHex := sigHex
+    authHeader := ""
+    presignedUrl? := some fullUrl
+  }
+
 end LeanSys.Auth
