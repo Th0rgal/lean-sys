@@ -248,18 +248,34 @@ def selfTestWave1Features (testDir : String) : IO UInt32 := do
       let .ok _ ← ftruncateFd ufd 4096 | return .error .eio
       let .ok bufReg ← mmapMapShared ufd 4096 0 false | return .error .eio
       let _ ← mmapRegionWrite bufReg 256 urData
-      -- Regression: colliding caller `userData = 0xAA02` across `enqueueNop` and `submitReadToRegion` MUST NOT cross-match CQEs!
+      -- Regression: colliding caller `userData = 0xAA02` across `enqueueNop` and `submitReadToRegion` MUST NOT cross-match CQEs,
+      -- and concurrent multi-thread `submitNop` / `waitSubmittedCqe` waiters MUST NOT lose wakeups across `pendingCqes` stashing!
       let .ok collTicket ← IoUring.enqueueNop ring 0xAA02 | return .error .eio
       let wRes ← IoUring.submitWriteFromRegion ring ufd 0 bufReg 256 urData.size 0xAA01
       let rRes ← IoUring.submitReadToRegion ring ufd 0 bufReg 1024 urData.size 0xAA02
       let collRes ← IoUring.waitSubmittedCqe ring collTicket
+      let concTaskA ← IO.asTask (prio := .dedicated) do
+        let mut ok := true
+        for k in [0:16] do
+          match ← IoUring.submitNop ring (0xBB00 + k.toUInt64) with
+          | .ok c => if c.userData != 0xBB00 + k.toUInt64 || c.res != 0 then ok := false
+          | .error _ => ok := false
+        return ok
+      let concTaskB ← IO.asTask (prio := .dedicated) do
+        let mut ok := true
+        for k in [0:16] do
+          match ← IoUring.submitNop ring (0xCC00 + k.toUInt64) with
+          | .ok c => if c.userData != 0xCC00 + k.toUInt64 || c.res != 0 then ok := false
+          | .error _ => ok := false
+        return ok
+      let concOk := (← IO.wait concTaskA).toOption == some true && (← IO.wait concTaskB).toOption == some true
       let readBack ← mmapRegionRead bufReg 1024 urData.size
       discard <| mmapUnmap bufReg
       match wRes, rRes, collRes with
       | .ok wcqe, .ok rcqe, .ok ccqe =>
         if wcqe.userData == 0xAA01 && wcqe.res == urData.size.toInt32 &&
            rcqe.userData == 0xAA02 && rcqe.res == urData.size.toInt32 &&
-           ccqe.userData == 0xAA02 && ccqe.res == 0 &&
+           ccqe.userData == 0xAA02 && ccqe.res == 0 && concOk &&
            readBack == urData then
           return .ok ()
         else

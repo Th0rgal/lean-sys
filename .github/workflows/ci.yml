@@ -51,7 +51,13 @@ jobs:
           restore-keys: |
             cargo-${{ runner.os }}-
 
-      - name: Run Lean 4 CI verification gates (build, self-test, bench, TCB & shim hygiene)
+      - name: Install & cache turbo-lean spec auditor
+        uses: Th0rgal/turbo-lean@3fea4a72fcd6d55cfe172c6b5a2651ad6dea1ef6
+        with:
+          project-dir: "."
+          command: cache-only
+
+      - name: Run Lean 4 CI verification gates (build, self-test, bench, turbo-lean 55/55 spec audit, TCB & shim hygiene)
         run: |
           export PATH="$HOME/.elan/bin:$PATH"
           sudo prlimit --pid=$$ --nofile=131072:131072 || true

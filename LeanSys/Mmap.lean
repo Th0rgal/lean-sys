@@ -412,6 +412,7 @@ structure IoUringTicket where
 
 private structure IoUringRuntimeState where
   nextInternalId : UInt64 := 1
+  cqWaiterActive : Bool := false
   inFlightOps    : Array (UInt64 × UInt64) := #[]
   pendingCqes    : Array (UInt64 × IoUringCqe) := #[]
 
@@ -423,6 +424,7 @@ structure IoUring where
   private cqRing      : MmapRegion
   private sqesRegion  : MmapRegion
   private state       : Std.Mutex IoUringRuntimeState
+  private cqCond      : Std.Condvar
   sqEntries   : UInt32
   cqEntries   : UInt32
   sqOffHead   : Nat
@@ -484,12 +486,14 @@ def setup (entries : UInt32 := 8) : IO (SysResult IoUring) := do
           return .error e
         | .ok sqesReg =>
           let rtMutex ← Std.Mutex.new ({} : IoUringRuntimeState)
+          let rtCond ← Std.Condvar.new
           return .ok {
             ringFd := rfd
             sqRing := sqReg
             cqRing := cqReg
             sqesRegion := sqesReg
             state := rtMutex
+            cqCond := rtCond
             sqEntries := sqEnt
             cqEntries := cqEnt
             sqOffHead := sqHead
@@ -536,32 +540,43 @@ private def buildSqe64 (opcode : UInt8) (fd : Int32) (off addr : UInt64) (len : 
     b := b.push 0
   return b
 
+private inductive CqeWaitPlan where
+  | found (cqe : IoUringCqe)
+  | waitLeader
+  | waitedFollower
+
 /-- Drain an already-submitted completion matching `ticket.internalId` from `pendingCqes` or the kernel CQ ring (`toSubmit = 0`),
-    restoring the caller's `userData` on the returned `IoUringCqe` and guaranteeing caller `userData` collisions can never cross-match. -/
+    restoring the caller's `userData` on the returned `IoUringCqe` and guaranteeing caller `userData` collisions can never cross-match
+    nor lose wakeups when multiple threads wait concurrently on the same `IoUring` (leader-follower `cqWaiterActive` + `Std.Condvar`). -/
 def waitSubmittedCqe (ring : IoUring) (ticket : IoUringTicket) : IO (SysResult IoUringCqe) := do
   let targetId := ticket.internalId
   let mut matchedCqe : Option IoUringCqe := none
   let mut fatalErr : Option Errno := none
   while matchedCqe.isNone && fatalErr.isNone do
-    let stepAction ← ring.state.atomically do
+    let stepAction : SysResult CqeWaitPlan ← ring.state.atomically do
       let st ← get
       match st.pendingCqes.findIdx? (fun entry => entry.1 == targetId) with
       | some idx =>
         let cqe := (st.pendingCqes[idx]!).2
         set { st with pendingCqes := st.pendingCqes.eraseIdx! idx }
-        return Except.ok (some cqe)
+        return Except.ok (.found cqe)
       | none =>
         if !st.inFlightOps.any (fun op => op.1 == targetId) then
           return Except.error Errno.einval
+        if st.cqWaiterActive then
+          ring.cqCond.wait ring.state.mutex
+          return Except.ok .waitedFollower
         let .ok cqHead0 ← mmapAtomicLoadU32 ring.cqRing ring.cqOffHead | return Except.error Errno.einval
         let .ok cqTail  ← mmapAtomicLoadU32 ring.cqRing ring.cqOffTail | return Except.error Errno.einval
         let .ok cqMask  ← mmapAtomicLoadU32 ring.cqRing ring.cqOffMask | return Except.error Errno.einval
         if cqHead0 == cqTail then
-          return Except.ok none
+          set { st with cqWaiterActive := true }
+          return Except.ok .waitLeader
         let mut curHead := cqHead0
         let mut inFlight := st.inFlightOps
         let mut stash := st.pendingCqes
         let mut found : Option IoUringCqe := none
+        let mut stashedAny := false
         let mut readFailed := false
         while curHead != cqTail && found.isNone do
           let cqeOff := ring.cqOffCqes + (curHead &&& cqMask).toNat * 16
@@ -587,18 +602,32 @@ def waitSubmittedCqe (ring : IoUring) (ticket : IoUringTicket) : IO (SysResult I
             found := some item
           else
             stash := stash.push (rawId, item)
+            stashedAny := true
         set { st with inFlightOps := inFlight, pendingCqes := stash }
+        if stashedAny || curHead != cqTail then
+          ring.cqCond.notifyAll
         if readFailed then
           return Except.error Errno.eio
-        return Except.ok found
+        match found with
+        | some cqe => return Except.ok (.found cqe)
+        | none =>
+          set { st with inFlightOps := inFlight, pendingCqes := stash, cqWaiterActive := true }
+          return Except.ok .waitLeader
     match stepAction with
     | .error e => fatalErr := some e
-    | .ok (some cqe) => matchedCqe := some cqe
-    | .ok none =>
-      match ← ioUringEnterRaw ring.ringFd 0 1 1 with
-      | .error .eintr => pure ()
-      | .error e => fatalErr := some e
-      | .ok _ => pure ()
+    | .ok (.found cqe) => matchedCqe := some cqe
+    | .ok .waitedFollower => pure ()
+    | .ok .waitLeader =>
+      let waitErr ← try
+          match ← ioUringEnterRaw ring.ringFd 0 1 1 with
+          | .error .eintr | .ok _ => pure none
+          | .error e => pure (some e)
+        finally
+          ring.state.atomically do
+            modify fun s => { s with cqWaiterActive := false }
+            ring.cqCond.notifyAll
+      if let some e := waitErr then
+        fatalErr := some e
   match fatalErr, matchedCqe with
   | some e, _ => return .error e
   | none, some cqe => return .ok cqe
@@ -631,23 +660,26 @@ private def enqueueSqe (ring : IoUring) (opcode : UInt8) (targetFd : Int32)
 
 /-- Submit a single SQE (`NOP`, `READ`, or `WRITE`) and wait for its exact `IoUringTicket` completion,
     returning `(SysResult IoUringCqe × canReleaseDmaPin)` where `canReleaseDmaPin == true` iff the SQE was never published
-    to `sqOffTail` OR its exact kernel CQE has been harvested (preventing UAF if `io_uring_enter` fails mid-DMA). -/
+    to `sqOffTail` OR its exact kernel CQE has been harvested (preventing UAF if `io_uring_enter` fails mid-DMA).
+    Note: `io_uring_enter` is invoked with `minComplete = 0` to publish SQEs first, and all blocking CQ waits go through
+    the leader-follower `waitSubmittedCqe` loop so concurrent waiters can never steal a completion across a lock gap. -/
 private def submitAndWaitOneRetain (ring : IoUring) (opcode : UInt8) (targetFd : Int32)
     (fileOff bufAddr : UInt64) (bufLen : UInt32) (userData : UInt64) : IO (SysResult IoUringCqe × Bool) := do
   match ← enqueueSqe ring opcode targetFd fileOff bufAddr bufLen userData with
   | .error e => return (.error e, true)
   | .ok ticket =>
-    let toSubRes : SysResult UInt32 ← ring.state.atomically do
+    let subRes : SysResult Unit ← ring.state.atomically do
       let .ok sqHead ← mmapAtomicLoadU32 ring.sqRing ring.sqOffHead | return Except.error Errno.einval
       let .ok sqTail ← mmapAtomicLoadU32 ring.sqRing ring.sqOffTail | return Except.error Errno.einval
-      return Except.ok (sqTail - sqHead)
-    match toSubRes with
-    | .error e => return (.error e, false)
-    | .ok toSub =>
+      let toSub := sqTail - sqHead
       if toSub > 0 then
-        match ← ioUringEnterRaw ring.ringFd toSub 1 1 with
+        match ← ioUringEnterRaw ring.ringFd toSub 0 0 with
         | .error .eintr | .ok _ => pure ()
-        | .error e => return (.error e, false)
+        | .error e => return Except.error e
+      return Except.ok ()
+    match subRes with
+    | .error e => return (.error e, false)
+    | .ok () =>
       match ← waitSubmittedCqe ring ticket with
       | .ok cqe => return (.ok cqe, true)
       | .error e => return (.error e, false)

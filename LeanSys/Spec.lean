@@ -2,7 +2,7 @@
   LeanSys.Spec: Verified Systems Specification & Unboxed C-ABI Kernel (`0 import Lean`, `0 sorryAx`)
   - Layer I: Universal Systems Meta-Specifications (`MetaGateSpec`, `TotalSliceParserSpec`,
     `FramedCodecSpec`, `CrashAtomicLogSpec`, `ProtocolRefinementSpec`)
-  - Layer II: Declarative Systems Corollaries (≤ 3 lines each) & 17 Unboxed C-ABI Gates (`@[inline, export]`)
+  - Layer II: Declarative Systems Corollaries (≤ 3 lines each) & 40 Unboxed C-ABI Gates (`@[inline, export]`, incl. `Gate.lean`)
 -/
 
 namespace LeanSys.Spec
