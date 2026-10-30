@@ -654,6 +654,30 @@ def sigV4NoControlBytes (headers queryParams : Array (String × String)) : Bool 
 private def sortStringPairs (xs : Array (String × String)) : Array (String × String) :=
   xs.qsort fun a b => if a.1 == b.1 then a.2 < b.2 else a.1 < b.1
 
+/-- Canonicalize HTTP headers per AWS SigV4: lowercase header names, trim + collapse interior runs of spaces
+    in header values, fold duplicate header names by comma-joining values *in wire order*, and sort distinct names
+    lexicographically by lowercase ASCII name. -/
+private def canonicalizeSigV4Headers (hdrs : Array (String × String)) : Array (String × String) := Id.run do
+  let mut grouped : Array (String × String) := #[]
+  for (rawK, rawV) in hdrs do
+    let k := asciiLower rawK
+    let v := awsTrimHeaderVal rawV
+    let mut foundIdx : Option Nat := none
+    for i in [0:grouped.size] do
+      if (grouped[i]!).1 == k then
+        foundIdx := some i
+        break
+    match foundIdx with
+    | some idx =>
+      let prev := grouped[idx]!
+      grouped := grouped.set! idx (k, prev.2 ++ "," ++ v)
+    | none =>
+      grouped := grouped.push (k, v)
+  return grouped.qsort fun a b => a.1 < b.1
+
+private def hasHeaderLower (hdrs : Array (String × String)) (targetLower : String) : Bool :=
+  hdrs.any fun (k, _) => asciiLower k == targetLower
+
 /-- Derive the 32-byte AWS SigV4 signing key `HMAC(HMAC(HMAC(HMAC("AWS4" ++ secret, dateStamp), region), service), "aws4_request")`. -/
 def deriveSigV4SigningKey (creds : AwsSigV4Credentials) (dateStamp : String) : ByteArray :=
   let kSecret := ("AWS4" ++ creds.secretAccessKey).toUTF8
@@ -666,20 +690,19 @@ def deriveSigV4SigningKey (creds : AwsSigV4Credentials) (dateStamp : String) : B
 def signSigV4Headers (creds : AwsSigV4Credentials) (req : AwsSigV4Request) (nowEpoch : UInt64) : Option AwsSigV4Signed := Id.run do
   if creds.accessKeyId.isEmpty || creds.secretAccessKey.isEmpty || req.dateStamp.utf8ByteSize != 8 then
     return none
+  let extraSha : Array (String × String) :=
+    if creds.service == "s3" && !hasHeaderLower req.headers "x-amz-content-sha256" then
+      #[("x-amz-content-sha256", req.payloadSha256Hex)]
+    else #[]
+  let extraDate : Array (String × String) :=
+    if !hasHeaderLower req.headers "x-amz-date" then #[("x-amz-date", req.amzDate)] else #[]
   let extraTok : Array (String × String) :=
     match creds.sessionToken? with
-    | some tok => #[("x-amz-security-token", tok)]
+    | some tok => if !hasHeaderLower req.headers "x-amz-security-token" then #[("x-amz-security-token", tok)] else #[]
     | none => #[]
-  let allHeaders := req.headers ++ #[("x-amz-date", req.amzDate)] ++ extraTok
+  let allHeaders := req.headers ++ extraSha ++ extraDate ++ extraTok
   let noCtl : UInt8 := if sigV4NoControlBytes allHeaders req.queryParams then 1 else 0
-  let normHeaders := sortStringPairs (allHeaders.map fun (k, v) => (asciiLower k, awsTrimHeaderVal v))
-  let mut dedupHeaders : Array (String × String) := #[]
-  for (k, v) in normHeaders do
-    if dedupHeaders.size > 0 && (dedupHeaders[dedupHeaders.size - 1]!).1 == k then
-      let prev := dedupHeaders[dedupHeaders.size - 1]!
-      dedupHeaders := dedupHeaders.set! (dedupHeaders.size - 1) (k, prev.2 ++ "," ++ v)
-    else
-      dedupHeaders := dedupHeaders.push (k, v)
+  let dedupHeaders := canonicalizeSigV4Headers allHeaders
   let mut hasHost : UInt8 := 0
   for (k, _) in dedupHeaders do
     if k == "host" then hasHost := 1
@@ -687,24 +710,15 @@ def signSigV4Headers (creds : AwsSigV4Credentials) (req : AwsSigV4Request) (nowE
     return none
   let encQuery := sortStringPairs (req.queryParams.map fun (k, v) => (awsUriEncode k true, awsUriEncode v true))
   let canonicalQuery := String.intercalate "&" (encQuery.toList.map fun (k, v) => k ++ "=" ++ v)
-  let canonicalHeaders := String.join (dedupHeaders.toList.map fun (k, v) => k ++ ":" ++ v ++ "
-")
+  let canonicalHeaders := String.join (dedupHeaders.toList.map fun (k, v) => k ++ ":" ++ v ++ "\n")
   let signedHeaders := String.intercalate ";" (dedupHeaders.toList.map Prod.fst)
   let canonUri := if req.canonicalUri.isEmpty then "/" else awsUriEncode req.canonicalUri false
   let canonicalRequest :=
-    req.method ++ "
-" ++ canonUri ++ "
-" ++ canonicalQuery ++ "
-" ++
-    canonicalHeaders ++ "
-" ++ signedHeaders ++ "
-" ++ req.payloadSha256Hex
+    req.method ++ "\n" ++ canonUri ++ "\n" ++ canonicalQuery ++ "\n" ++
+    canonicalHeaders ++ "\n" ++ signedHeaders ++ "\n" ++ req.payloadSha256Hex
   let scope := req.dateStamp ++ "/" ++ creds.region ++ "/" ++ creds.service ++ "/aws4_request"
   let canonHashHex := bytesToHexLower (sha256Bytes canonicalRequest.toUTF8)
-  let stringToSign := "AWS4-HMAC-SHA256
-" ++ req.amzDate ++ "
-" ++ scope ++ "
-" ++ canonHashHex
+  let stringToSign := "AWS4-HMAC-SHA256\n" ++ req.amzDate ++ "\n" ++ scope ++ "\n" ++ canonHashHex
   let signingKey := deriveSigV4SigningKey creds req.dateStamp
   let sigHex := bytesToHexLower (hmacSha256Bytes signingKey stringToSign.toUTF8)
   let authHdr :=
@@ -723,11 +737,11 @@ def presignS3Url (creds : AwsSigV4Credentials) (schemeHost : String) (req : AwsS
   if creds.accessKeyId.isEmpty || creds.secretAccessKey.isEmpty || req.dateStamp.utf8ByteSize != 8 then
     return none
   let scope := req.dateStamp ++ "/" ++ creds.region ++ "/" ++ creds.service ++ "/aws4_request"
-  let normHeaders := sortStringPairs (req.headers.map fun (k, v) => (asciiLower k, awsTrimHeaderVal v))
+  let dedupHeaders := canonicalizeSigV4Headers req.headers
   let mut hasHost : UInt8 := 0
-  for (k, _) in normHeaders do
+  for (k, _) in dedupHeaders do
     if k == "host" then hasHost := 1
-  let signedHeaders := String.intercalate ";" (normHeaders.toList.map Prod.fst)
+  let signedHeaders := String.intercalate ";" (dedupHeaders.toList.map Prod.fst)
   let baseQuery : Array (String × String) := #[
     ("X-Amz-Algorithm", "AWS4-HMAC-SHA256"),
     ("X-Amz-Credential", creds.accessKeyId ++ "/" ++ scope),
@@ -737,26 +751,17 @@ def presignS3Url (creds : AwsSigV4Credentials) (schemeHost : String) (req : AwsS
   ] ++ (match creds.sessionToken? with | some t => #[("X-Amz-Security-Token", t)] | none => #[])
   let allQuery := req.queryParams ++ baseQuery
   let noCtl : UInt8 := if sigV4NoControlBytes req.headers allQuery then 1 else 0
-  if verifySigV4Envelope req.signedAtEpoch nowEpoch req.expiresSecs normHeaders.size.toUInt32 noCtl hasHost != 1 then
+  if verifySigV4Envelope req.signedAtEpoch nowEpoch req.expiresSecs dedupHeaders.size.toUInt32 noCtl hasHost != 1 then
     return none
   let encQuery := sortStringPairs (allQuery.map fun (k, v) => (awsUriEncode k true, awsUriEncode v true))
   let canonicalQuery := String.intercalate "&" (encQuery.toList.map fun (k, v) => k ++ "=" ++ v)
-  let canonicalHeaders := String.join (normHeaders.toList.map fun (k, v) => k ++ ":" ++ v ++ "
-")
+  let canonicalHeaders := String.join (dedupHeaders.toList.map fun (k, v) => k ++ ":" ++ v ++ "\n")
   let canonUri := if req.canonicalUri.isEmpty then "/" else awsUriEncode req.canonicalUri false
   let canonicalRequest :=
-    req.method ++ "
-" ++ canonUri ++ "
-" ++ canonicalQuery ++ "
-" ++
-    canonicalHeaders ++ "
-" ++ signedHeaders ++ "
-UNSIGNED-PAYLOAD"
+    req.method ++ "\n" ++ canonUri ++ "\n" ++ canonicalQuery ++ "\n" ++
+    canonicalHeaders ++ "\n" ++ signedHeaders ++ "\nUNSIGNED-PAYLOAD"
   let canonHashHex := bytesToHexLower (sha256Bytes canonicalRequest.toUTF8)
-  let stringToSign := "AWS4-HMAC-SHA256
-" ++ req.amzDate ++ "
-" ++ scope ++ "
-" ++ canonHashHex
+  let stringToSign := "AWS4-HMAC-SHA256\n" ++ req.amzDate ++ "\n" ++ scope ++ "\n" ++ canonHashHex
   let signingKey := deriveSigV4SigningKey creds req.dateStamp
   let sigHex := bytesToHexLower (hmacSha256Bytes signingKey stringToSign.toUTF8)
   let fullUrl := schemeHost ++ canonUri ++ "?" ++ canonicalQuery ++ "&X-Amz-Signature=" ++ sigHex

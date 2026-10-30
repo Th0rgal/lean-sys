@@ -125,6 +125,9 @@ opaque rawNetAcceptPoll (listenFd : UInt32) (timeoutMs : UInt32) (pollOnly : UIn
 @[extern "leansys_ptr_read"]
 opaque rawPtrRead (ptr : USize) (cap : USize) (off : USize) (word64 : UInt8) : UInt64
 
+@[extern "leansys_ptr_load_io"]
+opaque rawPtrLoadIO (ptr : USize) (cap : USize) (off : USize) (width : UInt8) : IO UInt64
+
 /-! ## Zero-Copy ByteSlice over Borrowed `ByteArray` -/
 
 /-- Validated zero-copy view `[off, off + len)` inside `ba : ByteArray`. -/
@@ -189,8 +192,11 @@ end ByteSlice
 
 /-! ## Zero-Copy External Pointer View (`BorrowedSlice` / `RawByteView`) & `ByteSource` -/
 
-/-- Validated external `(ptr, len)` view over `mmap`, `io_uring`, or Rust `&[u8]` memory without `ByteArray` copying. -/
+/-- Validated external `(ptr, len)` view over live `mmap`, `io_uring`, or Rust `&[u8]` memory without `ByteArray` copying.
+    Constructor is `private`: safe Lean callers obtain views via `MmapRegion.withView` / `MmapArena.withPayloadView`,
+    while C-ABI / FFI callers must opt into `BorrowedSlice.unsafeFromRawParts?`. -/
 structure BorrowedSlice where
+  private mk ::
   ptr : USize
   len : USize
   deriving Repr, DecidableEq, Inhabited
@@ -200,9 +206,10 @@ abbrev RawByteView := BorrowedSlice
 
 namespace BorrowedSlice
 
-/-- Construct a `BorrowedSlice` gated by `leansys_verify_borrowed_view` (`ptr != 0` and no 64-bit wraparound). -/
+/-- Unsafe FFI constructor for an external `(ptr, len)` buffer whose liveness is guaranteed by the caller,
+    gated by `leansys_verify_borrowed_view` (`ptr != 0` and no 64-bit wraparound). -/
 @[inline]
-def mkChecked? (ptr : USize) (len : USize) : Option BorrowedSlice :=
+def unsafeFromRawParts? (ptr : USize) (len : USize) : Option BorrowedSlice :=
   if Spec.verifyBorrowedView ptr.toUInt64 len.toUInt64 0 len.toUInt64 == 1 then
     some { ptr := ptr, len := len }
   else
@@ -425,9 +432,24 @@ def writeSliceAll (fd : Fd) (slice : ByteSlice) (doSync : Bool := false) : IO (S
 def writeAll (fd : Fd) (ba : ByteArray) (doSync : Bool := false) : IO (SysResult Nat) :=
   writeSliceAll fd (ByteSlice.ofByteArray ba) doSync
 
-/-- Positional `pread` into a freshly allocated `ByteArray` of up to `maxLen` bytes. -/
+/-- Write as many bytes of `slice` as currently accepted by a non-blocking socket (`mode = 10` in `leansys_write_all`),
+    returning `.ok bytesSent` (`>= 1`) if a prefix was written before `EAGAIN`, or `.error .eagain` if `0` bytes were sent. -/
+def writeSlicePartial (fd : Fd) (slice : ByteSlice) : IO (SysResult Nat) := do
+  if Spec.verifySliceBounds slice.off.toUInt64 slice.len.toUInt64 slice.ba.size.toUInt64 != 1 then
+    return .error .einval
+  if slice.len == 0 then
+    return .ok 0
+  let w ← rawWriteAll fd.raw slice.ba slice.off.toUSize slice.len.toUSize 10
+  match decodePackedWord w with
+  | .ok n => pure (.ok n.toNat)
+  | .error e => pure (.error e)
+
+/-- Positional `pread` into a freshly allocated `ByteArray` of up to `maxLen` bytes.
+    Rejects offsets `>= 2^62` (`>= OFF_MAX` / internal tagged-offset space) so callers can never trigger tagged pointer or mmap reads. -/
 @[inline]
-def preadByteArray (fd : Fd) (offset : UInt64) (maxLen : Nat) : IO ByteArray :=
+def preadByteArray (fd : Fd) (offset : UInt64) (maxLen : Nat) : IO ByteArray := do
+  if offset >= ((1 : UInt64) <<< 62) then
+    return ByteArray.empty
   rawPreadBa fd.raw offset maxLen.toUSize
 
 /-- Sequential `read` (for sockets or pipes, passing `offset = UInt64.MAX`). -/
@@ -570,12 +592,16 @@ def reflinkFile (src dst : String) : IO (SysResult Unit) := do
   | .ok _ => pure (.ok ())
   | .error e => pure (.error e)
 
-/-- Persistent `MAP_SHARED` arena handle (`baseAddr`, `lenBytes`) mapped once and unmapped on close. -/
+/-- Persistent `MAP_SHARED` arena handle (`baseAddr`, `lenBytes`) with an `IO.Ref Bool` liveness token
+    preventing use-after-`munmap` or double-`munmap` in safe Lean code. -/
 structure MmapRegion where
   baseAddr : USize
   lenBytes : USize
   readOnly : Bool
-  deriving Repr, DecidableEq
+  closed   : IO.Ref Bool
+
+instance : Repr MmapRegion where
+  reprPrec r _ := s!"MmapRegion(base={r.baseAddr}, len={r.lenBytes}, ro={r.readOnly})"
 
 /-- Create a persistent `MAP_SHARED` mapping of `fd` at `fileOffset` of size `lenBytes` (`mode = 4` in `leansys_write_all`). -/
 def mmapMapShared (fd : Fd) (lenBytes : Nat) (fileOffset : Nat := 0) (readOnly : Bool := false) : IO (SysResult MmapRegion) := do
@@ -587,29 +613,58 @@ def mmapMapShared (fd : Fd) (lenBytes : Nat) (fileOffset : Nat := 0) (readOnly :
   | .error e => pure (.error e)
   | .ok addr =>
     if Spec.verifyBorrowedView addr lenBytes.toUInt64 0 lenBytes.toUInt64 == 1 then
-      pure (.ok { baseAddr := addr.toUSize, lenBytes := lenBytes.toUSize, readOnly := readOnly })
+      let closedRef ← IO.mkRef false
+      pure (.ok { baseAddr := addr.toUSize, lenBytes := lenBytes.toUSize, readOnly := readOnly, closed := closedRef })
     else
       let _ ← rawWriteAll 0 ByteArray.empty addr.toUSize lenBytes.toUSize 5
       pure (.error .einval)
 
-/-- Unmap a persistent `MmapRegion` via `munmap(2)` (`mode = 5` in `leansys_write_all`). -/
+/-- Unmap a persistent `MmapRegion` via `munmap(2)` (`mode = 5` in `leansys_write_all`), idempotently marking it closed. -/
 def mmapUnmap (reg : MmapRegion) : IO (SysResult Unit) := do
+  if ← reg.closed.get then
+    return .ok ()
   if reg.baseAddr == 0 || reg.lenBytes == 0 then
     return .error .einval
+  reg.closed.set true
   let w ← rawWriteAll 0 ByteArray.empty reg.baseAddr reg.lenBytes 5
   match decodePackedWord w with
   | .ok _ => pure (.ok ())
   | .error e => pure (.error e)
 
-/-- Obtain a zero-copy `BorrowedSlice` over `[relOff, relOff + subLen)` of a mapped `MmapRegion`. -/
-@[inline]
-def MmapRegion.view? (reg : MmapRegion) (relOff : Nat := 0) (subLen : Nat := reg.lenBytes.toNat) : Option BorrowedSlice :=
-  let full : BorrowedSlice := { ptr := reg.baseAddr, len := reg.lenBytes }
-  full.subView? relOff subLen
+/-- Scoped zero-copy `BorrowedSlice` access over `[relOff, relOff + subLen)` of a live `MmapRegion`
+    (fails closed with `.einval` if `reg` has already been unmapped or bounds overflow). -/
+def MmapRegion.withView {α : Type} (reg : MmapRegion) (relOff : Nat := 0) (subLen : Nat := reg.lenBytes.toNat)
+    (k : BorrowedSlice → IO α) : IO (SysResult α) := do
+  if ← reg.closed.get then
+    return .error .einval
+  let some full := BorrowedSlice.unsafeFromRawParts? reg.baseAddr reg.lenBytes
+    | return .error .einval
+  let some sub := full.subView? relOff subLen
+    | return .error .einval
+  let res ← k sub
+  if ← reg.closed.get then
+    return .error .einval
+  return .ok res
 
-/-- Write `ba` into `[relOff, relOff + ba.size)` of a writable `MmapRegion` with full memory barrier (`mode = 8`). -/
+/-- Effectful `__ATOMIC_ACQUIRE` 32-bit aligned load at `relOff` inside a live `MmapRegion`. -/
+def mmapAtomicLoadU32 (reg : MmapRegion) (relOff : Nat) : IO (SysResult UInt32) := do
+  if (← reg.closed.get) || (relOff % 4) != 0 ||
+     Spec.verifyBorrowedView reg.baseAddr.toUInt64 reg.lenBytes.toUInt64 relOff.toUInt64 4 != 1 then
+    return .error .einval
+  let v ← rawPtrLoadIO reg.baseAddr reg.lenBytes relOff.toUSize 4
+  return .ok v.toUInt32
+
+/-- Effectful `__ATOMIC_ACQUIRE` 64-bit aligned load at `relOff` inside a live `MmapRegion`. -/
+def mmapAtomicLoadU64 (reg : MmapRegion) (relOff : Nat) : IO (SysResult UInt64) := do
+  if (← reg.closed.get) || (relOff % 8) != 0 ||
+     Spec.verifyBorrowedView reg.baseAddr.toUInt64 reg.lenBytes.toUInt64 relOff.toUInt64 8 != 1 then
+    return .error .einval
+  let v ← rawPtrLoadIO reg.baseAddr reg.lenBytes relOff.toUSize 8
+  return .ok v
+
+/-- Write `ba` into `[relOff, relOff + ba.size)` of a writable live `MmapRegion` with `__ATOMIC_RELEASE` store/fence (`mode = 8`). -/
 def mmapRegionWrite (reg : MmapRegion) (relOff : Nat) (ba : ByteArray) : IO (SysResult Nat) := do
-  if reg.readOnly || relOff >= 0x100000000 ||
+  if (← reg.closed.get) || reg.readOnly || relOff >= 0x100000000 ||
      Spec.verifyBorrowedView reg.baseAddr.toUInt64 reg.lenBytes.toUInt64 relOff.toUInt64 ba.size.toUInt64 != 1 then
     return .error .einval
   let w ← rawWriteAll relOff.toUInt32 ba reg.baseAddr ba.size.toUSize 8
@@ -617,9 +672,9 @@ def mmapRegionWrite (reg : MmapRegion) (relOff : Nat) (ba : ByteArray) : IO (Sys
   | .ok n => pure (.ok n.toNat)
   | .error e => pure (.error e)
 
-/-- Read `len` bytes from `[relOff, relOff + len)` of an `MmapRegion` with full memory barrier (`tg = 1` in `leansys_pread_ba`). -/
+/-- Read `len` bytes from `[relOff, relOff + len)` of a live `MmapRegion` with `__ATOMIC_ACQUIRE` fence (`tg = 1` in `leansys_pread_ba`). -/
 def mmapRegionRead (reg : MmapRegion) (relOff : Nat) (len : Nat) : IO ByteArray := do
-  if relOff >= 0x100000000 ||
+  if (← reg.closed.get) || relOff >= 0x100000000 ||
      Spec.verifyBorrowedView reg.baseAddr.toUInt64 reg.lenBytes.toUInt64 relOff.toUInt64 len.toUInt64 != 1 then
     return ByteArray.empty
   let base64 := reg.baseAddr.toUInt64

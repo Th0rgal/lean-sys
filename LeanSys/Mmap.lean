@@ -280,16 +280,14 @@ def attach (path : String) (minEpoch : UInt64 := 0) : IO (SysResult MmapArena) :
       match ← mmapMapShared fd sz.toNat 0 false with
       | .error e => pure (.error e)
       | .ok reg =>
-        let some view := reg.view? 0 sz.toNat
-          | do discard <| mmapUnmap reg; return .error .einval
-        let magic := readU32View view 0
-        let ver   := readU32View view 4
-        let seq1  := view.getWord64LE 8
-        let epoch := view.getWord64LE 16
-        let head  := view.getWord64LE 24
-        let tail  := view.getWord64LE 32
-        let seq2  := view.getWord64LE 8
-        if magic != mmapSeqlockMagic ||
+        let .ok magic ← mmapAtomicLoadU32 reg 0 | do discard <| mmapUnmap reg; return .error .einval
+        let .ok ver   ← mmapAtomicLoadU32 reg 4 | do discard <| mmapUnmap reg; return .error .einval
+        let .ok seq1  ← mmapAtomicLoadU64 reg 8 | do discard <| mmapUnmap reg; return .error .einval
+        let .ok epoch ← mmapAtomicLoadU64 reg 16 | do discard <| mmapUnmap reg; return .error .einval
+        let .ok head  ← mmapAtomicLoadU64 reg 24 | do discard <| mmapUnmap reg; return .error .einval
+        let .ok tail  ← mmapAtomicLoadU64 reg 32 | do discard <| mmapUnmap reg; return .error .einval
+        let .ok seq2  ← mmapAtomicLoadU64 reg 8 | do discard <| mmapUnmap reg; return .error .einval
+        if head < tail || magic != mmapSeqlockMagic ||
            verifyMmapSeqlock magic ver 1 seq1 seq2 epoch minEpoch (head - tail) capNat.toUInt64 != 1 then
           discard <| mmapUnmap reg
           return .error .einval
@@ -299,10 +297,10 @@ def attach (path : String) (minEpoch : UInt64 := 0) : IO (SysResult MmapArena) :
 def close (arena : MmapArena) : IO (SysResult Unit) :=
   mmapUnmap arena.region
 
-/-- Return a zero-copy `BorrowedSlice` over the payload region `[40, 40 + cap)`. -/
+/-- Scoped zero-copy `BorrowedSlice` access over the payload region `[40, 40 + cap)` while `arena` remains mapped. -/
 @[inline]
-def payloadView? (arena : MmapArena) : Option BorrowedSlice :=
-  arena.region.view? headerBytes arena.cap.toNat
+def withPayloadView {α : Type} (arena : MmapArena) (k : BorrowedSlice → IO α) : IO (SysResult α) :=
+  arena.region.withView headerBytes arena.cap.toNat k
 
 private def writeRingBytes (reg : MmapRegion) (cap : Nat) (cursor : UInt64) (data : ByteArray) : IO (SysResult Unit) := do
   if data.isEmpty then return .ok ()
@@ -328,19 +326,17 @@ private def readRingBytes (reg : MmapRegion) (cap : Nat) (cursor : UInt64) (len 
   let c2 ← mmapRegionRead reg headerBytes (len - firstLen)
   return c1 ++ c2
 
-/-- Push a length-prefixed frame into the persistent `MmapArena` with zero syscalls (`memcpy` + memory barrier +
-    odd/even seqlock fencing gated by `leansys_verify_ring_cursor` and `leansys_verify_mmap_seqlock`). -/
+/-- Push a length-prefixed frame into the persistent `MmapArena` with zero syscalls (`__ATOMIC_ACQUIRE` loads +
+    `__ATOMIC_RELEASE` seqlock/cursor stores gated by `leansys_verify_ring_cursor` and `leansys_verify_mmap_seqlock`). -/
 def push (arena : MmapArena) (payload : ByteSlice) : IO (SysResult Bool) := do
-  let some hdrView := arena.region.view? 0 headerBytes
-    | return .error .einval
-  let seq0 := hdrView.getWord64LE 8
-  let head := hdrView.getWord64LE 24
-  let tail := hdrView.getWord64LE 32
+  let .ok seq0 ← mmapAtomicLoadU64 arena.region 8  | return .error .einval
+  let .ok head ← mmapAtomicLoadU64 arena.region 24 | return .error .einval
+  let .ok tail ← mmapAtomicLoadU64 arena.region 32 | return .error .einval
   let frameLen : UInt64 := 4 + payload.len.toUInt64
   if (seq0 &&& 1) != 0 || verifyRingCursor head tail arena.cap.toUInt64 frameLen != 1 then
     return .ok false
   let oddSeq := seq0 + 1
-  discard <| mmapRegionWrite arena.region 8 (pushUInt64LE ByteArray.empty oddSeq)
+  let .ok _ ← mmapRegionWrite arena.region 8 (pushUInt64LE ByteArray.empty oddSeq) | return .error .einval
   let lenBytes := pushUInt32LE ByteArray.empty payload.len.toUInt32
   let capNat := arena.cap.toNat
   match ← writeRingBytes arena.region capNat head lenBytes with
@@ -354,31 +350,31 @@ def push (arena : MmapArena) (payload : ByteSlice) : IO (SysResult Bool) := do
       if verifyMmapSeqlock mmapSeqlockMagic arena.schemaVersion 1 evenSeq evenSeq
            arena.writerEpoch arena.writerEpoch (newHead - tail) arena.cap.toUInt64 != 1 then
         return .error .einval
-      discard <| mmapRegionWrite arena.region 24 (pushUInt64LE ByteArray.empty newHead)
-      discard <| mmapRegionWrite arena.region 8 (pushUInt64LE ByteArray.empty evenSeq)
+      let .ok _ ← mmapRegionWrite arena.region 24 (pushUInt64LE ByteArray.empty newHead) | return .error .einval
+      let .ok _ ← mmapRegionWrite arena.region 8 (pushUInt64LE ByteArray.empty evenSeq) | return .error .einval
       return .ok true
 
-/-- Pop the next frame from the persistent `MmapArena` using lock-free seqlock validation (`leansys_verify_mmap_seqlock`)
-    and `leansys_verify_ring_cursor` with zero syscalls. -/
+/-- Pop the next frame from the persistent `MmapArena` using effectful `__ATOMIC_ACQUIRE` seqlock validation
+    (`leansys_verify_mmap_seqlock`) both before and *after* payload copy, before advancing `tail` with `__ATOMIC_RELEASE`. -/
 def pop? (arena : MmapArena) (minEpoch : UInt64 := 0) : IO (SysResult (Option ByteArray)) := do
-  let some hdrView := arena.region.view? 0 headerBytes
-    | return .error .einval
-  let magic := readU32View hdrView 0
-  let ver   := readU32View hdrView 4
-  let seqBefore := hdrView.getWord64LE 8
-  let epoch := hdrView.getWord64LE 16
-  let head  := hdrView.getWord64LE 24
-  let tail  := hdrView.getWord64LE 32
-  let seqAfter := hdrView.getWord64LE 8
+  let .ok magic     ← mmapAtomicLoadU32 arena.region 0  | return .error .einval
+  let .ok ver       ← mmapAtomicLoadU32 arena.region 4  | return .error .einval
+  let .ok seqBefore ← mmapAtomicLoadU64 arena.region 8  | return .error .einval
+  let .ok epoch     ← mmapAtomicLoadU64 arena.region 16 | return .error .einval
+  let .ok head      ← mmapAtomicLoadU64 arena.region 24 | return .error .einval
+  let .ok tail      ← mmapAtomicLoadU64 arena.region 32 | return .error .einval
   if head < tail then return .error .einval
-  if verifyMmapSeqlock magic ver 1 seqBefore seqAfter epoch minEpoch (head - tail) arena.cap.toUInt64 != 1 then
+  if verifyMmapSeqlock magic ver 1 seqBefore seqBefore epoch minEpoch (head - tail) arena.cap.toUInt64 != 1 then
     return .error .eagain
   if head == tail then
+    let .ok seqEmpty ← mmapAtomicLoadU64 arena.region 8 | return .error .einval
+    if seqEmpty != seqBefore then return .error .eagain
     return .ok none
   let unread := (head - tail).toNat
   if unread < 4 then return .error .eio
   let capNat := arena.cap.toNat
   let lenBuf ← readRingBytes arena.region capNat tail 4
+  if lenBuf.size < 4 then return .error .eio
   let msgLen := (readUInt32LE lenBuf 0).toNat
   let frameLen := 4 + msgLen
   if frameLen > unread then return .error .eio
@@ -386,7 +382,11 @@ def pop? (arena : MmapArena) (minEpoch : UInt64 := 0) : IO (SysResult (Option By
   if verifyRingCursor head newTail arena.cap.toUInt64 0 != 1 then
     return .error .einval
   let body ← readRingBytes arena.region capNat (tail + 4) msgLen
-  discard <| mmapRegionWrite arena.region 32 (pushUInt64LE ByteArray.empty newTail)
+  if body.size != msgLen then return .error .eio
+  let .ok seqPost ← mmapAtomicLoadU64 arena.region 8 | return .error .einval
+  if verifyMmapSeqlock magic ver 1 seqBefore seqPost epoch minEpoch (head - tail) arena.cap.toUInt64 != 1 then
+    return .error .eagain
+  let .ok _ ← mmapRegionWrite arena.region 32 (pushUInt64LE ByteArray.empty newTail) | return .error .einval
   return .ok (some body)
 
 end MmapArena
@@ -508,14 +508,14 @@ private def buildSqe64 (opcode : UInt8) (fd : Int32) (off addr : UInt64) (len : 
     b := b.push 0
   return b
 
-/-- Submit a single SQE (`NOP`, `READ`, or `WRITE`) and wait for 1 CQE completion, gated by `leansys_verify_io_uring_ring`. -/
+/-- Submit a single SQE (`NOP`, `READ`, or `WRITE`) and wait for its matching `userData` CQE completion
+    (retrying `ioUringEnterRaw` on `EINTR` with `toSubmit = 0` so in-flight kernel DMA buffers are never abandoned early),
+    using `__ATOMIC_ACQUIRE` 32-bit loads and `__ATOMIC_RELEASE` 32-bit stores gated by `leansys_verify_io_uring_ring`. -/
 def submitAndWaitOne (ring : IoUring) (opcode : UInt8) (targetFd : Int32)
     (fileOff bufAddr : UInt64) (bufLen : UInt32) (userData : UInt64) : IO (SysResult IoUringCqe) := do
-  let some sqView := ring.sqRing.view? 0 ring.sqRing.lenBytes.toNat
-    | return .error .einval
-  let head := (sqView.getWord64LE ring.sqOffHead &&& 0xFFFFFFFF).toUInt32
-  let tail := (sqView.getWord64LE ring.sqOffTail &&& 0xFFFFFFFF).toUInt32
-  let mask := (sqView.getWord64LE ring.sqOffMask &&& 0xFFFFFFFF).toUInt32
+  let .ok head ← mmapAtomicLoadU32 ring.sqRing ring.sqOffHead | return .error .einval
+  let .ok tail ← mmapAtomicLoadU32 ring.sqRing ring.sqOffTail | return .error .einval
+  let .ok mask ← mmapAtomicLoadU32 ring.sqRing ring.sqOffMask | return .error .einval
   if verifyIoUringRing head tail ring.sqEntries mask 1 != 1 then
     return .error .eagain
   let slotIdx := (tail &&& mask).toNat
@@ -529,42 +529,57 @@ def submitAndWaitOne (ring : IoUring) (opcode : UInt8) (targetFd : Int32)
       match ← mmapRegionWrite ring.sqRing ring.sqOffTail (pushUInt32LE ByteArray.empty (tail + 1)) with
       | .error e => return .error e
       | .ok _ =>
-        match ← ioUringEnterRaw ring.ringFd 1 1 1 with
-        | .error e => return .error e
-        | .ok _ =>
-          let some cqView := ring.cqRing.view? 0 ring.cqRing.lenBytes.toNat
-            | return .error .einval
-          let cqHead := (cqView.getWord64LE ring.cqOffHead &&& 0xFFFFFFFF).toUInt32
-          let cqTail := (cqView.getWord64LE ring.cqOffTail &&& 0xFFFFFFFF).toUInt32
-          let cqMask := (cqView.getWord64LE ring.cqOffMask &&& 0xFFFFFFFF).toUInt32
-          if cqHead == cqTail then
-            return .error .eagain
-          let cqeOff := ring.cqOffCqes + (cqHead &&& cqMask).toNat * 16
-          let cqeBytes ← mmapRegionRead ring.cqRing cqeOff 16
-          if cqeBytes.size < 16 then
-            return .error .eio
-          let ud := readUInt64LE cqeBytes 0
-          let resU32 := readUInt32LE cqeBytes 8
-          let flg := readUInt32LE cqeBytes 12
-          discard <| mmapRegionWrite ring.cqRing ring.cqOffHead (pushUInt32LE ByteArray.empty (cqHead + 1))
-          return .ok { userData := ud, res := resU32.toInt32, flags := flg }
+        let mut toSubmit : UInt32 := 1
+        let mut matchedCqe : Option IoUringCqe := none
+        let mut fatalErr : Option Errno := none
+        while matchedCqe.isNone && fatalErr.isNone do
+          match ← ioUringEnterRaw ring.ringFd toSubmit 1 1 with
+          | .error .eintr =>
+            toSubmit := 0
+          | .error e =>
+            fatalErr := some e
+          | .ok _ =>
+            toSubmit := 0
+            let .ok cqHead0 ← mmapAtomicLoadU32 ring.cqRing ring.cqOffHead | do fatalErr := some .einval; break
+            let .ok cqTail  ← mmapAtomicLoadU32 ring.cqRing ring.cqOffTail | do fatalErr := some .einval; break
+            let .ok cqMask  ← mmapAtomicLoadU32 ring.cqRing ring.cqOffMask | do fatalErr := some .einval; break
+            let mut curHead := cqHead0
+            while curHead != cqTail && matchedCqe.isNone do
+              let cqeOff := ring.cqOffCqes + (curHead &&& cqMask).toNat * 16
+              let cqeBytes ← mmapRegionRead ring.cqRing cqeOff 16
+              if cqeBytes.size < 16 then
+                fatalErr := some .eio
+                break
+              let ud := readUInt64LE cqeBytes 0
+              let resU32 := readUInt32LE cqeBytes 8
+              let flg := readUInt32LE cqeBytes 12
+              curHead := curHead + 1
+              let _ ← mmapRegionWrite ring.cqRing ring.cqOffHead (pushUInt32LE ByteArray.empty curHead)
+              if ud == userData then
+                matchedCqe := some { userData := ud, res := resU32.toInt32, flags := flg }
+        match fatalErr, matchedCqe with
+        | some e, _ => return .error e
+        | none, some cqe => return .ok cqe
+        | none, none => return .error .eagain
 
 /-- Submit an `IORING_OP_NOP` probe and verify round-trip `userData` completion. -/
 def submitNop (ring : IoUring) (userData : UInt64 := 0xCAFEBABE) : IO (SysResult IoUringCqe) :=
   submitAndWaitOne ring opNop (-1) 0 0 0 userData
 
-/-- Submit an `IORING_OP_READ` into a mapped `MmapRegion` slice `[regionOff, regionOff + len)` at `fileOff`. -/
+/-- Submit an `IORING_OP_READ` into a live mapped `MmapRegion` slice `[regionOff, regionOff + len)` at `fileOff`. -/
 def submitReadToRegion (ring : IoUring) (fd : Fd) (fileOff : UInt64)
     (dst : MmapRegion) (regionOff len : Nat) (userData : UInt64 := 1) : IO (SysResult IoUringCqe) := do
-  if dst.readOnly || verifyBorrowedView dst.baseAddr.toUInt64 dst.lenBytes.toUInt64 regionOff.toUInt64 len.toUInt64 != 1 then
+  if (← dst.closed.get) || dst.readOnly ||
+     verifyBorrowedView dst.baseAddr.toUInt64 dst.lenBytes.toUInt64 regionOff.toUInt64 len.toUInt64 != 1 then
     return .error .einval
   let targetAddr := dst.baseAddr.toUInt64 + regionOff.toUInt64
   submitAndWaitOne ring opRead fd.raw.toInt32 fileOff targetAddr len.toUInt32 userData
 
-/-- Submit an `IORING_OP_WRITE` from a mapped `MmapRegion` slice `[regionOff, regionOff + len)` to `fd` at `fileOff`. -/
+/-- Submit an `IORING_OP_WRITE` from a live mapped `MmapRegion` slice `[regionOff, regionOff + len)` to `fd` at `fileOff`. -/
 def submitWriteFromRegion (ring : IoUring) (fd : Fd) (fileOff : UInt64)
     (src : MmapRegion) (regionOff len : Nat) (userData : UInt64 := 2) : IO (SysResult IoUringCqe) := do
-  if verifyBorrowedView src.baseAddr.toUInt64 src.lenBytes.toUInt64 regionOff.toUInt64 len.toUInt64 != 1 then
+  if (← src.closed.get) ||
+     verifyBorrowedView src.baseAddr.toUInt64 src.lenBytes.toUInt64 regionOff.toUInt64 len.toUInt64 != 1 then
     return .error .einval
   let srcAddr := src.baseAddr.toUInt64 + regionOff.toUInt64
   submitAndWaitOne ring opWrite fd.raw.toInt32 fileOff srcAddr len.toUInt32 userData

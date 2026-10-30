@@ -138,6 +138,7 @@ private structure ConnSlot where
   fd         : Fd
   rxBuf      : ByteArray := ByteArray.empty
   txBuf      : ByteArray := ByteArray.empty
+  txOff      : Nat := 0
   reqsServed : Nat := 0
   closeAfter : Bool := false
   openedMs   : UInt64 := 0
@@ -147,7 +148,8 @@ private structure ConnSlot where
     Simultaneously multiplexes `listenFd` + up to `61` concurrent non-blocking Keep-Alive client connections
     AND optional non-blocking `ChildGroup` reaping (`waitOrKillGroup _ 0 true`), so a slow client stalling mid-header
     never blocks sibling connections on the same thread. Every connection admission and request step is gated by
-    `leansys_verify_poll_interest`. -/
+    `leansys_verify_poll_interest` and `leansys_verify_step_reactor`, and cleanup (`try ... finally`) closes all
+    accepted sockets and kills/reaps remaining watched subprocesses even if `handler` throws or `maxLoopMs` expires. -/
 def runMultiplexedReactor (cfg : ReactorConfig) (listenFd : Fd)
     (targetRequests : Nat) (handler : HttpRequest → IO HttpResponse)
     (watchedChildren : Array ChildGroup := #[])
@@ -155,126 +157,155 @@ def runMultiplexedReactor (cfg : ReactorConfig) (listenFd : Fd)
   discard <| setNonBlocking listenFd true
   let capConns := Nat.min 61 cfg.maxConns.toNat
   let tStart ← IO.monoNanosNow
-  let mut slots : Array ConnSlot := #[]
-  let mut completedReqs : Nat := 0
-  let mut reapedChildren : Array (UInt32 × UInt32) := #[]
-  let mut pendingChildren := watchedChildren
+  let slotsRef ← IO.mkRef (#[] : Array ConnSlot)
+  let completedRef ← IO.mkRef (0 : Nat)
+  let reapedRef ← IO.mkRef (#[] : Array (UInt32 × UInt32))
+  let pendingRef ← IO.mkRef watchedChildren
 
-  while completedReqs < targetRequests || !slots.isEmpty || !pendingChildren.isEmpty do
-    let nowNs ← IO.monoNanosNow
-    let elapsedMs : UInt64 := ((nowNs - tStart) / 1000000).toUInt64
-    if elapsedMs > maxLoopMs then
-      break
-    if completedReqs >= targetRequests && slots.isEmpty && pendingChildren.isEmpty then
-      break
+  try
+    while (← completedRef.get) < targetRequests || !(← slotsRef.get).isEmpty || !(← pendingRef.get).isEmpty do
+      let nowNs ← IO.monoNanosNow
+      let elapsedMs : UInt64 := ((nowNs - tStart) / 1000000).toUInt64
+      if elapsedMs > maxLoopMs then
+        break
+      if (← completedRef.get) >= targetRequests && (← slotsRef.get).isEmpty && (← pendingRef.get).isEmpty then
+        break
 
-    -- Poll any watched subprocess groups without blocking (`WNOHANG`)
-    let mut stillRunning : Array ChildGroup := #[]
-    for cg in pendingChildren do
-      match ← waitOrKillGroup cg 0 true with
-      | .ok (some code) => reapedChildren := reapedChildren.push (cg.pid, code)
-      | .ok none => stillRunning := stillRunning.push cg
-      | .error _ => pure ()
-    pendingChildren := stillRunning
+      -- Poll any watched subprocess groups without blocking (`WNOHANG`)
+      let curPending ← pendingRef.get
+      let mut stillRunning : Array ChildGroup := #[]
+      for cg in curPending do
+        match ← waitOrKillGroup cg 0 true with
+        | .ok (some code) => reapedRef.modify (·.push (cg.pid, code))
+        | .ok none => stillRunning := stillRunning.push cg
+        | .error .eintr => stillRunning := stillRunning.push cg
+        | .error _ => pure ()
+      pendingRef.set stillRunning
 
-    if completedReqs >= targetRequests && slots.isEmpty && pendingChildren.isEmpty then
-      break
+      if (← completedRef.get) >= targetRequests && (← slotsRef.get).isEmpty && (← pendingRef.get).isEmpty then
+        break
 
-    -- Build multi-FD poll array: index 0 is `listenFd` (while accepting), indices `1..slots.size` are client FDs
-    let mut pollFds : Array Fd := #[listenFd]
-    let mut outMask : UInt64 := 0
-    for i in [0:slots.size] do
-      let s := slots[i]!
-      pollFds := pollFds.push s.fd
-      if !s.txBuf.isEmpty then
-        outMask := outMask ||| ((1 : UInt64) <<< (i + 1).toUInt64)
+      -- Build multi-FD poll array: index 0 is `listenFd` (while accepting), indices `1..slots.size` are client FDs
+      let mut slots ← slotsRef.get
+      let mut pollFds : Array Fd := #[listenFd]
+      let mut outMask : UInt64 := 0
+      for i in [0:slots.size] do
+        let s := slots[i]!
+        pollFds := pollFds.push s.fd
+        if s.txOff < s.txBuf.size then
+          outMask := outMask ||| ((1 : UInt64) <<< (i + 1).toUInt64)
 
-    let sliceTimeout : UInt32 := if pendingChildren.isEmpty then 25 else 5
-    let readyIdxs ← match ← pollFdSet pollFds sliceTimeout outMask with
-      | .ok r => pure r
-      | .error _ => pure #[]
+      let sliceTimeout : UInt32 := if (← pendingRef.get).isEmpty then 25 else 5
+      let readyIdxs ← match ← pollFdSet pollFds sliceTimeout outMask with
+        | .ok r => pure r
+        | .error _ => pure #[]
 
-    -- 1. Accept any ready incoming connections on `listenFd` (slot 0)
-    if readyIdxs.contains 0 && slots.size < capConns && completedReqs < targetRequests then
-      let mut acceptMore := true
-      while acceptMore && slots.size < capConns do
-        match ← tcpAcceptPoll listenFd 0 with
-        | .ok cfd =>
-          if verifyPollInterest (slots.size + 1).toUInt32 cfg.maxConns 0 cfg.maxKeepAliveReq 0 cfg.maxIdleMs == 1 then
-            discard <| setNonBlocking cfd true
-            slots := slots.push { fd := cfd, openedMs := elapsedMs }
-          else
-            discard <| closeFd cfd
+      -- 1. Accept any ready incoming connections on `listenFd` (slot 0)
+      if readyIdxs.contains 0 && slots.size < capConns && (← completedRef.get) < targetRequests then
+        let mut acceptMore := true
+        while acceptMore && slots.size < capConns do
+          match ← tcpAcceptPoll listenFd 0 with
+          | .ok cfd =>
+            if verifyPollInterest (slots.size + 1).toUInt32 cfg.maxConns 0 cfg.maxKeepAliveReq 0 cfg.maxIdleMs == 1 then
+              discard <| setNonBlocking cfd true
+              slots := slots.push { fd := cfd, openedMs := elapsedMs }
+              slotsRef.set slots
+            else
+              discard <| closeFd cfd
+              acceptMore := false
+          | .error _ =>
             acceptMore := false
-        | .error _ =>
-          acceptMore := false
 
-    -- 2. Advance every active client connection state machine without blocking
-    let mut nextSlots : Array ConnSlot := #[]
-    for idx in [0:slots.size] do
-      let mut s := slots[idx]!
-      let mut dropConn := false
-      let idleAge : UInt32 := (elapsedMs - s.openedMs).toUInt32
-      if idleAge > cfg.maxIdleMs then
-        dropConn := true
-      else if readyIdxs.contains (idx + 1) then
-        if s.txBuf.isEmpty then
-          let chunk ← readStreamChunk s.fd 16384
-          if chunk.isEmpty then
-            -- Either EOF or EAGAIN on non-blocking socket; if poll reported ready with 0 bytes, peer closed or stalled
-            if s.rxBuf.isEmpty then
-              dropConn := true
-          else
-            s := { s with rxBuf := if s.rxBuf.isEmpty then chunk else s.rxBuf ++ chunk, openedMs := elapsedMs }
+      -- 2. Advance every active client connection state machine without blocking
+      let mut nextSlots : Array ConnSlot := #[]
+      for idx in [0:slots.size] do
+        let mut s := slots[idx]!
+        let mut dropConn := false
+        let idleAge : UInt32 := (elapsedMs - s.openedMs).toUInt32
+        if idleAge > cfg.maxIdleMs then
+          dropConn := true
+        else if readyIdxs.contains (idx + 1) then
+          if s.txOff >= s.txBuf.size && !s.closeAfter then
+            let chunk ← readStreamChunk s.fd 16384
+            if chunk.isEmpty then
+              -- Either EOF or EAGAIN on non-blocking socket; if poll reported ready with 0 bytes, peer closed or stalled
+              if s.rxBuf.isEmpty then
+                dropConn := true
+            else
+              s := { s with rxBuf := if s.rxBuf.isEmpty then chunk else s.rxBuf ++ chunk, openedMs := elapsedMs }
 
-        -- Drain all complete pipelined frames already buffered in `s.rxBuf`
-        let mut parseLoop := !dropConn && s.txBuf.isEmpty && !s.rxBuf.isEmpty
-        while parseLoop do
-          match tryParseIncremental s.rxBuf cfg.expectedBearer? with
-          | .error errMsg =>
-            let code := statusForParseError errMsg
-            let errResp := HttpResponse.json code s!"\{\"ok\":false,\"error\":\"{errMsg}\"}"
-            s := { s with rxBuf := ByteArray.empty, txBuf := s.txBuf ++ toKeepAliveWireBytes errResp false, closeAfter := true }
-            parseLoop := false
-          | .ok none =>
-            parseLoop := false
-          | .ok (some (req, rem)) =>
-            let nextReqs := s.reqsServed + 1
-            let wantsClose := req.headers.any fun (k, v) =>
-              asciiEqIgnoreCase k "connection" && asciiEqIgnoreCase v "close"
-            let canKeep := !wantsClose &&
-              verifyPollInterest slots.size.toUInt32 cfg.maxConns nextReqs.toUInt32 cfg.maxKeepAliveReq 0 cfg.maxIdleMs == 1
-            let resp ← handler req
-            completedReqs := completedReqs + 1
-            s := {
-              s with
-              rxBuf := rem
-              txBuf := s.txBuf ++ toKeepAliveWireBytes resp canKeep
-              reqsServed := nextReqs
-              closeAfter := !canKeep
-              openedMs := elapsedMs
-            }
-            if !canKeep || rem.isEmpty then
+          -- Drain all complete pipelined frames already buffered in `s.rxBuf`
+          let mut parseLoop := !dropConn && !s.closeAfter && !s.rxBuf.isEmpty
+          while parseLoop do
+            match tryParseIncremental s.rxBuf cfg.expectedBearer? with
+            | .error errMsg =>
+              let code := statusForParseError errMsg
+              let errResp := HttpResponse.json code s!"\{\"ok\":false,\"error\":\"{errMsg}\"}"
+              let remTx := if s.txOff == 0 then s.txBuf else s.txBuf.extract s.txOff s.txBuf.size
+              s := { s with rxBuf := ByteArray.empty, txBuf := remTx ++ toKeepAliveWireBytes errResp false, txOff := 0, closeAfter := true }
               parseLoop := false
+            | .ok none =>
+              parseLoop := false
+            | .ok (some (req, rem)) =>
+              let nextReqs := s.reqsServed + 1
+              if verifyStepReactor 1 1 nextReqs.toUInt64 cfg.maxKeepAliveReq.toUInt64 slots.size.toUInt32 cfg.maxConns 0 != 1 then
+                dropConn := true
+                parseLoop := false
+              else
+                let wantsClose := req.headers.any fun (k, v) =>
+                  asciiEqIgnoreCase k "connection" && asciiEqIgnoreCase v "close"
+                let canKeep := !wantsClose &&
+                  verifyPollInterest slots.size.toUInt32 cfg.maxConns nextReqs.toUInt32 cfg.maxKeepAliveReq 0 cfg.maxIdleMs == 1
+                slots := slots.set! idx s
+                slotsRef.set slots
+                let resp ← handler req
+                completedRef.modify (· + 1)
+                let remTx := if s.txOff == 0 then s.txBuf else s.txBuf.extract s.txOff s.txBuf.size
+                s := {
+                  s with
+                  rxBuf := rem
+                  txBuf := remTx ++ toKeepAliveWireBytes resp canKeep
+                  txOff := 0
+                  reqsServed := nextReqs
+                  closeAfter := !canKeep
+                  openedMs := elapsedMs
+                }
+                if !canKeep || rem.isEmpty then
+                  parseLoop := false
 
-      -- Flush outbound response bytes if queued
-      if !dropConn && !s.txBuf.isEmpty then
-        match ← writeAll s.fd s.txBuf false with
-        | .ok _ =>
-          s := { s with txBuf := ByteArray.empty }
-          if s.closeAfter then
-            dropConn := true
-        | .error .eagain => pure ()
-        | .error _ => dropConn := true
+        -- Flush outbound response slice `[s.txOff, s.txBuf.size)` via partial-write cursor tracking (`writeSlicePartial`)
+        if !dropConn && s.txOff < s.txBuf.size then
+          let pendingSlice : ByteSlice := { ba := s.txBuf, off := s.txOff, len := s.txBuf.size - s.txOff }
+          match ← writeSlicePartial s.fd pendingSlice with
+          | .ok sent =>
+            let newOff := s.txOff + sent
+            if newOff >= s.txBuf.size then
+              s := { s with txBuf := ByteArray.empty, txOff := 0 }
+              if s.closeAfter then
+                dropConn := true
+            else
+              s := { s with txOff := newOff, openedMs := elapsedMs }
+          | .error .eagain => pure ()
+          | .error _ => dropConn := true
 
-      if dropConn then
-        discard <| closeFd s.fd
-      else
-        nextSlots := nextSlots.push s
-    slots := nextSlots
+        if dropConn then
+          discard <| closeFd s.fd
+        else
+          nextSlots := nextSlots.push s
+      slotsRef.set nextSlots
+  finally
+    let leftoverSlots ← slotsRef.get
+    slotsRef.set #[]
+    for s in leftoverSlots do
+      discard <| closeFd s.fd
+    let leftoverChildren ← pendingRef.get
+    pendingRef.set #[]
+    for cg in leftoverChildren do
+      match ← waitOrKillGroup cg 9 false with
+      | .ok (some code) => reapedRef.modify (·.push (cg.pid, code))
+      | _ => pure ()
+    discard <| setNonBlocking listenFd false
 
-  for s in slots do
-    discard <| closeFd s.fd
-  return (completedReqs, reapedChildren)
+  return (← completedRef.get, ← reapedRef.get)
 
 end LeanSys.Reactor

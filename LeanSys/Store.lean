@@ -669,23 +669,34 @@ def casPut256 (h : Handle) (src : ByteSource) (algo : CasAlgo256 := .sha256) : I
         return .error e
       | .ok () => return .ok (prefixTag ++ hex64)
 
-/-- Verify and read a 256-bit CAS object (`"sha256:<64-hex>"` or raw 64-char hex) via `leansys_verify_cas_digest256`. -/
+/-- Verify and read a 256-bit CAS object (`"sha256:<64-hex>"` or raw 64-char hex) in a single `withFd` pass
+    via `leansys_verify_cas_digest256` (zero TOCTOU reopen, exact `fstat` byte-count check). -/
 def casGet256 (h : Handle) (key : String) : IO (SysResult ByteArray) := do
   let (algo, cleanHex) := match key.splitOn ":" with
     | ["blake256", rest] => (CasAlgo256.keyed256, rest)
     | [_, rest] => (CasAlgo256.sha256, rest)
     | _ => (CasAlgo256.sha256, key)
   let pathSep := hasPathTraversal cleanHex
+  if pathSep != 0 then
+    return .error .einval
   let some expected := Digest256.ofHex? cleanHex
     | return .error .einval
   let casPath := (System.FilePath.mk h.casDir / cleanHex).toString
-  match ← verifyCasFile256 casPath expected pathSep algo with
-  | .error e => pure (.error e)
-  | .ok () =>
-    withFd casPath 0 fun fd => do
-      match ← fstatSize fd with
-      | .error e => pure (.error e)
-      | .ok sz => preadByteArray fd 0 sz.toNat >>= (pure ∘ .ok)
+  withFd casPath 0 fun fd => do
+    match ← fstatSize fd with
+    | .error e => pure (.error e)
+    | .ok sz =>
+      if sz > ((1 : UInt64) <<< 30) then
+        return .error .einval
+      let raw ← preadByteArray fd 0 sz.toNat
+      if raw.size.toUInt64 != sz then
+        return .error .eio
+      let computed := ((initCasStream algo).updateBytes raw).finalizeDigest256
+      if verifyCasDigest256 expected.w0 expected.w1 expected.w2 expected.w3
+           computed.w0 computed.w1 computed.w2 computed.w3 pathSep == 1 then
+        pure (.ok raw)
+      else
+        pure (.error .einval)
 
 /-- Stream-copy `srcPath` to `tmpTarget` in `1 MiB` `pread` chunks with `0644` writable mode + `fsync`. -/
 private def streamCopyWritable (srcPath tmpTarget : String) (chunkBytes : Nat := 1048576) : IO (SysResult Unit) := do

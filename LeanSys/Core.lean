@@ -87,12 +87,22 @@ def selfTestWave1Features (testDir : String) : IO UInt32 := do
   }
   let some signed := signSigV4Headers creds sigReq 1369353660
     | do IO.eprintln "[lean-sys-core] FAIL: signSigV4Headers rejected valid vector"; return 1
-  let some presigned := presignS3Url creds "https://examplebucket.s3.amazonaws.com" sigReq 1369353660
+  let presignReq : AwsSigV4Request := { sigReq with headers := #[("Host", "examplebucket.s3.amazonaws.com")] }
+  let some presigned := presignS3Url creds "https://examplebucket.s3.amazonaws.com" presignReq 1369353660
     | do IO.eprintln "[lean-sys-core] FAIL: presignS3Url rejected valid vector"; return 1
-  if signed.signatureHex.utf8ByteSize != 64 || presigned.presignedUrl?.isNone ||
+  let dupHdrReq := { sigReq with headers := #[("Host", "examplebucket.s3.amazonaws.com"), ("X-Dup", "z"), ("x-dup", "a")] }
+  let some dupSigned := signSigV4Headers creds dupHdrReq 1369353660
+    | do IO.eprintln "[lean-sys-core] FAIL: signSigV4Headers duplicate header fold"; return 1
+  let some dupPresigned := presignS3Url creds "https://examplebucket.s3.amazonaws.com" dupHdrReq 1369353660
+    | do IO.eprintln "[lean-sys-core] FAIL: presignS3Url duplicate header fold"; return 1
+  if signed.signatureHex != "f0e8bdb87c964420e857bd35b5d6ed310bd44f0170aba48dd91039c6036bdb41" ||
+     presigned.signatureHex != "aeeed9bbccd4d02ee5c0109b86d86835f995330da4c265957d157751f604d404" ||
+     presigned.presignedUrl?.isNone ||
+     (dupSigned.canonicalRequest.splitOn "x-dup:z,a\n").length != 2 ||
+     dupPresigned.signedHeaders != "host;x-dup" ||
      (signSigV4Headers creds { sigReq with headers := #[("Host", "bad\r\ninject")] } 1369353660).isSome ||
      (signSigV4Headers creds sigReq 1369440001).isSome then
-    IO.eprintln s!"[lean-sys-core] FAIL: SigV4 verification failed: {signed.signatureHex}"
+    IO.eprintln s!"[lean-sys-core] FAIL: SigV4 verification failed: sig={signed.signatureHex}, presig={presigned.signatureHex}"
     return 1
 
   -- 4. P0.2 + P1.7: 256-bit streaming CAS + CoW Reflink materialization (`0644` writable target, `0444` CAS untouched)
@@ -125,6 +135,21 @@ def selfTestWave1Features (testDir : String) : IO UInt32 := do
       IO.eprintln "[lean-sys-core] FAIL: CAS immutability violated after target mutation"
       return 1
 
+  -- Regression: `preadByteArray` with reserved high-tag offset (`>= 1 <<< 62`) must fail closed with `#[]` (never pointer deref!)
+  let .ok hiTagRead ← withFd srcBlobPath 0 fun rfd => do pure (.ok (← preadByteArray rfd (0x4000000000000001 : UInt64) 4))
+    | do IO.eprintln "[lean-sys-core] FAIL: open srcBlobPath for hiTagRead"; return 1
+  if !hiTagRead.isEmpty then
+    IO.eprintln "[lean-sys-core] FAIL: preadByteArray allowed reserved pointer-tag offset"
+    return 1
+  -- Regression: `mmapMapShared` on empty/short file (`len > st_size`) must reject with `.error .einval` (no SIGBUS!)
+  let shortMmap ← withFd srcBlobPath 0 fun rfd => mmapMapShared rfd 65536 0 true
+  match shortMmap with
+  | .ok badReg =>
+    discard <| mmapUnmap badReg
+    IO.eprintln "[lean-sys-core] FAIL: mmapMapShared allowed mapping past regular file EOF"
+    return 1
+  | .error _ => pure ()
+
   -- 5. P3.11 + P2.9: Persistent `MmapArena` (`0` syscalls per push/pop) + zero-copy `BorrowedSlice` across Hash/Codec/JsonRpc/Http/Auth
   let arenaPath := s!"{testDir}/wave1.arena"
   let .ok arena ← MmapArena.create arenaPath 4096 7
@@ -140,32 +165,35 @@ def selfTestWave1Features (testDir : String) : IO UInt32 := do
     IO.eprintln "[lean-sys-core] FAIL: MmapArena roundtrip mismatch"
     return 1
 
-  -- Zero-copy `BorrowedSlice` directly over mapped `MmapRegion` memory (`0` ByteArray copies)
+  -- Scoped zero-copy `BorrowedSlice` directly over mapped `MmapRegion` memory (`0` ByteArray copies, liveness-checked)
   let rawHttpBytes := s!"POST /v1/rpc HTTP/1.1\r\nHost: unix\r\nContent-Length: {rpcWire.utf8ByteSize}\r\n\r\n{rpcWire}".toUTF8
   let _ ← mmapRegionWrite arena.region 512 rawHttpBytes
-  let some bView := arena.region.view? 512 rawHttpBytes.size
-    | do IO.eprintln "[lean-sys-core] FAIL: MmapRegion.view?"; return 1
-  let bSrc := ByteSource.ofBorrowed bView
-  let sliceRef := ByteSlice.ofByteArray rawHttpBytes
-  if xxh64Borrowed bView != xxh64Slice sliceRef ||
-     sha256Source bSrc != sha256Bytes rawHttpBytes ||
-     !ctEqSource bSrc (ByteSource.ofByteSlice sliceRef) then
-    IO.eprintln "[lean-sys-core] FAIL: zero-copy BorrowedSlice hash/sha256/ctEq parity"
+  let viewOk ← arena.region.withView 512 rawHttpBytes.size fun bView => do
+    let bSrc := ByteSource.ofBorrowed bView
+    let sliceRef := ByteSlice.ofByteArray rawHttpBytes
+    if xxh64Borrowed bView != xxh64Slice sliceRef ||
+       sha256Source bSrc != sha256Bytes rawHttpBytes ||
+       !ctEqSource bSrc (ByteSource.ofByteSlice sliceRef) then
+      return false
+    match parseRequestSourcePrefix bSrc none false with
+    | .error _ => return false
+    | .ok (breq, _) =>
+      let some parsedRpc := parseRequestSource? breq.bodySource | return false
+      let some pt := parsedRpc.paramsTape | return false
+      return (parsedRpc.method == "ping" && BorrowedJsonTape.lookupNat? pt "n" == some 99)
+  match viewOk with
+  | .ok true => pure ()
+  | _ =>
+    IO.eprintln "[lean-sys-core] FAIL: scoped MmapRegion.withView zero-copy verification failed"
     return 1
-  match parseRequestSourcePrefix bSrc none false with
-  | .error e =>
-    IO.eprintln s!"[lean-sys-core] FAIL: parseRequestSourcePrefix {e}"
-    return 1
-  | .ok (breq, _) =>
-    let some parsedRpc := parseRequestSource? breq.bodySource
-      | do IO.eprintln "[lean-sys-core] FAIL: parseRequestSource? over BorrowedSlice"; return 1
-    let some pt := parsedRpc.paramsTape
-      | do IO.eprintln "[lean-sys-core] FAIL: BorrowedRpcRequest paramsTape"; return 1
-    if parsedRpc.method != "ping" || BorrowedJsonTape.lookupNat? pt "n" != some 99 then
-      IO.eprintln "[lean-sys-core] FAIL: BorrowedJsonTape lookup mismatch"
-      return 1
   discard <| MmapArena.close arena2
   discard <| MmapArena.close arena
+  -- Regression: accessing `withView` or `MmapArena.pop?` after `MmapArena.close` fails closed with `.error .einval`!
+  match ← arena.region.withView 0 16 (fun v => pure (v.getByteD 0)), ← MmapArena.pop? arena 7 with
+  | .error .einval, .error .einval => pure ()
+  | _, _ =>
+    IO.eprintln "[lean-sys-core] FAIL: MmapArena/MmapRegion allowed use-after-close!"
+    return 1
 
   -- 6. P3.11: Linux `io_uring` SQ/CQ shared-memory ring (`NOP` + `WRITE` + `READ` roundtrip on Linux)
   match ← IoUring.setup 8 with
@@ -210,29 +238,35 @@ def selfTestWave1Features (testDir : String) : IO UInt32 := do
     | do IO.eprintln "[lean-sys-core] FAIL: unixListen"; return 1
   let .ok bgChild ← spawnProcessGroup "/bin/sh" #["-c", "exit 0"]
     | do IO.eprintln "[lean-sys-core] FAIL: spawnProcessGroup for reactor"; return 1
-  let muxCfg : ReactorConfig := { maxConns := 16, maxKeepAliveReq := 8, maxIdleMs := 1500 }
+  let muxCfg : ReactorConfig := { maxConns := 16, maxKeepAliveReq := 8, maxIdleMs := 2500 }
+  let bigBodyStr := String.ofList (List.replicate 300000 'X')
   let muxServer ← IO.asTask (prio := .dedicated) do
-    runMultiplexedReactor muxCfg uxListen 2
-      (fun req => pure (HttpResponse.json 200 s!"\{\"ok\":true,\"unix_path\":\"{req.path}\"}"))
-      #[bgChild] 2500
+    runMultiplexedReactor muxCfg uxListen 3
+      (fun req =>
+        if req.path == "/big" then
+          pure (HttpResponse.json 200 bigBodyStr)
+        else
+          pure (HttpResponse.json 200 s!"\{\"ok\":true,\"unix_path\":\"{req.path}\"}"))
+      #[bgChild] 3000
   -- Open a slow/stalled client sending only partial headers so single-FD blocking servers would wedge!
   let .ok slowClient ← unixConnect sockPath
     | do IO.eprintln "[lean-sys-core] FAIL: unixConnect slow"; return 1
   discard <| writeAll slowClient ("GET /slow HTTP/1.1\r\nHost: local".toUTF8) false
-  -- While `slowClient` sits mid-header, `requestUnix` on two sibling connections must complete immediately!
-  let uxRes1 ← requestUnix sockPath "GET" "/fast-1" (ByteSlice.ofString "") none 1500
-  let uxRes2 ← requestUnix sockPath "POST" "/fast-2" (ByteSlice.ofString "{}") none 1500
+  -- While `slowClient` sits mid-header, `requestUnix` on sibling connections (including 300 KB backpressure payload) must complete intact!
+  let uxRes1 ← requestUnix sockPath "GET" "/fast-1" (ByteSlice.ofString "") none 2000
+  let uxRes2 ← requestUnix sockPath "POST" "/fast-2" (ByteSlice.ofString "{}") none 2000
+  let uxBig  ← requestUnix sockPath "GET" "/big" (ByteSlice.ofString "") none 2500
   discard <| closeFd slowClient
   let muxOut ← IO.wait muxServer
   discard <| closeFd uxListen
   discard <| unlinkFile sockPath
-  match uxRes1, uxRes2, muxOut with
-  | .ok b1, .ok b2, .ok (reqsDone, reaped) =>
-    if reqsDone < 2 || reaped.size != 1 ||
+  match uxRes1, uxRes2, uxBig, muxOut with
+  | .ok b1, .ok b2, .ok bBig, .ok (reqsDone, reaped) =>
+    if reqsDone < 3 || reaped.size != 1 || bBig != bigBodyStr ||
        (b1.splitOn "fast-1").length ≤ 1 || (b2.splitOn "fast-2").length ≤ 1 then
-      IO.eprintln s!"[lean-sys-core] FAIL: AF_UNIX / multiplexed reactor mismatch: reqs={reqsDone}, reaped={reaped.size}, b1={b1}, b2={b2}"
+      IO.eprintln s!"[lean-sys-core] FAIL: AF_UNIX / multiplexed reactor mismatch: reqs={reqsDone}, reaped={reaped.size}, bigLen={bBig.utf8ByteSize}"
       return 1
-  | _, _, _ =>
+  | _, _, _, _ =>
     IO.eprintln "[lean-sys-core] FAIL: AF_UNIX / multiplexed reactor IO failure"
     return 1
 
@@ -270,10 +304,23 @@ def selfTestWave1Features (testDir : String) : IO UInt32 := do
   | .ok (_, none) =>
     IO.eprintln "[lean-sys-core] FAIL: runCgroupV2Group missing metrics"
     return 1
+  -- Regression: missing `cgroupDir` fails closed immediately (`.error .enoent`), and unwritable `cgroup.procs`
+  -- with valid metrics fails closed via child pre-`execve` exit 126 (`.error .eacces`)!
   match ← runCgroupV2Group { maxRssBytes := 16777216, timeoutMs := 2000 } s!"{testDir}/missing-cg-dir" "/bin/sh" #["-c", "exit 0"] with
+  | .error .enoent | .error .eacces => pure ()
+  | other =>
+    IO.eprintln s!"[lean-sys-core] FAIL: runCgroupV2Group did not fail closed on missing cgroupDir: {repr other}"
+    return 1
+  let roCg := s!"{testDir}/ro-cg"
+  IO.FS.createDirAll roCg
+  let _ ← withFd s!"{roCg}/cgroup.procs" 4 (fun fd => writeAll fd ByteArray.empty false)
+  discard <| chmodReadOnly s!"{roCg}/cgroup.procs"
+  let _ ← withFd s!"{roCg}/memory.current" 4 (fun fd => writeAll fd "1024\n".toUTF8 false)
+  let _ ← withFd s!"{roCg}/memory.events" 4 (fun fd => writeAll fd "oom 0\noom_kill 0\n".toUTF8 false)
+  match ← runCgroupV2Group { maxRssBytes := 16777216, timeoutMs := 2000 } roCg "/bin/sh" #["-c", "exit 0"] with
   | .error .eacces => pure ()
   | other =>
-    IO.eprintln s!"[lean-sys-core] FAIL: runCgroupV2Group did not fail closed on missing cgroup.procs: {repr other}"
+    IO.eprintln s!"[lean-sys-core] FAIL: runCgroupV2Group did not fail closed on unwritable cgroup.procs: {repr other}"
     return 1
 
   return 0

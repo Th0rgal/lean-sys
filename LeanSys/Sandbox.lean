@@ -167,17 +167,26 @@ def resolveSelfCgroupV2Dir (cgroupMount : String := "/sys/fs/cgroup") : IO (SysR
         return .ok full
     return .error .eopnotsupp
 
-/-- Parse `memory.events` text to extract `(oom, oom_kill)` counters in pure Lean (`0` C LOC). -/
-def parseMemoryEvents (content : String) : UInt64 × UInt64 := Id.run do
-  let mut oom : UInt64 := 0
-  let mut oomKill : UInt64 := 0
+/-- Parse `memory.events` text to extract `(oom, oom_kill)` counters in pure Lean (`0` C LOC).
+    Fails closed (`none`) if `oom` or `oom_kill` lines are missing or non-numeric. -/
+def parseMemoryEvents? (content : String) : Option (UInt64 × UInt64) := Id.run do
+  let mut oom? : Option UInt64 := none
+  let mut oomKill? : Option UInt64 := none
   for line in content.splitOn "\n" do
     let parts := line.trimAscii.toString.splitOn " "
     match parts with
-    | ["oom", v] => oom := (parseAsciiUInt64? v).getD oom
-    | ["oom_kill", v] => oomKill := (parseAsciiUInt64? v).getD oomKill
+    | ["oom", v] =>
+      match parseAsciiUInt64? v with
+      | some n => oom? := some n
+      | none => return none
+    | ["oom_kill", v] =>
+      match parseAsciiUInt64? v with
+      | some n => oomKill? := some n
+      | none => return none
     | _ => pure ()
-  return (oom, oomKill)
+  match oom?, oomKill? with
+  | some o, some k => some (o, k)
+  | _, _ => none
 
 /-- Read live `memory.current` and `memory.events` (`oom`, `oom_kill`) from `cgroupDir` in pure Lean. -/
 def readCgroupV2Metrics (cgroupDir : String) : IO (SysResult CgroupV2Metrics) := do
@@ -191,7 +200,8 @@ def readCgroupV2Metrics (cgroupDir : String) : IO (SysResult CgroupV2Metrics) :=
     match ← readSmallProcFile s!"{cgroupDir}/memory.events" with
     | .error e => return .error e
     | .ok evTxt =>
-      let (oomCnt, oomKillCnt) := parseMemoryEvents evTxt
+      let some (oomCnt, oomKillCnt) := parseMemoryEvents? evTxt
+        | return .error .eio
       return .ok {
         cgroupDir := cgroupDir
         memoryCurrentBytes := memCur
@@ -227,6 +237,7 @@ def runCgroupV2Group (quota : SandboxQuota) (cgroupDir : String)
       let mut doneExit : Option UInt32 := none
       let mut timedOut := false
       let mut quotaBreach := false
+      let mut metricsErr : Option Errno := none
       let mut lastMetrics : Option CgroupV2Metrics := none
       while doneExit.isNone do
         let now ← IO.monoNanosNow
@@ -237,7 +248,12 @@ def runCgroupV2Group (quota : SandboxQuota) (cgroupDir : String)
             if verifyCgroupV2Budget m.memoryCurrentBytes quota.maxRssBytes m.oomKillCount 1 != 1 then
               quotaBreach := true
             pure m.memoryCurrentBytes
-          | .error _ => pure 0
+          | .error e =>
+            metricsErr := some e
+            pure 0
+        if metricsErr.isSome then
+          discard <| waitOrKillGroup cg 9 false
+          break
         if quotaBreach || verifyRlimitBudget liveRss quota.maxRssBytes elapsedMs quota.timeoutMs observedPipeBytes quota.maxPipeBytes != 1 then
           timedOut := elapsedMs > quota.timeoutMs
           quotaBreach := true
@@ -248,6 +264,8 @@ def runCgroupV2Group (quota : SandboxQuota) (cgroupDir : String)
         | .error e => return .error e
         | .ok (some code) => doneExit := some code
         | .ok none => IO.sleep 2
+      if let some me := metricsErr then
+        return .error me
       let code := doneExit.getD 137
       if code == 126 then
         return .error .eacces

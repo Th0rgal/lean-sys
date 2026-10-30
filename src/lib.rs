@@ -814,8 +814,8 @@ impl Digest256Limbs {
 #[repr(C)]
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct RawByteView {
-    pub ptr: usize,
-    pub len: usize,
+    ptr: usize,
+    len: usize,
 }
 
 impl RawByteView {
@@ -829,6 +829,21 @@ impl RawByteView {
         } else {
             None
         }
+    }
+
+    #[inline]
+    pub fn ptr(&self) -> usize {
+        self.ptr
+    }
+
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
     }
 
     #[inline]
