@@ -93,6 +93,7 @@ const LEANSYS_EXPORTS: &[&str] = &[
     "leansys_verify_io_uring_ring",
     "leansys_verify_borrowed_view",
     "leansys_verify_step_reactor",
+    "leansys_verify_stream_relay",
 ];
 
 fn extract_spec_exports(spec_src: &str) -> Vec<String> {

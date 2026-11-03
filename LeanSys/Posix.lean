@@ -52,11 +52,13 @@ def ofUInt32 (code : UInt32) : Errno :=
   | 22  => .einval
   | 28  => .enospc
   | 32  => .epiped
+  | 35  => .eagain      -- macOS / BSD EAGAIN / EWOULDBLOCK
   | 38  => .enosys
   | 45  => .eopnotsupp
   | 61  => .econnrefused
   | 78  => .enosys
   | 95  => .eopnotsupp
+  | 102 => .eopnotsupp  -- macOS EOPNOTSUPP (sys/errno.h)
   | 111 => .econnrefused
   | _   => .unknown code
 

@@ -311,4 +311,166 @@ def runMultiplexedReactor (cfg : ReactorConfig) (listenFd : Fd)
 
   return (← completedRef.get, ← reapedRef.get)
 
+/-- Configuration for a governed SSE / HTTP/1.1 streaming reverse-proxy splice (`relayHttpStream`). -/
+structure StreamRelayConfig where
+  prefillMaxMs    : UInt64 := 600000
+  idleMaxMs       : UInt64 := 120000
+  keepaliveMs     : UInt64 := 10000
+  maxBufferBytes  : UInt64 := 4194304
+  keepaliveComment : ByteArray := ": keepalive\n\n".toUTF8
+
+/-- Summary telemetry returned when a governed `relayHttpStream` session completes or aborts. -/
+structure StreamRelayStats where
+  bytesForwarded  : UInt64 := 0
+  chunksForwarded : UInt64 := 0
+  keepalivesSent  : UInt64 := 0
+  firstByteMs     : UInt64 := 0
+  abortedByClient : Bool := false
+  abortedByGate   : Bool := false
+  deriving Repr, DecidableEq
+
+/-- True iff `ba` ends at a clean SSE event boundary (`\n\n` or `\r\n\r\n`), preventing mid-event comment injection. -/
+@[inline]
+def endsAtSseBoundary (ba : ByteArray) : Bool :=
+  let n := ba.size
+  (n >= 2 && ba.get! (n - 2) == 10 && ba.get! (n - 1) == 10) ||
+  (n >= 4 && ba.get! (n - 4) == 13 && ba.get! (n - 3) == 10 && ba.get! (n - 2) == 13 && ba.get! (n - 1) == 10)
+
+/-- Non-blocking HTTP/1.1 / SSE streaming splice between `clientFd` and `upstreamFd` (`relayHttpStream`):
+    - Sends `upstreamReqWire` to `upstreamFd` using partial non-blocking writes while simultaneously watching `clientFd`
+      for early disconnect (`POLLIN=EOF` / `POLLHUP`) via `pollFdSet`.
+    - Once upstream headers arrive, immediately emits SSE-safe response headers (or forwards upstream headers/status)
+      and splices chunks with zero full-response buffering, bounded backpressure (`cfg.maxBufferBytes`),
+      and `leansys_verify_stream_relay` dual-clock (`prefillMaxMs` vs `idleMaxMs`) + `: keepalive\n\n` enforcement.
+    - Guarantees deterministic `closeFd upstreamFd` inside `finally` on the exact tick `clientFd` disconnects or
+      any deadline trips, immediately freeing upstream vLLM KV-cache / compute slots. -/
+def relayHttpStream (cfg : StreamRelayConfig) (clientFd upstreamFd : Fd)
+    (upstreamReqWire : ByteArray) (initialHeartbeatHeader? : Option ByteArray := none) :
+    IO (SysResult StreamRelayStats) := do
+  discard <| setNonBlocking clientFd true
+  discard <| setNonBlocking upstreamFd true
+  let tStartNs ← IO.monoNanosNow
+  let mut upTxOff : Nat := 0
+  let mut clientTxBuf : ByteArray := initialHeartbeatHeader?.getD ByteArray.empty
+  let mut clientTxOff : Nat := 0
+  let mut firstChunkSeen : UInt8 := 0
+  let mut atBoundary : UInt8 := if initialHeartbeatHeader?.isSome then 1 else 0
+  let mut lastActivityMs : UInt64 := 0
+  let mut lastKeepaliveMs : UInt64 := 0
+  let mut stats : StreamRelayStats := {}
+  let mut done := false
+  try
+    while !done do
+      let nowNs ← IO.monoNanosNow
+      let elapsedMs : UInt64 := ((nowNs - tStartNs) / 1000000).toUInt64
+      let idleMs : UInt64 := elapsedMs - lastActivityMs
+      let kaIdleMs : UInt64 := elapsedMs - lastKeepaliveMs
+      let pendingTx : UInt64 := (clientTxBuf.size - clientTxOff).toUInt64
+
+      let gateVerdict := verifyStreamRelay 0 0 firstChunkSeen atBoundary
+        elapsedMs cfg.prefillMaxMs idleMs cfg.idleMaxMs cfg.keepaliveMs pendingTx cfg.maxBufferBytes
+      if gateVerdict == 0 then
+        stats := { stats with abortedByGate := true }
+        break
+      if gateVerdict == 1 && kaIdleMs >= cfg.keepaliveMs && upTxOff >= upstreamReqWire.size then
+        clientTxBuf := cfg.keepaliveComment
+        clientTxOff := 0
+        lastKeepaliveMs := elapsedMs
+        stats := { stats with keepalivesSent := stats.keepalivesSent + 1 }
+
+      let mut outMask : UInt64 := 0
+      if clientTxOff < clientTxBuf.size then
+        outMask := outMask ||| 1 -- index 0 = `clientFd`
+      if upTxOff < upstreamReqWire.size then
+        outMask := outMask ||| 2 -- index 1 = `upstreamFd`
+
+      let ready ← match ← pollFdSet #[clientFd, upstreamFd] 50 outMask with
+        | .ok r => pure r
+        | .error _ =>
+          stats := { stats with abortedByGate := true }
+          break
+
+      -- 1. Flush pending outbound bytes to `clientFd` (index 0) and check for downstream disconnect (`EOF` / `POLLHUP`)
+      if clientTxOff < clientTxBuf.size then
+        let slice : ByteSlice := { ba := clientTxBuf, off := clientTxOff, len := clientTxBuf.size - clientTxOff }
+        match ← writeSlicePartial clientFd slice with
+        | .ok sent =>
+          let nextOff := clientTxOff + sent
+          if nextOff >= clientTxBuf.size then
+            clientTxBuf := ByteArray.empty
+            clientTxOff := 0
+          else
+            clientTxOff := nextOff
+        | .error .eagain => pure ()
+        | .error _ =>
+          stats := { stats with abortedByClient := true }
+          break
+
+      if ready.contains 0 && (outMask &&& 1) == 0 then
+        -- Only when `POLLOUT` was NOT requested on `clientFd`, ready index 0 strictly means `POLLIN` / `POLLHUP` / `POLLERR`.
+        -- Because the downstream HTTP request body was already parsed, a 0-byte read here is true client EOF/abort!
+        let probe ← readStreamChunk clientFd 256
+        if probe.isEmpty then
+          stats := { stats with abortedByClient := true }
+          break
+
+      -- 2. Flush outbound request wire to `upstreamFd` (index 1)
+      if upTxOff < upstreamReqWire.size then
+        let reqSlice : ByteSlice := { ba := upstreamReqWire, off := upTxOff, len := upstreamReqWire.size - upTxOff }
+        match ← writeSlicePartial upstreamFd reqSlice with
+        | .ok sent =>
+          upTxOff := upTxOff + sent
+          lastActivityMs := elapsedMs
+        | .error .eagain => pure ()
+        | .error _ =>
+          stats := { stats with abortedByGate := true }
+          break
+
+      -- 3. Splice readable upstream chunks (`upstreamFd`, index 1) when downstream backpressure permits
+      let curPending := clientTxBuf.size - clientTxOff
+      if ready.contains 1 && (outMask &&& 2) == 0 && upTxOff >= upstreamReqWire.size && curPending.toUInt64 < cfg.maxBufferBytes then
+        let budget := Nat.min 32768 (cfg.maxBufferBytes.toNat - curPending)
+        let chunk ← readStreamChunk upstreamFd budget
+        if chunk.isEmpty then
+          -- Clean upstream EOF: flush any remaining `clientTxBuf` before exiting
+          while clientTxOff < clientTxBuf.size do
+            let remSlice : ByteSlice := { ba := clientTxBuf, off := clientTxOff, len := clientTxBuf.size - clientTxOff }
+            match ← writeSlicePartial clientFd remSlice with
+            | .ok s => clientTxOff := clientTxOff + s
+            | .error .eagain =>
+              match ← pollFdSet #[clientFd] 50 1 with
+              | .ok _ => pure ()
+              | .error _ => break
+            | .error _ =>
+              stats := { stats with abortedByClient := true }
+              break
+          done := true
+        else
+          let payloadChunk ←
+            if firstChunkSeen == 0 && initialHeartbeatHeader?.isSome then
+              -- Strip upstream HTTP response header block if we already sent SSE headers early during prefill/swap
+              match findHeaderEnd? chunk with
+              | some bStart => pure (chunk.extract bStart chunk.size)
+              | none => pure ByteArray.empty
+            else
+              pure chunk
+          if firstChunkSeen == 0 then
+            firstChunkSeen := 1
+            stats := { stats with firstByteMs := elapsedMs }
+          lastActivityMs := elapsedMs
+          lastKeepaliveMs := elapsedMs
+          if !payloadChunk.isEmpty then
+            atBoundary := if endsAtSseBoundary payloadChunk then 1 else 0
+            let remTx := if clientTxOff == 0 then clientTxBuf else clientTxBuf.extract clientTxOff clientTxBuf.size
+            clientTxBuf := remTx ++ payloadChunk
+            clientTxOff := 0
+            stats := {
+              stats with
+              bytesForwarded := stats.bytesForwarded + payloadChunk.size.toUInt64
+              chunksForwarded := stats.chunksForwarded + 1
+            }
+  finally
+    discard <| closeFd upstreamFd
+  return .ok stats
+
 end LeanSys.Reactor

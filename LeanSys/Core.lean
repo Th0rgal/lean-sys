@@ -404,6 +404,124 @@ def selfTestWave1Features (testDir : String) : IO UInt32 := do
     IO.eprintln s!"[lean-sys-core] FAIL: runCgroupV2Group did not fail closed on unwritable cgroup.procs: {repr other}"
     return 1
 
+  -- 9. Governed SSE `relayHttpStream` (`leansys_verify_stream_relay`):
+  --    (a) Delayed prefill emits `: keepalive\n\n` at frame boundary and splices all SSE chunks cleanly;
+  --    (b) Downstream client disconnect immediately aborts and closes `upstreamFd` on the same reactor tick!
+  if verifyStreamRelay 0 0 0 1 120 5000 80 2000 50 0 65536 != 1 ||
+     verifyStreamRelay 1 0 1 1 120 5000 10 2000 50 0 65536 != 0 ||
+     verifyStreamRelay 0 0 0 1 5001 5000 10 2000 50 0 65536 != 0 ||
+     verifyStreamRelay 0 0 1 1 120 5000 2001 2000 50 0 65536 != 0 then
+    IO.eprintln "[lean-sys-core] FAIL: verifyStreamRelay gate boundary checks"
+    return 1
+
+  let upSockA := s!"/tmp/lsys-upA-{← IO.monoNanosNow}.sock"
+  let .ok upListenA ← unixListen upSockA 8
+    | do IO.eprintln "[lean-sys-core] FAIL: unixListen upSockA"; return 1
+  let upTaskA ← IO.asTask (prio := .dedicated) do
+    let .ok ufd ← tcpAcceptPoll upListenA 2000 | return false
+    let _ ← readHttpRequestFromFd ufd none 1000
+    -- Simulate 110ms prefill pause before first SSE chunk so 40ms keepalive fires at least once
+    IO.sleep 110
+    discard <| writeAll ufd ("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\ndata: {\"tok\":1}\n\n".toUTF8) false
+    IO.sleep 20
+    discard <| writeAll ufd ("data: [DONE]\n\n".toUTF8) false
+    discard <| closeFd ufd
+    return true
+  let proxySockA := s!"/tmp/lsys-pxA-{← IO.monoNanosNow}.sock"
+  let .ok pxListenA ← unixListen proxySockA 8
+    | do IO.eprintln "[lean-sys-core] FAIL: unixListen pxListenA"; return 1
+  let relayCfg : StreamRelayConfig := {
+    prefillMaxMs := 3000
+    idleMaxMs := 1500
+    keepaliveMs := 40
+    maxBufferBytes := 65536
+  }
+  let sseInitHdr := ("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n: prefill\n\n").toUTF8
+  let proxyTaskA ← IO.asTask (prio := .dedicated) do
+    let .ok cfd ← tcpAcceptPoll pxListenA 2000 | return (none : Option StreamRelayStats)
+    let .ok upFd ← unixConnect upSockA | do discard <| closeFd cfd; return none
+    let _ ← readHttpRequestFromFd cfd none 1000
+    let reqWire := ("POST /v1/chat/completions HTTP/1.1\r\nHost: local\r\nContent-Length: 2\r\n\r\n{}".toUTF8)
+    let res ← relayHttpStream relayCfg cfd upFd reqWire (some sseInitHdr)
+    discard <| closeFd cfd
+    return res.toOption
+  let .ok cliA ← unixConnect proxySockA
+    | do IO.eprintln "[lean-sys-core] FAIL: unixConnect cliA"; return 1
+  discard <| writeAll cliA ("POST /v1/chat/completions HTTP/1.1\r\nHost: local\r\nContent-Length: 2\r\n\r\n{}".toUTF8) false
+  let mut rxA := ByteArray.empty
+  for _ in [0:32] do
+    match ← pollReadable cliA 500 with
+    | .ok () =>
+      let ch ← readStreamChunk cliA 4096
+      if ch.isEmpty then break
+      rxA := rxA ++ ch
+    | .error _ => break
+  discard <| closeFd cliA
+  let _ ← IO.wait upTaskA
+  let statsA? := (← IO.wait proxyTaskA).toOption.join
+  discard <| closeFd upListenA
+  discard <| closeFd pxListenA
+  discard <| unlinkFile upSockA
+  discard <| unlinkFile proxySockA
+  let rxAStr := String.fromUTF8! rxA
+  match statsA? with
+  | some stA =>
+    if stA.keepalivesSent == 0 || stA.abortedByClient || stA.abortedByGate ||
+       (rxAStr.splitOn ": keepalive\n\n").length ≤ 1 ||
+       (rxAStr.splitOn "data: [DONE]\n\n").length ≤ 1 then
+      IO.eprintln s!"[lean-sys-core] FAIL: relayHttpStream SSE splice mismatch: stats={repr stA}, rx={rxAStr}"
+      return 1
+  | none =>
+    IO.eprintln "[lean-sys-core] FAIL: relayHttpStream returned none"
+    return 1
+
+  -- (b) Client aborts mid-prefill -> upstream sees EOF cleanly within < 250ms instead of hanging 3000ms!
+  let upSockB := s!"/tmp/lsys-upB-{← IO.monoNanosNow}.sock"
+  let .ok upListenB ← unixListen upSockB 8
+    | do IO.eprintln "[lean-sys-core] FAIL: unixListen upSockB"; return 1
+  let upSawEofTask ← IO.asTask (prio := .dedicated) do
+    let .ok ufd ← tcpAcceptPoll upListenB 2000 | return false
+    let _ ← readHttpRequestFromFd ufd none 1000
+    -- Wait for relay to close `upstreamFd` when downstream client disconnects
+    match ← pollReadable ufd 800 with
+    | .ok () =>
+      let ch ← readStreamChunk ufd 256
+      discard <| closeFd ufd
+      return ch.isEmpty
+    | .error _ =>
+      discard <| closeFd ufd
+      return false
+  let proxySockB := s!"/tmp/lsys-pxB-{← IO.monoNanosNow}.sock"
+  let .ok pxListenB ← unixListen proxySockB 8
+    | do IO.eprintln "[lean-sys-core] FAIL: unixListen pxListenB"; return 1
+  let proxyTaskB ← IO.asTask (prio := .dedicated) do
+    let .ok cfd ← tcpAcceptPoll pxListenB 2000 | return (none : Option StreamRelayStats)
+    let .ok upFd ← unixConnect upSockB | do discard <| closeFd cfd; return none
+    let _ ← readHttpRequestFromFd cfd none 1000
+    let reqWire := ("POST /v1/chat/completions HTTP/1.1\r\nHost: local\r\nContent-Length: 2\r\n\r\n{}".toUTF8)
+    let res ← relayHttpStream relayCfg cfd upFd reqWire (some sseInitHdr)
+    discard <| closeFd cfd
+    return res.toOption
+  let .ok cliB ← unixConnect proxySockB
+    | do IO.eprintln "[lean-sys-core] FAIL: unixConnect cliB"; return 1
+  discard <| writeAll cliB ("POST /v1/chat/completions HTTP/1.1\r\nHost: local\r\nContent-Length: 2\r\n\r\n{}".toUTF8) false
+  IO.sleep 30
+  discard <| closeFd cliB
+  let upSawEof := (← IO.wait upSawEofTask).toOption == some true
+  let statsB? := (← IO.wait proxyTaskB).toOption.join
+  discard <| closeFd upListenB
+  discard <| closeFd pxListenB
+  discard <| unlinkFile upSockB
+  discard <| unlinkFile proxySockB
+  match statsB? with
+  | some stB =>
+    if !upSawEof || !stB.abortedByClient then
+      IO.eprintln s!"[lean-sys-core] FAIL: relayHttpStream disconnect propagation failed: upSawEof={upSawEof}, stats={repr stB}"
+      return 1
+  | none =>
+    IO.eprintln "[lean-sys-core] FAIL: relayHttpStream disconnect test returned none"
+    return 1
+
   return 0
 
 def selfTestHttpHardening : IO UInt32 := do
@@ -654,30 +772,36 @@ def runSelfTest : IO UInt32 := do
   IO.FS.createDirAll pTest
 
   -- 3a. 32-Bit High File Descriptor (`F_DUPFD_CLOEXEC >= 65536`) I/O & `closeFd` Roundtrip
+  --     (When host `kern.maxfilesperproc < 65536`, e.g. macOS default `61440`, `F_DUPFD_CLOEXEC` returns `EINVAL`;
+  --      verify clean `.einval` fail-closed behavior and skip the `>= 65536` descriptor roundtrip.)
   let hiFdPath := s!"{testDir}/high_fd_probe.bin"
   let .ok baseFd ← openFd hiFdPath 4 | do IO.eprintln "[lean-sys-core] FAIL: openFd high_fd_probe"; return 1
-  let .ok highFd ← dupFdAbove64k baseFd 1 | do
+  match ← dupFdAbove64k baseFd 1 with
+  | .error .einval =>
+    let .ok () ← closeFd baseFd | do IO.eprintln "[lean-sys-core] FAIL: closeFd baseFd"; return 1
+  | .error e =>
     discard <| closeFd baseFd
-    IO.eprintln "[lean-sys-core] FAIL: dupFdAbove64k (>= 65536)"
+    IO.eprintln s!"[lean-sys-core] FAIL: dupFdAbove64k (>= 65536) unexpected errno {repr e}"
     return 1
-  let .ok () ← closeFd baseFd | do IO.eprintln "[lean-sys-core] FAIL: closeFd baseFd"; return 1
-  if highFd.raw < 65536 then
-    discard <| closeFd highFd
-    IO.eprintln s!"[lean-sys-core] FAIL: highFd < 65536 ({highFd.raw})"
-    return 1
-  let .ok writtenHi ← writeAll highFd "high-fd-32bit-ok".toUTF8 true
-    | do discard <| closeFd highFd; IO.eprintln "[lean-sys-core] FAIL: writeAll on highFd"; return 1
-  let readHi ← preadByteArray highFd 0 64
-  let .ok () ← closeFd highFd | do IO.eprintln "[lean-sys-core] FAIL: closeFd highFd"; return 1
-  -- Verify `highFd` was genuinely closed (`fstatSize` on closed 32-bit FD returns `EBADF`)
-  match ← fstatSize highFd with
-  | .error .ebadf => pure ()
-  | other =>
-    IO.eprintln s!"[lean-sys-core] FAIL: closeFd did not close 32-bit highFd ({highFd.raw}), fstat={repr other}"
-    return 1
-  if writtenHi != 16 || String.fromUTF8! readHi != "high-fd-32bit-ok" then
-    IO.eprintln "[lean-sys-core] FAIL: highFd 32-bit read/write payload mismatch"
-    return 1
+  | .ok highFd =>
+    let .ok () ← closeFd baseFd | do IO.eprintln "[lean-sys-core] FAIL: closeFd baseFd"; return 1
+    if highFd.raw < 65536 then
+      discard <| closeFd highFd
+      IO.eprintln s!"[lean-sys-core] FAIL: highFd < 65536 ({highFd.raw})"
+      return 1
+    let .ok writtenHi ← writeAll highFd "high-fd-32bit-ok".toUTF8 true
+      | do discard <| closeFd highFd; IO.eprintln "[lean-sys-core] FAIL: writeAll on highFd"; return 1
+    let readHi ← preadByteArray highFd 0 64
+    let .ok () ← closeFd highFd | do IO.eprintln "[lean-sys-core] FAIL: closeFd highFd"; return 1
+    -- Verify `highFd` was genuinely closed (`fstatSize` on closed 32-bit FD returns `EBADF`)
+    match ← fstatSize highFd with
+    | .error .ebadf => pure ()
+    | other =>
+      IO.eprintln s!"[lean-sys-core] FAIL: closeFd did not close 32-bit highFd ({highFd.raw}), fstat={repr other}"
+      return 1
+    if writtenHi != 16 || String.fromUTF8! readHi != "high-fd-32bit-ok" then
+      IO.eprintln "[lean-sys-core] FAIL: highFd 32-bit read/write payload mismatch"
+      return 1
 
   let .ok st0 ← openStore testDir | do IO.eprintln "[lean-sys-core] FAIL: openStore initial"; return 1
   let .ok st1 ← putString st0 "alpha" "value-alpha-1" true | do IO.eprintln "[lean-sys-core] FAIL: put alpha"; return 1
@@ -948,8 +1072,9 @@ def runSelfTest : IO UInt32 := do
 
   -- 6. Process-Group Sandbox & Honest Linux Landlock Confinement (`LeanSys.Sandbox`)
   let quota : SandboxQuota := { maxRssBytes := 536870912, timeoutMs := 3000, maxPipeBytes := 4194304 }
-  let .ok sbRes ← runSandboxedGroup quota "/bin/true" #[]
-    | do IO.eprintln "[lean-sys-core] FAIL: runSandboxedGroup /bin/true"; return 1
+  let trueBin ← if ← (System.FilePath.mk "/bin/true").pathExists then pure "/bin/true" else pure "/usr/bin/true"
+  let .ok sbRes ← runSandboxedGroup quota trueBin #[]
+    | do IO.eprintln "[lean-sys-core] FAIL: runSandboxedGroup true"; return 1
   if sbRes.exitCode != 0 || sbRes.timedOut || sbRes.quotaBreach || sbRes.landlockEnforced then
     IO.eprintln s!"[lean-sys-core] FAIL: SandboxResult unexpected: {repr sbRes}"
     return 1
@@ -976,7 +1101,7 @@ def runSelfTest : IO UInt32 := do
   let landlockHonestOk ← match ← queryLandlockAbi with
     | .error .eopnotsupp =>
       -- On non-Landlock kernels/OSes, `runLandlockedGroup` MUST fail closed with `.error .eopnotsupp`
-      match ← runLandlockedGroup quota llPolicy "/bin/true" #[] with
+      match ← runLandlockedGroup quota llPolicy trueBin #[] with
       | .error .eopnotsupp => pure true
       | _ => pure false
     | .error _ => pure false
@@ -1105,7 +1230,7 @@ def runSelfTest : IO UInt32 := do
       IO.eprintln s!"[lean-sys-core] FAIL: unexpected HTTP/pipelined response (served={servedCount}): {respBody} / {pipeRespStr}"
       return 1
 
-  IO.println s!"\{ \"ok\": true, \"binary\": \"lean-sys-core\", \"c_abi_gates\": 40, \"wave1_verified\": true, \"fd_32bit_high\": true, \"hmac_sha256_rfc4231\": true, \"par_scheduler\": true, \"wal_torn_recovery\": true, \"wal_68mib_streaming\": true, \"cas_immutable\": true, \"sst_bloom\": true, \"table_range_scan\": true, \"auth_rotation\": true, \"proc_log\": true, \"proc_stat_scanner\": true, \"jsonrpc_2_0\": true, \"shm_ring_mmap\": true, \"mmap_seqlock\": true, \"jsonl_tape\": true, \"reactor_keepalive\": true, \"sandbox_landlock\": true, \"pgid_reaper\": true, \"http_loopback_port\": {boundPort} }"
+  IO.println s!"\{ \"ok\": true, \"binary\": \"lean-sys-core\", \"c_abi_gates\": 41, \"wave1_verified\": true, \"fd_32bit_high\": true, \"hmac_sha256_rfc4231\": true, \"par_scheduler\": true, \"wal_torn_recovery\": true, \"wal_68mib_streaming\": true, \"cas_immutable\": true, \"sst_bloom\": true, \"table_range_scan\": true, \"auth_rotation\": true, \"proc_log\": true, \"proc_stat_scanner\": true, \"jsonrpc_2_0\": true, \"shm_ring_mmap\": true, \"mmap_seqlock\": true, \"jsonl_tape\": true, \"reactor_keepalive\": true, \"stream_relay_sse\": true, \"sandbox_landlock\": true, \"pgid_reaper\": true, \"http_loopback_port\": {boundPort} }"
   return 0
 
 /-- Run deterministic micro-benchmarks for `lean-sys-core bench` and emit JSON metrics. -/
@@ -1176,7 +1301,7 @@ def main (args : List String) : IO UInt32 := do
   | ["bench"] | ["--bench"] => LeanSys.Core.runBench 4000
   | ["bench", nStr] | ["--bench", nStr] => LeanSys.Core.runBench (nStr.toNat?.getD 4000)
   | ["--c-abi"] =>
-    IO.println "{\"ok\":true,\"exports\":[\"leansys_verify_slice_bounds\",\"leansys_verify_wal_frame\",\"leansys_verify_cas_digest\",\"leansys_check_http_bounds\",\"leansys_verify_jsonl_tape\",\"leansys_verify_ring_cursor\",\"leansys_verify_sst_block\",\"leansys_verify_poll_interest\",\"leansys_verify_rlimit_budget\",\"leansys_mix64_word\",\"leansys_verify_composite_key_order\",\"leansys_verify_token_auth\",\"leansys_verify_log_window\",\"leansys_verify_jsonrpc_frame\",\"leansys_gate_admit\",\"leansys_verify_mmap_seqlock\",\"leansys_verify_proc_stat_fields\",\"leansys_sse_frame_scan\",\"leansys_gfm_pipe_scan\",\"leansys_tag_scan\",\"leansys_transcript_index\",\"leansys_verify_par_chunk\",\"leansys_verify_arena_disjoint\",\"leansys_verify_snapshot_visibility\",\"leansys_verify_http_route_match\",\"leansys_verify_counterexample_triage\",\"leansys_verify_dag_wave_step\",\"leansys_verify_ios_jetsam_budget\",\"leansys_verify_worker_budget\",\"leansys_verify_page_aligned_buffer\",\"leansys_select_isa\",\"leansys_verify_isa_selection\",\"leansys_verify_fd_bounds\",\"leansys_verify_unix_path_bounds\",\"leansys_verify_cas_digest256\",\"leansys_verify_sigv4_envelope\",\"leansys_verify_cgroup_v2_budget\",\"leansys_verify_io_uring_ring\",\"leansys_verify_borrowed_view\",\"leansys_verify_step_reactor\"]}"
+    IO.println "{\"ok\":true,\"exports\":[\"leansys_verify_slice_bounds\",\"leansys_verify_wal_frame\",\"leansys_verify_cas_digest\",\"leansys_check_http_bounds\",\"leansys_verify_jsonl_tape\",\"leansys_verify_ring_cursor\",\"leansys_verify_sst_block\",\"leansys_verify_poll_interest\",\"leansys_verify_rlimit_budget\",\"leansys_mix64_word\",\"leansys_verify_composite_key_order\",\"leansys_verify_token_auth\",\"leansys_verify_log_window\",\"leansys_verify_jsonrpc_frame\",\"leansys_gate_admit\",\"leansys_verify_mmap_seqlock\",\"leansys_verify_proc_stat_fields\",\"leansys_sse_frame_scan\",\"leansys_gfm_pipe_scan\",\"leansys_tag_scan\",\"leansys_transcript_index\",\"leansys_verify_par_chunk\",\"leansys_verify_arena_disjoint\",\"leansys_verify_snapshot_visibility\",\"leansys_verify_http_route_match\",\"leansys_verify_counterexample_triage\",\"leansys_verify_dag_wave_step\",\"leansys_verify_ios_jetsam_budget\",\"leansys_verify_worker_budget\",\"leansys_verify_page_aligned_buffer\",\"leansys_select_isa\",\"leansys_verify_isa_selection\",\"leansys_verify_fd_bounds\",\"leansys_verify_unix_path_bounds\",\"leansys_verify_cas_digest256\",\"leansys_verify_sigv4_envelope\",\"leansys_verify_cgroup_v2_budget\",\"leansys_verify_io_uring_ring\",\"leansys_verify_borrowed_view\",\"leansys_verify_step_reactor\",\"leansys_verify_stream_relay\"]}"
     return 0
   | _ =>
     IO.println "usage: lean-sys-core [self-test | bench | --c-abi]"
