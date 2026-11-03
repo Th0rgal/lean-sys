@@ -294,6 +294,20 @@ extern "C" {
         max_conns: u32,
         already_seen: u8,
     ) -> u8;
+
+    pub fn leansys_verify_stream_relay(
+        client_gone: u8,
+        upstream_dead: u8,
+        first_chunk_seen: u8,
+        at_frame_boundary: u8,
+        prefill_elapsed_ms: u64,
+        prefill_max_ms: u64,
+        idle_ms: u64,
+        idle_max_ms: u64,
+        keepalive_due_ms: u64,
+        pending_tx_bytes: u64,
+        max_buffer_bytes: u64,
+    ) -> u8;
 }
 
 pub const WAL_MAGIC: u32 = 0x4C53_5953;
@@ -985,6 +999,50 @@ pub fn verify_step_reactor(
     }
 }
 
+/// Verified verdict returned by `verify_stream_relay` (`leansys_verify_stream_relay`).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum StreamRelayVerdict {
+    Abort,
+    EmitKeepalive,
+    Continue,
+}
+
+#[inline]
+pub fn verify_stream_relay(
+    client_gone: bool,
+    upstream_dead: bool,
+    first_chunk_seen: bool,
+    at_frame_boundary: bool,
+    prefill_elapsed_ms: u64,
+    prefill_max_ms: u64,
+    idle_ms: u64,
+    idle_max_ms: u64,
+    keepalive_due_ms: u64,
+    pending_tx_bytes: ByteLen,
+    max_buffer_bytes: ByteLen,
+) -> StreamRelayVerdict {
+    let code = unsafe {
+        leansys_verify_stream_relay(
+            u8::from(client_gone),
+            u8::from(upstream_dead),
+            u8::from(first_chunk_seen),
+            u8::from(at_frame_boundary),
+            prefill_elapsed_ms,
+            prefill_max_ms,
+            idle_ms,
+            idle_max_ms,
+            keepalive_due_ms,
+            pending_tx_bytes.0,
+            max_buffer_bytes.0,
+        )
+    };
+    match code {
+        1 => StreamRelayVerdict::EmitKeepalive,
+        2 => StreamRelayVerdict::Continue,
+        _ => StreamRelayVerdict::Abort,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1267,5 +1325,72 @@ mod tests {
             62,
             true
         ));
+
+        // StreamRelay dual-clock SSE splice gate
+        assert_eq!(
+            verify_stream_relay(
+                false,
+                false,
+                false,
+                true,
+                15_000,
+                600_000,
+                12_000,
+                120_000,
+                10_000,
+                ByteLen(0),
+                ByteLen(65_536),
+            ),
+            StreamRelayVerdict::EmitKeepalive
+        );
+        assert_eq!(
+            verify_stream_relay(
+                false,
+                false,
+                true,
+                false,
+                15_000,
+                600_000,
+                5_000,
+                120_000,
+                10_000,
+                ByteLen(512),
+                ByteLen(65_536),
+            ),
+            StreamRelayVerdict::Continue
+        );
+        // Client disconnect or prefill/idle deadline expiry aborts immediately
+        assert_eq!(
+            verify_stream_relay(
+                true,
+                false,
+                true,
+                true,
+                1_000,
+                600_000,
+                100,
+                120_000,
+                10_000,
+                ByteLen(0),
+                ByteLen(65_536),
+            ),
+            StreamRelayVerdict::Abort
+        );
+        assert_eq!(
+            verify_stream_relay(
+                false,
+                false,
+                false,
+                true,
+                600_001,
+                600_000,
+                1_000,
+                120_000,
+                10_000,
+                ByteLen(0),
+                ByteLen(65_536),
+            ),
+            StreamRelayVerdict::Abort
+        );
     }
 }

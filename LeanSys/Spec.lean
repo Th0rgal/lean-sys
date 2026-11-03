@@ -1795,4 +1795,83 @@ theorem step_reactor_rejects_stale_dup_or_over_quota (r : StepReactorCheck)
       r.epochsAndQuota.2.2.1 r.epochsAndQuota.2.2.2 r.conns.1 r.conns.2 r.alreadySeen == 1) = false :=
   stepReactorMetaSpec.rejects_unsafe () r h_bad
 
+/--
+  Unboxed C-ABI Non-Blocking SSE / Chunked Stream Relay Step Gate (`leansys_verify_stream_relay`):
+  Governs bidirectional reverse-proxy splicing (`clientFd ↔ upstreamFd`) with dual-clock prefill vs.
+  generation deadlines, bounded ring-buffer backpressure (`pendingTxBytes ≤ maxBufferBytes`),
+  and immediate disconnect propagation (`action = 0`: abort/close both FDs immediately;
+  `action = 1`: emit SSE `: keepalive\n\n` frame; `action = 2`: continue splicing).
+  - If `clientGone == 1` or `upstreamDead == 1` or `pendingTxBytes > maxBufferBytes`, returns `0` immediately
+    so client abort (`POLLHUP`/`EOF`) cancels upstream generation on the exact same reactor tick.
+  - Before `firstChunkSeen == 1`, enforces `prefillElapsedMs ≤ prefillMaxMs` (`ClockDiscipline`).
+  - After `firstChunkSeen == 1`, enforces `idleMs ≤ idleMaxMs` (`StickyFence` + `ClockDiscipline`).
+  - Emits keepalive (`1`) iff `atFrameBoundary == 1 && keepaliveDueMs > 0 && idleMs ≥ keepaliveDueMs && pendingTxBytes == 0`.
+-/
+@[inline, export leansys_verify_stream_relay]
+def verifyStreamRelay (clientGone upstreamDead firstChunkSeen atFrameBoundary : UInt8)
+    (prefillElapsedMs prefillMaxMs idleMs idleMaxMs keepaliveDueMs pendingTxBytes maxBufferBytes : UInt64) : UInt8 :=
+  if clientGone == 0 && upstreamDead == 0 && maxBufferBytes > 0 && pendingTxBytes ≤ maxBufferBytes &&
+     (firstChunkSeen != 0 || prefillElapsedMs ≤ prefillMaxMs) &&
+     (firstChunkSeen == 0 || idleMs ≤ idleMaxMs) then
+    if atFrameBoundary == 1 && keepaliveDueMs > 0 && idleMs >= keepaliveDueMs && pendingTxBytes == 0 then 1
+    else 2
+  else 0
+
+/-- Stream relay step check parameters (≤ 3 fields via tuple packing). -/
+structure StreamRelayCheck where
+  flags     : UInt8 × UInt8 × UInt8 × UInt8
+  deadlines : UInt64 × UInt64 × UInt64 × UInt64 × UInt64
+  buffers   : UInt64 × UInt64
+  deriving Repr, DecidableEq
+
+@[inline]
+def streamRelayAdmissible (s : StreamRelayCheck) : Bool :=
+  s.flags.1 == 0 && s.flags.2.1 == 0 &&
+  s.buffers.2 > 0 && s.buffers.1 ≤ s.buffers.2 &&
+  (s.flags.2.2.1 != 0 || s.deadlines.1 ≤ s.deadlines.2.1) &&
+  (s.flags.2.2.1 == 0 || s.deadlines.2.2.1 ≤ s.deadlines.2.2.2.1)
+
+/-- Layer II Bundle 43: Non-blocking SSE / HTTP stream relay dual-clock &
+    disconnect propagation gate (`leansys_verify_stream_relay`). -/
+def streamRelayMetaSpec : MetaGateSpec Unit StreamRelayCheck where
+  inv _ := True
+  gate _ s :=
+    verifyStreamRelay s.flags.1 s.flags.2.1 s.flags.2.2.1 s.flags.2.2.2
+      s.deadlines.1 s.deadlines.2.1 s.deadlines.2.2.1 s.deadlines.2.2.2.1 s.deadlines.2.2.2.2
+      s.buffers.1 s.buffers.2 != 0
+  step _ _ := ()
+  safe _ s := streamRelayAdmissible s
+  preserves_inv _ _ _ h := h
+  ensures_safe _ s h := by
+    unfold verifyStreamRelay at h
+    unfold streamRelayAdmissible
+    split at h
+    · assumption
+    · contradiction
+
+/-- Corollary 43: `verifyStreamRelay` aborts (`0`) immediately on client disconnect,
+    upstream death, buffer overrun, or prefill/idle deadline expiry. -/
+theorem stream_relay_aborts_on_disconnect_or_deadline (s : StreamRelayCheck)
+    (h_bad : streamRelayAdmissible s = false) :
+    (verifyStreamRelay s.flags.1 s.flags.2.1 s.flags.2.2.1 s.flags.2.2.2
+      s.deadlines.1 s.deadlines.2.1 s.deadlines.2.2.1 s.deadlines.2.2.2.1 s.deadlines.2.2.2.2
+      s.buffers.1 s.buffers.2 != 0) = false :=
+  streamRelayMetaSpec.rejects_unsafe () s h_bad
+
+/-- Corollary 44: Keepalive emission (`verifyStreamRelay == 1`) occurs strictly at clean SSE
+    frame boundaries (`atFrameBoundary == 1`) with an empty outbound buffer and live peers. -/
+theorem stream_relay_keepalive_boundary_safe
+    (cg ud fc fb : UInt8) (pe pm idl im kd ptx mb : UInt64)
+    (h_ka : verifyStreamRelay cg ud fc fb pe pm idl im kd ptx mb = 1) :
+    cg = 0 ∧ ud = 0 ∧ fb = 1 ∧ kd > 0 ∧ idl ≥ kd ∧ ptx = 0 := by
+  unfold verifyStreamRelay at h_ka
+  split at h_ka
+  · next h_ok =>
+    split at h_ka
+    · next h_emit =>
+      simp only [Bool.and_eq_true, beq_iff_eq, decide_eq_true_eq] at h_ok h_emit
+      exact ⟨h_ok.1.1.1.1.1, h_ok.1.1.1.1.2, h_emit.1.1.1, h_emit.1.1.2, h_emit.1.2, h_emit.2⟩
+    · contradiction
+  · contradiction
+
 end LeanSys.Spec
