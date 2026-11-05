@@ -68,7 +68,7 @@ def extractTrigrams (text : String) : Array UInt32 := Id.run do
 /-- Exact case-insensitive ASCII substring check (`needleLower` already lowercased). -/
 def containsBytesLower (haystack : ByteArray) (needleLower : ByteArray) : Bool := Id.run do
   if needleLower.isEmpty then return true
-  if haystack.size < needleLower.size then return false
+  if verifySliceBounds 0 needleLower.size.toUInt64 haystack.size.toUInt64 != 1 then return false
   let limit := haystack.size - needleLower.size + 1
   for i in [0:limit] do
     let mut matched := true
@@ -79,17 +79,19 @@ def containsBytesLower (haystack : ByteArray) (needleLower : ByteArray) : Bool :
     if matched then return true
   return false
 
-/-- Index a document `(docId, text)` into `st`, writing `doc:<docId>` and all `tri:<6hex>:<docId>` postings in a single WAL batch. -/
+/-- Index a document `(docId, text)` into `st`, writing all `tri:<6hex>:<docId>` postings BEFORE
+    publishing `doc:<docId>` in the WAL batch so a crash mid-batch never exposes a document snapshot
+    whose trigram postings are incomplete. -/
 def indexDoc (st : Store.Handle) (docId : String) (text : String) (sync : Bool := false) :
     IO (SysResult Store.Handle) := do
   if docId.isEmpty then
     return .error .einval
   let tris := extractTrigrams text
   let mut batch : Array (String × ByteSlice) := Array.mkEmpty (tris.size + 1)
-  batch := batch.push (s!"doc:{docId}", ByteSlice.ofString text)
   let marker := ByteSlice.ofString "1"
   for tri in tris do
     batch := batch.push (s!"tri:{hex6BE tri}:{docId}", marker)
+  batch := batch.push (s!"doc:{docId}", ByteSlice.ofString text)
   Store.putBatch st batch sync
 
 /-- `true` iff `tbl` was opened lazily (`openSstLazy`) with non-empty directory entries and an unpopulated `rawBuf`. -/
