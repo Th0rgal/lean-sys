@@ -577,13 +577,24 @@ def selfTestWave1Features (testDir : String) : IO UInt32 := do
   let hitsTombShort := searchTrigramSst searchSst "el" 10
   let .ok hitsLazyLean ← searchTrigramSstIO searchSstLazy "lean4" 10 | return 1
   let .ok hitsLazyShort ← searchTrigramSstIO searchSstLazy "ab" 10 | return 1
+  -- Compact searchSst with `dropTombstones := true` after tombstoning `doc:m-002` (leaving `tri:` postings for "QUIC")
+  -- and verify lazy search skips the absent `doc:m-002` cleanly instead of failing with `.error .eio`!
+  let .ok sTombStore ← openStore s!"{searchDir}/tomb" | return 1
+  let .ok sTombStore ← Store.put sTombStore "doc:m-002" (ByteSlice.ofByteArray tombstoneMarker) false | return 1
+  let .ok tombSst ← SstTable.flushStore sTombStore s!"{searchDir}/tomb.sst" | return 1
+  let .ok compactedSearchSst ← SstTable.compactLevels #[searchSst, tombSst] s!"{searchDir}/compacted_search.sst" true | return 1
+  let _ := compactedSearchSst
+  let .ok compactedSearchLazy ← SstTable.openSstLazy s!"{searchDir}/compacted_search.sst" | return 1
+  let .ok hitsAfterCompactQuic ← searchTrigramSstIO compactedSearchLazy "multiplexer" 10 | return 1
+  let .ok hitsAfterCompactLean ← searchTrigramSstIO compactedSearchLazy "lean4" 10 | return 1
   if hitsLean.size != 1 || hitsLean[0]!.1 != "m-001" ||
      hitsQuic.size != 1 || hitsQuic[0]!.1 != "m-002" ||
      hitsShort.size != 1 || hitsShort[0]!.1 != "m-003" ||
      hitsLen3.size != 1 || hitsLen3[0]!.1 != "m-003" ||
      hitsTombShort.any (fun p => p.1 == "m-deleted") ||
      (searchTrigramSst? searchSstLazy "lean4" 10).isSome ||
-     hitsLazyLean != hitsLean || hitsLazyShort != hitsShort then
+     hitsLazyLean != hitsLean || hitsLazyShort != hitsShort ||
+     !hitsAfterCompactQuic.isEmpty || hitsAfterCompactLean != hitsLean then
     IO.eprintln s!"[lean-sys-core] FAIL: searchTrigramSst / lazy search mismatch: {repr hitsLean} / {repr hitsLazyLean}"
     return 1
 
@@ -629,10 +640,14 @@ def selfTestWave1Features (testDir : String) : IO UInt32 := do
   let capped0 := SseEventStream.init 16
   let some (capped1, _) := capped0.pushChunk? (ByteSlice.ofString "data: 12345678\n")
     | do IO.eprintln "[lean-sys-core] FAIL: SseEventStream first small chunk failed"; return 1
+  -- Completing event 1 (`\n`) and starting event 2 (`data: x\n\n`) in one chunk MUST succeed under cap 16!
+  let some (_, cappedDispatchAndNext) := capped1.pushChunk? (ByteSlice.ofString "\ndata: x\n\n")
+    | do IO.eprintln "[lean-sys-core] FAIL: SseEventStream chunk boundary across dispatch rejected!"; return 1
   let cappedOverflow := capped1.pushChunk? (ByteSlice.ofString "data: 12345678\n")
   if !evs1.isEmpty || evs2 != #[sseEv] ||
      evsCr.size != 1 || evsCr[0]!.retryMs? != some 1500 || evsCr[0]!.data != "ok" ||
      lossySubpart != "\uFFFD" ++ "A" ||
+     cappedDispatchAndNext.size != 2 ||
      cappedOverflow.isSome then
     IO.eprintln s!"[lean-sys-core] FAIL: SseEventStream reassembly/cap/CR/UTF8 mismatch: {repr evs2} / {repr evsCr} / {repr lossySubpart}"
     return 1

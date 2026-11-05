@@ -159,7 +159,8 @@ private def parseDigitsOnlyNat? (s : String) : Option Nat := Id.run do
 /-- Feed a raw `ByteSlice` chunk into `st`, returning `(updatedState, dispatchedEvents)` or `none` if buffer cap is exceeded. -/
 def pushChunk? (st : SseEventStream) (chunk : ByteSlice) : Option (SseEventStream × Array SseEvent) := Id.run do
   let chunkBytes := chunk.toByteArray
-  if st.carry.size + chunkBytes.size + st.pendingBytes > st.maxCarryCap then
+  -- Guard against giant single chunks (`chunk` > 2x cap + carry) while allowing chunks that finish a pending event and start the next!
+  if verifySliceBounds st.carry.size.toUInt64 chunkBytes.size.toUInt64 (st.maxCarryCap * 2 + 64).toUInt64 != 1 then
     return none
   let rawBuf := if st.carry.isEmpty then chunkBytes else st.carry ++ chunkBytes
   if rawBuf.isEmpty then
@@ -194,6 +195,8 @@ def pushChunk? (st : SseEventStream) (chunk : ByteSlice) : Option (SseEventStrea
     let b := rawBuf.get! i
     if b == 10 || b == 13 then -- '\n' or '\r'
       let lineEnd := i
+      if lineEnd - lineStart > st.maxCarryCap then
+        return none
       let nextPos :=
         if b == 13 then
           if i + 1 < rawBuf.size && rawBuf.get! (i + 1) == 10 then i + 2 else i + 1

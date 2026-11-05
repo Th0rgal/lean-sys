@@ -383,7 +383,7 @@ def pushFrame (st : WsMessageAssembler) (frame : WsFrame) :
   | .text | .binary =>
     if st.inProgressOp?.isSome then
       return .error "ws_unexpected_data_opcode_mid_fragment"
-    if frame.payload.size > st.maxMsgBytes then
+    if verifySliceBounds 0 frame.payload.size.toUInt64 st.maxMsgBytes.toUInt64 != 1 then
       return .error "ws_message_too_large"
     if frame.fin then
       if frame.opcode == .text && (String.fromUTF8? frame.payload).isNone then
@@ -394,7 +394,7 @@ def pushFrame (st : WsMessageAssembler) (frame : WsFrame) :
   | .continuation =>
     let some op := st.inProgressOp?
       | return .error "ws_unexpected_continuation"
-    if st.buf.size + frame.payload.size > st.maxMsgBytes then
+    if verifySliceBounds st.buf.size.toUInt64 frame.payload.size.toUInt64 st.maxMsgBytes.toUInt64 != 1 then
       return .error "ws_message_too_large"
     let combined := st.buf ++ frame.payload
     if frame.fin then

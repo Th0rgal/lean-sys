@@ -224,55 +224,6 @@ def openSstLazy (sstPath : String) : IO (SysResult SstTable) := do
       p := p + 12 + kLen
     return .ok { path := sstPath, rawBuf := ByteArray.empty, bloomMask := bloom, entries := entries }
 
-/-- Lookup a value by `key` in `SstTable`, using in-memory `rawBuf` when resident or lazy `preadByteArray`
-    when opened via `openSstLazy`. -/
-def getLazyIO? (tbl : SstTable) (key : String) : IO (Option ByteArray) := do
-  if !bloomContains tbl.bloomMask (xxh64String key) then
-    return none
-  let es := tbl.entries
-  let mut lo : Nat := 0
-  let mut hi : Nat := es.size
-  let mut found? : Option SstIndexEntry := none
-  while lo < hi do
-    let mid := (lo + hi) >>> 1
-    let e := es[mid]!
-    if e.key == key then
-      found? := some e
-      lo := hi
-    else if e.key < key then lo := mid + 1
-    else hi := mid
-  match found? with
-  | none => return none
-  | some e =>
-    if e.valOff + e.valLen ≤ tbl.rawBuf.size then
-      return some (tbl.rawBuf.extract e.valOff (e.valOff + e.valLen))
-    else
-      match ← withFd tbl.path 0 (fun fd => do
-        let b ← preadByteArray fd e.valOff.toUInt64 e.valLen
-        pure (.ok b)) with
-      | .ok b => return if b.size == e.valLen then some b else none
-      | .error _ => return none
-
-/-- Atomically flush `st` into a sorted SST file at `sstPath` and compact the WAL,
-    returning the compacted `(Store.Handle × SstTable)` pair. -/
-def flushAndCompactStore (st : Store.Handle) (sstPath : String) : IO (SysResult (Store.Handle × SstTable)) := do
-  match ← flushStore st sstPath with
-  | .error e => pure (.error e)
-  | .ok tbl =>
-    match ← Store.compact st with
-    | .error e => pure (.error e)
-    | .ok stCompacted => pure (.ok (stCompacted, tbl))
-
-/-- Explicit 5-byte LSM tombstone sentinel (`0xFF 0x00 'D' 'E' 'L'`), matching `LeanSys.Table.tombstoneMarker`. -/
-@[inline]
-private def isSstTombstoneBytes (ba : ByteArray) (off len : Nat) : Bool :=
-  len == 5 && off + 5 ≤ ba.size &&
-  ba.get! off == 0xFF &&
-  ba.get! (off + 1) == 0x00 &&
-  ba.get! (off + 2) == 0x44 &&
-  ba.get! (off + 3) == 0x45 &&
-  ba.get! (off + 4) == 0x4C
-
 /-- Load an SST entry's value bytes from resident `rawBuf` when available, or via `preadByteArray`
     when the `SstTable` was opened with `openSstLazy` (`rawBuf.isEmpty`). Fails closed with `.eio`
     on short/corrupted reads so compaction and lazy search never silently drop keys. -/
@@ -293,6 +244,57 @@ def readEntryValue (tbl : SstTable) (e : SstIndexEntry) : IO (SysResult ByteArra
       if b.size == e.valLen then pure (.ok b) else pure (.error .eio)) with
     | .ok b => return .ok b
     | .error err => return .error err
+
+/-- Lookup a value by `key` in `SstTable` on resident or lazy (`openSstLazy`) handles, distinguishing
+    clean key absence (`.ok none`) from short/corrupt disk read failures (`.error .eio`). -/
+def getLazyResult (tbl : SstTable) (key : String) : IO (SysResult (Option ByteArray)) := do
+  if !bloomContains tbl.bloomMask (xxh64String key) then
+    return .ok none
+  let es := tbl.entries
+  let mut lo : Nat := 0
+  let mut hi : Nat := es.size
+  let mut found? : Option SstIndexEntry := none
+  while lo < hi do
+    let mid := (lo + hi) >>> 1
+    let e := es[mid]!
+    if e.key == key then
+      found? := some e
+      lo := hi
+    else if e.key < key then lo := mid + 1
+    else hi := mid
+  match found? with
+  | none => return .ok none
+  | some e =>
+    match ← readEntryValue tbl e with
+    | .ok b => return .ok (some b)
+    | .error err => return .error err
+
+/-- Lookup a value by `key` in `SstTable`, using in-memory `rawBuf` when resident or lazy `preadByteArray`
+    when opened via `openSstLazy`. -/
+def getLazyIO? (tbl : SstTable) (key : String) : IO (Option ByteArray) := do
+  match ← getLazyResult tbl key with
+  | .ok v? => return v?
+  | .error _ => return none
+
+/-- Atomically flush `st` into a sorted SST file at `sstPath` and compact the WAL,
+    returning the compacted `(Store.Handle × SstTable)` pair. -/
+def flushAndCompactStore (st : Store.Handle) (sstPath : String) : IO (SysResult (Store.Handle × SstTable)) := do
+  match ← flushStore st sstPath with
+  | .error e => pure (.error e)
+  | .ok tbl =>
+    match ← Store.compact st with
+    | .error e => pure (.error e)
+    | .ok stCompacted => pure (.ok (stCompacted, tbl))
+
+/-- Explicit 5-byte LSM tombstone sentinel (`0xFF 0x00 'D' 'E' 'L'`), matching `LeanSys.Table.tombstoneMarker`. -/
+@[inline]
+private def isSstTombstoneBytes (ba : ByteArray) (off len : Nat) : Bool :=
+  len == 5 && off + 5 ≤ ba.size &&
+  ba.get! off == 0xFF &&
+  ba.get! (off + 1) == 0x00 &&
+  ba.get! (off + 2) == 0x44 &&
+  ba.get! (off + 3) == 0x45 &&
+  ba.get! (off + 4) == 0x4C
 
 /-- Maximum SST file size (`64 MiB`), matching `openSst`'s bounded resident read cap
     and ensuring 32-bit `kLen`/`vOff`/`vLen`/`numEntries` directory fields never wrap. -/

@@ -253,9 +253,10 @@ def searchTrigramSstIO (tbl : SstTable) (query : String) (limit : Nat := 64) : I
     let mut out : Array (String × String) := Array.mkEmpty (Nat.min cands.size limit)
     for docId in cands do
       if out.size >= limit then break
-      match ← SstTable.getLazyIO? tbl s!"doc:{docId}" with
-      | none => return .error .eio
-      | some docBytes =>
+      match ← SstTable.getLazyResult tbl s!"doc:{docId}" with
+      | .error err => return .error err
+      | .ok none => pure () -- Stale `tri:` posting after bottom-most tombstone drop: skip cleanly
+      | .ok (some docBytes) =>
         if !LeanSys.Table.isTombstoneSlice (ByteSlice.ofByteArray docBytes) then
           if verifyTrigramCandidate qTris.size.toUInt32 qTris.size.toUInt32 docBytes.size.toUInt64 == 1 &&
              containsBytesLower docBytes qLower then
