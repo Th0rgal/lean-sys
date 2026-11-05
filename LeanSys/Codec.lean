@@ -682,7 +682,7 @@ def JsonTape.lookupObjectTape? (tape : JsonTape) (key : String) : Option JsonTap
   if isStr || sl.len == 0 then none
   else
     let p := JsonTape.skipWs sl.ba sl.off (Nat.min (sl.off + sl.len) sl.ba.size)
-    if p < sl.ba.size && byteAt sl.ba p == 123 then
+    if verifySliceBounds p.toUInt64 1 sl.ba.size.toUInt64 == 1 && byteAt sl.ba p == 123 then
       some (JsonTape.indexJsonObject sl)
     else
       none
@@ -694,18 +694,18 @@ def scanJsonArraySlices (s : ByteSlice) : Array (ByteSlice × Bool) := Id.run do
   let cap := ba.size
   let limit := Nat.min (s.off + s.len) cap
   let mut p := JsonTape.skipWs ba s.off limit
-  if p ≥ limit || byteAt ba p != 91 then -- '['
+  if verifySliceBounds p.toUInt64 1 limit.toUInt64 != 1 || byteAt ba p != 91 then -- '['
     return #[]
   p := p + 1
   let mut out : Array (ByteSlice × Bool) := #[]
-  while p < limit do
+  while verifySliceBounds p.toUInt64 1 limit.toUInt64 == 1 do
     p := JsonTape.skipWs ba p limit
-    if p ≥ limit then break
+    if verifySliceBounds p.toUInt64 1 limit.toUInt64 != 1 then break
     let c := byteAt ba p
     if c == 93 then break -- ']'
     if c == 44 then
       p := JsonTape.skipWs ba (p + 1) limit
-      if p ≥ limit || byteAt ba p == 93 then break
+      if verifySliceBounds p.toUInt64 1 limit.toUInt64 != 1 || byteAt ba p == 93 then break
     if byteAt ba p == 34 then
       let vStart := p + 1
       match JsonTape.scanQuotedString ba vStart limit with

@@ -851,7 +851,7 @@ def encodeHttpChunk (chunk : ByteSlice) : ByteArray :=
 def decodeChunkedBody? (raw : ByteArray) (maxBytes : Nat := maxHttpBodyBytes) : Option ByteArray := Id.run do
   let mut p : Nat := 0
   let mut out := ByteArray.empty
-  while p < raw.size do
+  while verifySliceBounds p.toUInt64 1 raw.size.toUInt64 == 1 do
     let mut crlf : Option Nat := none
     for i in [p : raw.size - 1] do
       if raw.get! i == 13 && raw.get! (i + 1) == 10 then
@@ -877,7 +877,7 @@ def decodeChunkedBody? (raw : ByteArray) (maxBytes : Nat := maxHttpBodyBytes) : 
       -- RFC 9112 §7.1.3: consume optional trailer lines up to terminating empty `\r\n`
       let mut tp := p
       let mut trailerLines : Nat := 0
-      while tp + 1 < raw.size do
+      while verifySliceBounds tp.toUInt64 2 raw.size.toUInt64 == 1 do
         if raw.get! tp == 13 && raw.get! (tp + 1) == 10 then
           return some out
         if verifySliceBounds trailerLines.toUInt64 1 64 != 1 then

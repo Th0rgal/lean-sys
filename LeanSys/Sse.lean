@@ -73,15 +73,16 @@ def decodeUtf8Lossy (ba : ByteArray) : String :=
   match String.fromUTF8? ba with
   | some s => s
   | none => Id.run do
+    let cap := ba.size.toUInt64
     let mut out := ByteArray.emptyWithCapacity (ba.size * 3)
     let mut i : Nat := 0
-    while i < ba.size do
+    while verifySliceBounds i.toUInt64 1 cap == 1 do
       let b0 := ba.get! i
       if b0 < 0x80 then
         out := out.push b0
         i := i + 1
       else if 0xC2 ≤ b0 && b0 ≤ 0xDF then
-        if i + 1 < ba.size && ((ba.get! (i + 1)) &&& 0xC0) == 0x80 then
+        if verifySliceBounds i.toUInt64 2 cap == 1 && ((ba.get! (i + 1)) &&& 0xC0) == 0x80 then
           out := out.push b0 |>.push (ba.get! (i + 1))
           i := i + 2
         else
@@ -89,13 +90,13 @@ def decodeUtf8Lossy (ba : ByteArray) : String :=
           i := i + 1
       else if 0xE0 ≤ b0 && b0 ≤ 0xEF then
         let validB1 :=
-          i + 1 < ba.size &&
+          verifySliceBounds i.toUInt64 2 cap == 1 &&
           let b1 := ba.get! (i + 1)
           (b1 &&& 0xC0) == 0x80 && !(b0 == 0xE0 && b1 < 0xA0) && !(b0 == 0xED && b1 ≥ 0xA0)
         if !validB1 then
           out := out.push 0xEF |>.push 0xBF |>.push 0xBD
           i := i + 1
-        else if i + 2 < ba.size && ((ba.get! (i + 2)) &&& 0xC0) == 0x80 then
+        else if verifySliceBounds i.toUInt64 3 cap == 1 && ((ba.get! (i + 2)) &&& 0xC0) == 0x80 then
           out := out.push b0 |>.push (ba.get! (i + 1)) |>.push (ba.get! (i + 2))
           i := i + 3
         else
@@ -104,17 +105,17 @@ def decodeUtf8Lossy (ba : ByteArray) : String :=
           i := i + 2
       else if 0xF0 ≤ b0 && b0 ≤ 0xF4 then
         let validB1 :=
-          i + 1 < ba.size &&
+          verifySliceBounds i.toUInt64 2 cap == 1 &&
           let b1 := ba.get! (i + 1)
           (b1 &&& 0xC0) == 0x80 && !(b0 == 0xF0 && b1 < 0x90) && !(b0 == 0xF4 && b1 ≥ 0x90)
         if !validB1 then
           out := out.push 0xEF |>.push 0xBF |>.push 0xBD
           i := i + 1
-        else if !(i + 2 < ba.size && ((ba.get! (i + 2)) &&& 0xC0) == 0x80) then
+        else if !(verifySliceBounds i.toUInt64 3 cap == 1 && ((ba.get! (i + 2)) &&& 0xC0) == 0x80) then
           -- Maximal valid prefix of length 2 (`b0`, `b1`)
           out := out.push 0xEF |>.push 0xBF |>.push 0xBD
           i := i + 2
-        else if i + 3 < ba.size && ((ba.get! (i + 3)) &&& 0xC0) == 0x80 then
+        else if verifySliceBounds i.toUInt64 4 cap == 1 && ((ba.get! (i + 3)) &&& 0xC0) == 0x80 then
           out := out.push b0 |>.push (ba.get! (i + 1)) |>.push (ba.get! (i + 2)) |>.push (ba.get! (i + 3))
           i := i + 4
         else
@@ -173,11 +174,12 @@ def pushChunk? (st : SseEventStream) (chunk : ByteSlice) : Option (SseEventStrea
       startIdx := 1
   let mut sawFirst := st.sawFirstByte
   if !sawFirst then
-    if rawBuf.size - startIdx < 3 then
+    if verifySliceBounds startIdx.toUInt64 3 rawBuf.size.toUInt64 != 1 then
       -- Could still be a partial UTF-8 BOM (`0xEF` or `0xEF 0xBB`) at stream start
-      let b0 := rawBuf.get! startIdx
-      if b0 == 0xEF && (rawBuf.size - startIdx == 1 || rawBuf.get! (startIdx + 1) == 0xBB) then
-        return some ({ st with carry := rawBuf.extract startIdx rawBuf.size, skipNextLf := false }, #[])
+      if verifySliceBounds startIdx.toUInt64 1 rawBuf.size.toUInt64 == 1 then
+        let b0 := rawBuf.get! startIdx
+        if b0 == 0xEF && (verifySliceBounds startIdx.toUInt64 2 rawBuf.size.toUInt64 != 1 || rawBuf.get! (startIdx + 1) == 0xBB) then
+          return some ({ st with carry := rawBuf.extract startIdx rawBuf.size, skipNextLf := false }, #[])
       sawFirst := true
     else
       sawFirst := true
@@ -191,7 +193,7 @@ def pushChunk? (st : SseEventStream) (chunk : ByteSlice) : Option (SseEventStrea
   let mut emitted : Array SseEvent := #[]
   let mut lineStart : Nat := startIdx
   let mut i : Nat := startIdx
-  while i < rawBuf.size do
+  while verifySliceBounds i.toUInt64 1 rawBuf.size.toUInt64 == 1 do
     let b := rawBuf.get! i
     if b == 10 || b == 13 then -- '\n' or '\r'
       let lineEnd := i
@@ -200,9 +202,9 @@ def pushChunk? (st : SseEventStream) (chunk : ByteSlice) : Option (SseEventStrea
         return none
       let nextPos :=
         if b == 13 then
-          if i + 1 < rawBuf.size && rawBuf.get! (i + 1) == 10 then i + 2 else i + 1
+          if verifySliceBounds i.toUInt64 2 rawBuf.size.toUInt64 == 1 && rawBuf.get! (i + 1) == 10 then i + 2 else i + 1
         else i + 1
-      if b == 13 && i + 1 == rawBuf.size then
+      if b == 13 && verifySliceBounds i.toUInt64 2 rawBuf.size.toUInt64 != 1 then
         skipLf := true
       if lineEnd == lineStart then
         -- Blank line dispatches event iff at least one `data:` field was accumulated (W3C SSE §9.2.6)

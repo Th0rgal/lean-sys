@@ -188,7 +188,7 @@ structure WsFrame where
 
 /-- Apply RFC 6455 §5.3 4-byte XOR payload mask (`j mod 4`). -/
 def applyMask (payload : ByteArray) (maskKey4 : ByteArray) : ByteArray := Id.run do
-  if maskKey4.size < 4 || payload.isEmpty then
+  if verifySliceBounds 0 4 maskKey4.size.toUInt64 != 1 || payload.isEmpty then
     return payload
   let m0 := maskKey4.get! 0
   let m1 := maskKey4.get! 1
@@ -216,7 +216,7 @@ def validateFramePayload (frame : WsFrame) : Bool :=
   match frame.opcode with
   | .close =>
     if frame.payload.isEmpty then true
-    else if frame.payload.size == 1 then false
+    else if verifySliceBounds 0 2 frame.payload.size.toUInt64 != 1 then false
     else
       let code : UInt16 := ((frame.payload.get! 0).toUInt16 <<< 8) ||| (frame.payload.get! 1).toUInt16
       let reasonBytes := frame.payload.extract 2 frame.payload.size
