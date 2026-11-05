@@ -588,21 +588,23 @@ private def pushUtf8Codepoint (out : ByteArray) (cp : UInt32) : ByteArray :=
     and rejects unescaped control characters (`< 0x20`) or raw unescaped `"` (`34`). -/
 def unescapeJsonSlice? (s : ByteSlice) : Option String := Id.run do
   let ba := s.ba
-  let limit := Nat.min (s.off + s.len) ba.size
+  let limit := if verifySliceBounds s.off.toUInt64 s.len.toUInt64 ba.size.toUInt64 == 1 then s.off + s.len else Nat.min (s.off + s.len) ba.size
   let mut hasBackslash := false
-  for idx in [s.off : limit] do
-    let b := byteAt ba idx
+  let mut scanIdx := s.off
+  while verifySliceBounds scanIdx.toUInt64 1 limit.toUInt64 == 1 do
+    let b := byteAt ba scanIdx
     if b < 0x20 then
       return none
     if b == 92 then
       hasBackslash := true
     else if !hasBackslash && b == 34 then
       return none
+    scanIdx := scanIdx + 1
   if !hasBackslash then
     return String.fromUTF8? (ba.extract s.off limit)
   let mut out := ByteArray.emptyWithCapacity s.len
   let mut p := s.off
-  while p < limit do
+  while verifySliceBounds p.toUInt64 1 limit.toUInt64 == 1 do
     let c := byteAt ba p
     if c < 0x20 || c == 34 then
       return none

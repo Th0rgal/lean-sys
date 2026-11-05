@@ -755,11 +755,12 @@ private def pctNib? (b : UInt8) : Option UInt8 :=
 /-- Percent-decode a URL query or path component (`%XX` and `+` → `' '` when `plusAsSpace := true`). -/
 def percentDecode (s : String) (plusAsSpace : Bool := false) : String := Id.run do
   let b := s.toUTF8
+  let cap := b.size.toUInt64
   let mut out := ByteArray.emptyWithCapacity b.size
   let mut i : Nat := 0
-  while i < b.size do
+  while verifySliceBounds i.toUInt64 1 cap == 1 do
     let c := b.get! i
-    if c == 37 && verifySliceBounds i.toUInt64 3 b.size.toUInt64 == 1 then -- '%'
+    if c == 37 && verifySliceBounds i.toUInt64 3 cap == 1 then -- '%'
       match pctNib? (b.get! (i + 1)), pctNib? (b.get! (i + 2)) with
       | some hi, some lo =>
         out := out.push ((hi <<< 4) ||| lo)
@@ -849,21 +850,26 @@ def encodeHttpChunk (chunk : ByteSlice) : ByteArray :=
 
 /-- Decode a complete HTTP/1.1 `Transfer-Encoding: chunked` response body (rejecting chunks exceeding `maxBytes`). -/
 def decodeChunkedBody? (raw : ByteArray) (maxBytes : Nat := maxHttpBodyBytes) : Option ByteArray := Id.run do
+  let cap := raw.size.toUInt64
   let mut p : Nat := 0
   let mut out := ByteArray.empty
-  while verifySliceBounds p.toUInt64 1 raw.size.toUInt64 == 1 do
+  while verifySliceBounds p.toUInt64 2 cap == 1 do
     let mut crlf : Option Nat := none
-    for i in [p : raw.size - 1] do
-      if raw.get! i == 13 && raw.get! (i + 1) == 10 then
-        crlf := some i
+    let mut scan := p
+    while verifySliceBounds scan.toUInt64 2 cap == 1 do
+      if raw.get! scan == 13 && raw.get! (scan + 1) == 10 then
+        crlf := some scan
         break
+      scan := scan + 1
     let some lineEnd := crlf | return none
-    if lineEnd == p || verifySliceBounds 0 (lineEnd - p).toUInt64 64 != 1 then return none
+    if lineEnd == p || verifySliceBounds p.toUInt64 (lineEnd - p).toUInt64 cap != 1 ||
+       verifySliceBounds 0 (lineEnd - p).toUInt64 64 != 1 then return none
     -- Parse hex chunk size (ignoring optional `;chunk-ext`)
     let mut chunkLen : Nat := 0
     let mut digitsSeen := false
-    for i in [p : lineEnd] do
-      let b := raw.get! i
+    let mut idx := p
+    while verifySliceBounds idx.toUInt64 1 lineEnd.toUInt64 == 1 do
+      let b := raw.get! idx
       if b == 59 then break -- ';'
       match pctNib? b with
       | some nib =>
@@ -871,37 +877,43 @@ def decodeChunkedBody? (raw : ByteArray) (maxBytes : Nat := maxHttpBodyBytes) : 
         chunkLen := (chunkLen <<< 4) + nib.toNat
         if verifySliceBounds 0 chunkLen.toUInt64 maxBytes.toUInt64 != 1 then return none
       | none => return none
+      idx := idx + 1
     if !digitsSeen then return none
     p := lineEnd + 2
     if chunkLen == 0 then
       -- RFC 9112 §7.1.3: consume optional trailer lines up to terminating empty `\r\n`
       let mut tp := p
       let mut trailerLines : Nat := 0
-      while verifySliceBounds tp.toUInt64 2 raw.size.toUInt64 == 1 do
+      while verifySliceBounds tp.toUInt64 2 cap == 1 do
         if raw.get! tp == 13 && raw.get! (tp + 1) == 10 then
           return some out
         if verifySliceBounds trailerLines.toUInt64 1 64 != 1 then
           return none
         let mut tEnd : Option Nat := none
-        for j in [tp : raw.size - 1] do
+        let mut j := tp
+        while verifySliceBounds j.toUInt64 2 cap == 1 do
           if raw.get! j == 13 && raw.get! (j + 1) == 10 then
             tEnd := some j
             break
+          j := j + 1
         let some te := tEnd | return none
-        if verifySliceBounds 0 (te - tp).toUInt64 8192 != 1 then return none
+        if verifySliceBounds tp.toUInt64 (te - tp).toUInt64 cap != 1 ||
+           verifySliceBounds 0 (te - tp).toUInt64 8192 != 1 then return none
         -- Require colon inside trailer header field and no bare control bytes
         let mut colonAt : Option Nat := none
-        for j in [tp : te] do
-          let b := raw.get! j
-          if b == 58 && colonAt.isNone then colonAt := some j
+        let mut k := tp
+        while verifySliceBounds k.toUInt64 1 te.toUInt64 == 1 do
+          let b := raw.get! k
+          if b == 58 && colonAt.isNone then colonAt := some k
           if b < 0x20 && b != 9 then return none
+          k := k + 1
         let some cIdx := colonAt | return none
         if cIdx == tp then return none
         trailerLines := trailerLines + 1
         tp := te + 2
       return none
     if verifySliceBounds out.size.toUInt64 chunkLen.toUInt64 maxBytes.toUInt64 != 1 ||
-       verifySliceBounds p.toUInt64 (chunkLen + 2).toUInt64 raw.size.toUInt64 != 1 then
+       verifySliceBounds p.toUInt64 (chunkLen + 2).toUInt64 cap != 1 then
       return none
     if raw.get! (p + chunkLen) != 13 || raw.get! (p + chunkLen + 1) != 10 then
       return none

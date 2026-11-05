@@ -45,16 +45,18 @@ def hex6BE (tri : UInt32) : String := Id.run do
 /-- Extract sorted, deduplicated 24-bit ASCII-lowercased trigrams from `text`. -/
 def extractTrigrams (text : String) : Array UInt32 := Id.run do
   let b := asciiLowerBytes text.toUTF8
-  if b.size < 3 then
+  let cap := b.size.toUInt64
+  if verifySliceBounds 0 3 cap != 1 then
     return #[]
-  let n := b.size - 2
-  let mut raw : Array UInt32 := Array.mkEmpty n
-  for i in [0:n] do
+  let mut raw : Array UInt32 := Array.mkEmpty (b.size - 2)
+  let mut i : Nat := 0
+  while verifySliceBounds i.toUInt64 3 cap == 1 do
     let w : UInt32 :=
       ((b.get! i).toUInt32 <<< 16) |||
       ((b.get! (i + 1)).toUInt32 <<< 8) |||
       (b.get! (i + 2)).toUInt32
     raw := raw.push w
+    i := i + 1
   let sorted := raw.qsort (fun a c => a < c)
   let mut dedup : Array UInt32 := Array.mkEmpty sorted.size
   for w in sorted do
@@ -68,15 +70,20 @@ def extractTrigrams (text : String) : Array UInt32 := Id.run do
 /-- Exact case-insensitive ASCII substring check (`needleLower` already lowercased). -/
 def containsBytesLower (haystack : ByteArray) (needleLower : ByteArray) : Bool := Id.run do
   if needleLower.isEmpty then return true
-  if verifySliceBounds 0 needleLower.size.toUInt64 haystack.size.toUInt64 != 1 then return false
-  let limit := haystack.size - needleLower.size + 1
-  for i in [0:limit] do
+  let hCap := haystack.size.toUInt64
+  let nLen := needleLower.size
+  if verifySliceBounds 0 nLen.toUInt64 hCap != 1 then return false
+  let mut i : Nat := 0
+  while verifySliceBounds i.toUInt64 nLen.toUInt64 hCap == 1 do
     let mut matched := true
-    for j in [0:needleLower.size] do
+    let mut j : Nat := 0
+    while verifySliceBounds j.toUInt64 1 nLen.toUInt64 == 1 do
       if asciiLowerByte (haystack.get! (i + j)) != needleLower.get! j then
         matched := false
         break
+      j := j + 1
     if matched then return true
+    i := i + 1
   return false
 
 /-- Index a document `(docId, text)` into `st`, writing all `tri:<6hex>:<docId>` postings BEFORE
