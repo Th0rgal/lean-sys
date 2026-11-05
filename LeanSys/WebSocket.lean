@@ -94,12 +94,13 @@ def sha1Bytes (msg : ByteArray) : ByteArray := Id.run do
   let mut h3 : UInt32 := 0x10325476
   let mut h4 : UInt32 := 0xC3D2E1F0
 
-  let blocks := padded.size / 64
-  for blk in [0:blocks] do
-    let base := blk * 64
+  let mut base : Nat := 0
+  while verifySliceBounds base.toUInt64 64 padded.size.toUInt64 == 1 do
     let mut w : Array UInt32 := Array.mkEmpty 80
     for t in [0:16] do
-      w := w.push (readWord32BE padded (base + t * 4))
+      let off := base + t * 4
+      if verifySliceBounds off.toUInt64 4 padded.size.toUInt64 == 1 then
+        w := w.push (readWord32BE padded off)
     for t in [16:80] do
       let x := w[t - 3]! ^^^ w[t - 8]! ^^^ w[t - 14]! ^^^ w[t - 16]!
       w := w.push (rotl32 x 1)
@@ -129,6 +130,7 @@ def sha1Bytes (msg : ByteArray) : ByteArray := Id.run do
     h2 := h2 + c
     h3 := h3 + d
     h4 := h4 + e
+    base := base + 64
 
   let mut out := ByteArray.emptyWithCapacity 20
   out := pushWord32BE out h0
@@ -142,11 +144,10 @@ def sha1Bytes (msg : ByteArray) : ByteArray := Id.run do
 def base64Encode (ba : ByteArray) : String := Id.run do
   let alphabet := "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/".toUTF8
   let n := ba.size
-  let fullGroups := n / 3
-  let rem := n % 3
+  let cap := n.toUInt64
   let mut out := ByteArray.emptyWithCapacity (((n + 2) / 3) * 4)
-  for g in [0:fullGroups] do
-    let p := g * 3
+  let mut p : Nat := 0
+  while verifySliceBounds p.toUInt64 3 cap == 1 do
     let b0 := (ba.get! p).toNat
     let b1 := (ba.get! (p + 1)).toNat
     let b2 := (ba.get! (p + 2)).toNat
@@ -155,20 +156,21 @@ def base64Encode (ba : ByteArray) : String := Id.run do
       |>.push (alphabet.get! ((triple >>> 12) &&& 0x3F))
       |>.push (alphabet.get! ((triple >>> 6) &&& 0x3F))
       |>.push (alphabet.get! (triple &&& 0x3F))
-  if rem == 1 then
-    let b0 := (ba.get! (fullGroups * 3)).toNat
-    let triple := b0 <<< 16
-    out := out.push (alphabet.get! ((triple >>> 18) &&& 0x3F))
-      |>.push (alphabet.get! ((triple >>> 12) &&& 0x3F))
-      |>.push 61 -- '='
-      |>.push 61 -- '='
-  else if rem == 2 then
-    let b0 := (ba.get! (fullGroups * 3)).toNat
-    let b1 := (ba.get! (fullGroups * 3 + 1)).toNat
+    p := p + 3
+  if verifySliceBounds p.toUInt64 2 cap == 1 then
+    let b0 := (ba.get! p).toNat
+    let b1 := (ba.get! (p + 1)).toNat
     let triple := (b0 <<< 16) ||| (b1 <<< 8)
     out := out.push (alphabet.get! ((triple >>> 18) &&& 0x3F))
       |>.push (alphabet.get! ((triple >>> 12) &&& 0x3F))
       |>.push (alphabet.get! ((triple >>> 6) &&& 0x3F))
+      |>.push 61 -- '='
+  else if verifySliceBounds p.toUInt64 1 cap == 1 then
+    let b0 := (ba.get! p).toNat
+    let triple := b0 <<< 16
+    out := out.push (alphabet.get! ((triple >>> 18) &&& 0x3F))
+      |>.push (alphabet.get! ((triple >>> 12) &&& 0x3F))
+      |>.push 61 -- '='
       |>.push 61 -- '='
   return String.fromUTF8! out
 

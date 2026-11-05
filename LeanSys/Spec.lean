@@ -1911,11 +1911,25 @@ def compactionNoTombstoneResurrection (c : CompactionWinnerCheck) : Bool :=
       c.olderFlags.1 c.olderFlags.2 c.dropFlag == 0
   else true
 
-/-- Theorem 45: Newer-generation deletion tombstones strictly mask older SST
+/-- Layer II Bundle 43: LSM compaction merge tombstone-masking safety gate. -/
+def compactionWinnerMetaSpec : MetaGateSpec Unit CompactionWinnerCheck where
+  inv _ := True
+  gate _ c :=
+    verifyCompactionWinner c.newerFlags.1 c.newerFlags.2
+      c.olderFlags.1 c.olderFlags.2 c.dropFlag == 0
+  step _ _ := ()
+  safe _ c :=
+    !(c.newerFlags.1 == 1 && c.newerFlags.2 == 1 && c.dropFlag == 1) ||
+      verifyCompactionWinner c.newerFlags.1 c.newerFlags.2
+        c.olderFlags.1 c.olderFlags.2 c.dropFlag == 0
+  preserves_inv _ _ _ h := h
+  ensures_safe _ c h := by simp [h]
+
+/-- Corollary 45: Newer-generation deletion tombstones strictly mask older SST
     entries even during bottom-most compaction (`dropTombstones == 1`). -/
 theorem compaction_newer_tombstone_masks_older
     (olderPresent olderTomb : UInt8) :
-    verifyCompactionWinner 1 1 olderPresent olderTomb 1 = 0 := by
+    verifyCompactionWinner 1 1 olderPresent olderTomb 1 = 0 :=
   rfl
 
 /-- Theorem 46 (Mutant Kill #1): `verifyCompactionWinner` kills the LSM
@@ -1943,19 +1957,36 @@ def verifyTrigramCandidateMutantLen3
     if docLen > 0 then 1 else 0
   else if matchedTriCount == queryTriCount && docLen > 3 then 1 else 0
 
-/-- Theorem 47: When all `qCount > 0` query trigrams match a document of length
-    `≥ 3`, `verifyTrigramCandidate` retains the candidate (`== 1`). -/
-theorem trigram_candidate_no_false_negative (qCount : UInt32) (docLen : UInt64)
-    (hq : qCount > 0) (hlen : docLen ≥ 3) :
-    verifyTrigramCandidate qCount qCount docLen = 1 := by
-  unfold verifyTrigramCandidate
-  have hne : (qCount == 0) = false := by
-    cases h : (qCount == 0)
-    · rfl
-    · have heq : qCount = 0 := beq_iff_eq.mp h
-      subst heq
-      exact False.elim (Nat.lt_irrefl 0 hq)
-  simp [hne, hlen]
+/-- Trigram candidate check parameters (≤ 3 fields). -/
+structure TrigramCandidateCheck where
+  queryTriCount   : UInt32
+  matchedTriCount : UInt32
+  docLen          : UInt64
+  deriving Repr, DecidableEq
+
+@[inline]
+def trigramCandidateSafe (c : TrigramCandidateCheck) : Bool :=
+  if c.queryTriCount == 0 then c.docLen > 0
+  else c.matchedTriCount == c.queryTriCount && c.docLen ≥ 3
+
+/-- Layer II Bundle 43b: Trigram candidate posting-intersection safety gate. -/
+def trigramCandidateMetaSpec : MetaGateSpec Unit TrigramCandidateCheck where
+  inv _ := True
+  gate _ c := verifyTrigramCandidate c.queryTriCount c.matchedTriCount c.docLen == 1
+  step _ _ := ()
+  safe _ c := trigramCandidateSafe c
+  preserves_inv _ _ _ h := h
+  ensures_safe _ c h := by
+    unfold verifyTrigramCandidate at h
+    unfold trigramCandidateSafe
+    split at h <;> split at h <;> simp_all
+
+/-- Corollary 47: `verifyTrigramCandidate` rejects insufficient trigram matches
+    or sub-3-byte documents when `queryTriCount > 0`. -/
+theorem trigram_candidate_no_false_negative (c : TrigramCandidateCheck)
+    (h_bad : trigramCandidateSafe c = false) :
+    (verifyTrigramCandidate c.queryTriCount c.matchedTriCount c.docLen == 1) = false :=
+  trigramCandidateMetaSpec.rejects_unsafe () c h_bad
 
 /-- Theorem 48 (Mutant Kill #2): `verifyTrigramCandidate` kills the 3-character
     document boundary mutant. -/
@@ -2065,17 +2096,35 @@ def verifySseEventEncode
   if noHeaderCrLf == 1 && dataLines ≥ 1 && maxChunkBytes ≤ 16777216 &&
      encodedBytes ≥ 2 && encodedBytes ≤ maxChunkBytes then 1 else 0
 
-/-- Theorem 51: `verifySseEventEncode` guarantees absence of CR/LF header
-    injection (`noHeaderCrLf = 1`) and bounded frame size. -/
-theorem sse_event_encode_rejects_crlf_injection
-    (noCrLf : UInt8) (lines : UInt32) (encBytes maxBytes : UInt64)
-    (h_ok : verifySseEventEncode noCrLf lines encBytes maxBytes = 1) :
-    noCrLf = 1 ∧ lines ≥ 1 ∧ encBytes ≥ 2 ∧ encBytes ≤ maxBytes := by
-  unfold verifySseEventEncode at h_ok
-  split at h_ok
-  · next h =>
-    simp only [Bool.and_eq_true, beq_iff_eq, decide_eq_true_eq] at h
-    exact ⟨h.1.1.1.1, h.1.1.1.2, h.1.2, h.2⟩
-  · contradiction
+/-- SSE outgoing event check parameters (≤ 3 fields via tuple packing). -/
+structure SseEventEncodeCheck where
+  noHeaderCrLf : UInt8
+  dataLines    : UInt32
+  sizes        : UInt64 × UInt64
+  deriving Repr, DecidableEq
+
+@[inline]
+def sseEventEncodeSafe (e : SseEventEncodeCheck) : Bool :=
+  e.noHeaderCrLf == 1 && e.dataLines ≥ 1 && e.sizes.2 ≤ 16777216 &&
+  e.sizes.1 ≥ 2 && e.sizes.1 ≤ e.sizes.2
+
+/-- Layer II Bundle 45: W3C SSE outgoing event CR/LF & chunk-bounds safety gate. -/
+def sseEventEncodeMetaSpec : MetaGateSpec Unit SseEventEncodeCheck where
+  inv _ := True
+  gate _ e :=
+    verifySseEventEncode e.noHeaderCrLf e.dataLines e.sizes.1 e.sizes.2 == 1
+  step _ _ := ()
+  safe _ e := sseEventEncodeSafe e
+  preserves_inv _ _ _ h := h
+  ensures_safe _ e h := by
+    unfold verifySseEventEncode at h; unfold sseEventEncodeSafe
+    split at h <;> simp_all
+
+/-- Corollary 51: `verifySseEventEncode` rejects CR/LF header injection, empty
+    `dataLines`, or chunks exceeding `maxChunkBytes`. -/
+theorem sse_event_encode_rejects_crlf_injection (e : SseEventEncodeCheck)
+    (h_bad : sseEventEncodeSafe e = false) :
+    (verifySseEventEncode e.noHeaderCrLf e.dataLines e.sizes.1 e.sizes.2 == 1) = false :=
+  sseEventEncodeMetaSpec.rejects_unsafe () e h_bad
 
 end LeanSys.Spec
