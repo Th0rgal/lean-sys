@@ -275,8 +275,8 @@ private def isSstTombstoneBytes (ba : ByteArray) (off len : Nat) : Bool :=
 
 /-- Load an SST entry's value bytes from resident `rawBuf` when available, or via `preadByteArray`
     when the `SstTable` was opened with `openSstLazy` (`rawBuf.isEmpty`). Fails closed with `.eio`
-    on short/corrupted reads so compaction never silently drops keys. -/
-private def readEntryValue (tbl : SstTable) (e : SstIndexEntry) : IO (SysResult ByteArray) := do
+    on short/corrupted reads so compaction and lazy search never silently drop keys. -/
+def readEntryValue (tbl : SstTable) (e : SstIndexEntry) : IO (SysResult ByteArray) := do
   if !tbl.rawBuf.isEmpty then
     if e.valOff + e.valLen ≤ tbl.rawBuf.size then
       return .ok (tbl.rawBuf.extract e.valOff (e.valOff + e.valLen))

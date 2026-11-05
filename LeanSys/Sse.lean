@@ -67,8 +67,9 @@ def formatSseEvent? (ev : SseEvent) (maxChunkBytes : Nat := 4194304) : Option By
   else
     return none
 
-/-- Decode `ba` as UTF-8, replacing any invalid byte sequence with `U+FFFD` (`0xEF 0xBF 0xBD`). -/
-private def decodeUtf8Lossy (ba : ByteArray) : String :=
+/-- Decode `ba` as UTF-8 per Unicode §3.9 D93b / WHATWG UTF-8 decoder (maximal valid subpart replacement
+    with `U+FFFD` `0xEF 0xBF 0xBD`). -/
+def decodeUtf8Lossy (ba : ByteArray) : String :=
   match String.fromUTF8? ba with
   | some s => s
   | none => Id.run do
@@ -79,39 +80,47 @@ private def decodeUtf8Lossy (ba : ByteArray) : String :=
       if b0 < 0x80 then
         out := out.push b0
         i := i + 1
-      else if 0xC2 ≤ b0 && b0 ≤ 0xDF && i + 1 < ba.size then
-        let b1 := ba.get! (i + 1)
-        if (b1 &&& 0xC0) == 0x80 then
-          out := out.push b0 |>.push b1
+      else if 0xC2 ≤ b0 && b0 ≤ 0xDF then
+        if i + 1 < ba.size && ((ba.get! (i + 1)) &&& 0xC0) == 0x80 then
+          out := out.push b0 |>.push (ba.get! (i + 1))
           i := i + 2
         else
           out := out.push 0xEF |>.push 0xBF |>.push 0xBD
           i := i + 1
-      else if 0xE0 ≤ b0 && b0 ≤ 0xEF && i + 2 < ba.size then
-        let b1 := ba.get! (i + 1)
-        let b2 := ba.get! (i + 2)
-        let validE :=
-          (b1 &&& 0xC0) == 0x80 && (b2 &&& 0xC0) == 0x80 &&
-          !(b0 == 0xE0 && b1 < 0xA0) && !(b0 == 0xED && b1 ≥ 0xA0)
-        if validE then
-          out := out.push b0 |>.push b1 |>.push b2
+      else if 0xE0 ≤ b0 && b0 ≤ 0xEF then
+        let validB1 :=
+          i + 1 < ba.size &&
+          let b1 := ba.get! (i + 1)
+          (b1 &&& 0xC0) == 0x80 && !(b0 == 0xE0 && b1 < 0xA0) && !(b0 == 0xED && b1 ≥ 0xA0)
+        if !validB1 then
+          out := out.push 0xEF |>.push 0xBF |>.push 0xBD
+          i := i + 1
+        else if i + 2 < ba.size && ((ba.get! (i + 2)) &&& 0xC0) == 0x80 then
+          out := out.push b0 |>.push (ba.get! (i + 1)) |>.push (ba.get! (i + 2))
           i := i + 3
         else
+          -- Maximal valid prefix of length 2 (`b0`, `b1`) replaced by a single U+FFFD
+          out := out.push 0xEF |>.push 0xBF |>.push 0xBD
+          i := i + 2
+      else if 0xF0 ≤ b0 && b0 ≤ 0xF4 then
+        let validB1 :=
+          i + 1 < ba.size &&
+          let b1 := ba.get! (i + 1)
+          (b1 &&& 0xC0) == 0x80 && !(b0 == 0xF0 && b1 < 0x90) && !(b0 == 0xF4 && b1 ≥ 0x90)
+        if !validB1 then
           out := out.push 0xEF |>.push 0xBF |>.push 0xBD
           i := i + 1
-      else if 0xF0 ≤ b0 && b0 ≤ 0xF4 && i + 3 < ba.size then
-        let b1 := ba.get! (i + 1)
-        let b2 := ba.get! (i + 2)
-        let b3 := ba.get! (i + 3)
-        let validF :=
-          (b1 &&& 0xC0) == 0x80 && (b2 &&& 0xC0) == 0x80 && (b3 &&& 0xC0) == 0x80 &&
-          !(b0 == 0xF0 && b1 < 0x90) && !(b0 == 0xF4 && b1 ≥ 0x90)
-        if validF then
-          out := out.push b0 |>.push b1 |>.push b2 |>.push b3
+        else if !(i + 2 < ba.size && ((ba.get! (i + 2)) &&& 0xC0) == 0x80) then
+          -- Maximal valid prefix of length 2 (`b0`, `b1`)
+          out := out.push 0xEF |>.push 0xBF |>.push 0xBD
+          i := i + 2
+        else if i + 3 < ba.size && ((ba.get! (i + 3)) &&& 0xC0) == 0x80 then
+          out := out.push b0 |>.push (ba.get! (i + 1)) |>.push (ba.get! (i + 2)) |>.push (ba.get! (i + 3))
           i := i + 4
         else
+          -- Maximal valid prefix of length 3 (`b0`, `b1`, `b2`)
           out := out.push 0xEF |>.push 0xBF |>.push 0xBD
-          i := i + 1
+          i := i + 3
       else
         out := out.push 0xEF |>.push 0xBF |>.push 0xBD
         i := i + 1

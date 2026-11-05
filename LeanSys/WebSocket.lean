@@ -355,4 +355,55 @@ def makeServerClose? (statusCode : UInt16 := 1000) (reason : String := "") : Opt
   let body := hdr ++ reasonBytes
   encodeFrame? { fin := true, opcode := .close, payload := body } none 256
 
+/-- Stateful RFC 6455 §5.4 message fragmentation reassembler:
+    - Enforces continuation ordering (rejects unexpected `.continuation` when idle and new `.text`/`.binary` mid-fragment).
+    - Allows interleaved control frames (`.ping`, `.pong`, `.close` with `fin == true` and `payload.size ≤ 125`) without disrupting in-progress fragments.
+    - Caps accumulated message bytes at `maxMsgBytes` and validates complete `.text` messages with `String.fromUTF8?` upon `fin == true`. -/
+structure WsMessageAssembler where
+  inProgressOp? : Option WsOpcode := none
+  buf           : ByteArray := ByteArray.empty
+  maxMsgBytes   : Nat := 4194304
+  deriving Inhabited
+
+namespace WsMessageAssembler
+
+def init (maxMsgBytes : Nat := 4194304) : WsMessageAssembler :=
+  { maxMsgBytes := maxMsgBytes }
+
+/-- Feed a decoded `WsFrame` into `st`, returning `(updatedAssembler, completedMessageOrControl?)`. -/
+def pushFrame (st : WsMessageAssembler) (frame : WsFrame) :
+    Except String (WsMessageAssembler × Option (WsOpcode × ByteArray)) := Id.run do
+  if !validateFramePayload frame then
+    return .error "ws_invalid_payload"
+  match frame.opcode with
+  | .ping | .pong | .close =>
+    if !frame.fin || frame.payload.size > 125 then
+      return .error "ws_invalid_control_frame"
+    return .ok (st, some (frame.opcode, frame.payload))
+  | .text | .binary =>
+    if st.inProgressOp?.isSome then
+      return .error "ws_unexpected_data_opcode_mid_fragment"
+    if frame.payload.size > st.maxMsgBytes then
+      return .error "ws_message_too_large"
+    if frame.fin then
+      if frame.opcode == .text && (String.fromUTF8? frame.payload).isNone then
+        return .error "ws_invalid_utf8_text"
+      return .ok (st, some (frame.opcode, frame.payload))
+    else
+      return .ok ({ st with inProgressOp? := some frame.opcode, buf := frame.payload }, none)
+  | .continuation =>
+    let some op := st.inProgressOp?
+      | return .error "ws_unexpected_continuation"
+    if st.buf.size + frame.payload.size > st.maxMsgBytes then
+      return .error "ws_message_too_large"
+    let combined := st.buf ++ frame.payload
+    if frame.fin then
+      if op == .text && (String.fromUTF8? combined).isNone then
+        return .error "ws_invalid_utf8_text"
+      return .ok ({ st with inProgressOp? := none, buf := ByteArray.empty }, some (op, combined))
+    else
+      return .ok ({ st with buf := combined }, none)
+
+end WsMessageAssembler
+
 end LeanSys.WebSocket

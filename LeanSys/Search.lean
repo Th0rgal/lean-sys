@@ -92,7 +92,12 @@ def indexDoc (st : Store.Handle) (docId : String) (text : String) (sync : Bool :
     batch := batch.push (s!"tri:{hex6BE tri}:{docId}", marker)
   Store.putBatch st batch sync
 
-/-- Collect all `docId` postings matching prefix `tri:<6hex>:` in sorted order via binary search on `tbl.entries`. -/
+/-- `true` iff `tbl` was opened lazily (`openSstLazy`) with non-empty directory entries and an unpopulated `rawBuf`. -/
+@[inline]
+def isNonResidentLazy (tbl : SstTable) : Bool :=
+  tbl.rawBuf.isEmpty && !tbl.entries.isEmpty
+
+/-- Collect all `docId` postings matching prefix `tri:<6hex>:` in sorted order via binary search on resident `tbl.entries`. -/
 def lookupTrigramPostings (tbl : SstTable) (tri : UInt32) : Array String := Id.run do
   let prefixStr := s!"tri:{hex6BE tri}:"
   let prefixLen := prefixStr.utf8ByteSize
@@ -115,6 +120,28 @@ def lookupTrigramPostings (tbl : SstTable) (tri : UInt32) : Array String := Id.r
     idx := idx + 1
   return docs
 
+/-- Collect all `docId` postings matching prefix `tri:<6hex>:` on either resident (`openSst`) or lazy (`openSstLazy`) tables. -/
+def lookupTrigramPostingsIO (tbl : SstTable) (tri : UInt32) : IO (SysResult (Array String)) := do
+  let prefixStr := s!"tri:{hex6BE tri}:"
+  let prefixLen := prefixStr.utf8ByteSize
+  let es := tbl.entries
+  let mut lo : Nat := 0
+  let mut hi : Nat := es.size
+  while lo < hi do
+    let mid := (lo + hi) >>> 1
+    if es[mid]!.key < prefixStr then lo := mid + 1 else hi := mid
+  let mut docs : Array String := #[]
+  let mut idx := lo
+  while idx < es.size do
+    let e := es[idx]!
+    if !e.key.startsWith prefixStr then break
+    let .ok valBytes ← SstTable.readEntryValue tbl e | return .error .eio
+    if !LeanSys.Table.isTombstoneSlice (ByteSlice.ofByteArray valBytes) then
+      let docId := String.fromUTF8! (e.key.toUTF8.extract prefixLen e.key.utf8ByteSize)
+      docs := docs.push docId
+    idx := idx + 1
+  return .ok docs
+
 /-- Intersect two sorted `Array String` posting lists in `O(|a| + |b|)`. -/
 def intersectSortedPostings (a b : Array String) : Array String := Id.run do
   let mut out : Array String := Array.mkEmpty (Nat.min a.size b.size)
@@ -133,11 +160,13 @@ def intersectSortedPostings (a b : Array String) : Array String := Id.run do
       j := j + 1
   return out
 
-/-- Search an indexed `SstTable` for case-insensitive substring `query`, returning up to `limit` matching `(docId, docText)` pairs:
+/-- Search a resident `SstTable` (`openSst` / `flushStore`) for case-insensitive substring `query`,
+    returning up to `limit` matching `(docId, docText)` pairs:
     - Queries with `≥ 3` ASCII bytes intersect sorted `tri:<6hex>:` posting lists first, then verify via `verifyTrigramCandidate` + `containsBytesLower`.
-    - Short queries (`1..2` bytes) scan `doc:` entries with `containsBytesLower` so short substrings also have zero false negatives. -/
+    - Short queries (`1..2` bytes) scan `doc:` entries with `containsBytesLower` so short substrings also have zero false negatives.
+    - Note: For lazy SSTs (`openSstLazy`), call `searchTrigramSstIO` (or `searchTrigramSst?` which rejects non-resident tables with `none`). -/
 def searchTrigramSst (tbl : SstTable) (query : String) (limit : Nat := 64) : Array (String × String) := Id.run do
-  if limit == 0 || query.isEmpty then
+  if limit == 0 || query.isEmpty || isNonResidentLazy tbl then
     return #[]
   let qLower := asciiLowerBytes query.toUTF8
   let qTris := extractTrigrams query
@@ -179,6 +208,59 @@ def searchTrigramSst (tbl : SstTable) (query : String) (limit : Nat := 64) : Arr
              containsBytesLower docBytes qLower then
             out := out.push (docId, String.fromUTF8? docBytes |>.getD "")
     return out
+
+/-- Pure resident search wrapper that returns `none` when `tbl` is a non-resident `openSstLazy` handle
+    (preventing callers from confusing an unloaded lazy handle with zero search matches). -/
+def searchTrigramSst? (tbl : SstTable) (query : String) (limit : Nat := 64) : Option (Array (String × String)) :=
+  if isNonResidentLazy tbl then none else some (searchTrigramSst tbl query limit)
+
+/-- Search any `SstTable` (both resident `openSst` and on-demand `openSstLazy` via `preadByteArray`)
+    for case-insensitive substring `query`, preserving zero false negatives (`noFalseNegatives`). -/
+def searchTrigramSstIO (tbl : SstTable) (query : String) (limit : Nat := 64) : IO (SysResult (Array (String × String))) := do
+  if limit == 0 || query.isEmpty then
+    return .ok #[]
+  if !isNonResidentLazy tbl then
+    return .ok (searchTrigramSst tbl query limit)
+  let qLower := asciiLowerBytes query.toUTF8
+  let qTris := extractTrigrams query
+  if qTris.isEmpty then
+    let docPrefix := "doc:"
+    let es := tbl.entries
+    let mut lo : Nat := 0
+    let mut hi : Nat := es.size
+    while lo < hi do
+      let mid := (lo + hi) >>> 1
+      if es[mid]!.key < docPrefix then lo := mid + 1 else hi := mid
+    let mut out : Array (String × String) := #[]
+    let mut idx := lo
+    while idx < es.size && out.size < limit do
+      let e := es[idx]!
+      if !e.key.startsWith docPrefix then break
+      let .ok docBytes ← SstTable.readEntryValue tbl e | return .error .eio
+      if !LeanSys.Table.isTombstoneSlice (ByteSlice.ofByteArray docBytes) then
+        if verifyTrigramCandidate 0 0 docBytes.size.toUInt64 == 1 && containsBytesLower docBytes qLower then
+          let docId := String.fromUTF8! (e.key.toUTF8.extract 4 e.key.utf8ByteSize)
+          out := out.push (docId, String.fromUTF8? docBytes |>.getD "")
+      idx := idx + 1
+    return .ok out
+  else
+    let .ok firstPostings ← lookupTrigramPostingsIO tbl qTris[0]! | return .error .eio
+    let mut cands := firstPostings
+    for k in [1:qTris.size] do
+      if cands.isEmpty then break
+      let .ok nextPostings ← lookupTrigramPostingsIO tbl qTris[k]! | return .error .eio
+      cands := intersectSortedPostings cands nextPostings
+    let mut out : Array (String × String) := Array.mkEmpty (Nat.min cands.size limit)
+    for docId in cands do
+      if out.size >= limit then break
+      match ← SstTable.getLazyIO? tbl s!"doc:{docId}" with
+      | none => return .error .eio
+      | some docBytes =>
+        if !LeanSys.Table.isTombstoneSlice (ByteSlice.ofByteArray docBytes) then
+          if verifyTrigramCandidate qTris.size.toUInt32 qTris.size.toUInt32 docBytes.size.toUInt64 == 1 &&
+             containsBytesLower docBytes qLower then
+            out := out.push (docId, String.fromUTF8? docBytes |>.getD "")
+    return .ok out
 
 /-- Direct in-memory substring search over live `doc:<docId>` entries in a `Store.Handle` (before SST flush). -/
 def searchStoreSubstring (st : Store.Handle) (query : String) (limit : Nat := 64) : Array (String × String) := Id.run do

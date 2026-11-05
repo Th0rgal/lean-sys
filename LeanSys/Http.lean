@@ -27,10 +27,11 @@ open LeanSys.Auth
 /-- Maximum HTTP/1.1 request body size in bytes (4 MiB). -/
 @[inline] def maxHttpBodyBytes : Nat := 4194304
 
-/-- Parsed zero-copy HTTP/1.1 request over a backing `ByteArray`. -/
+/-- Parsed zero-copy HTTP/1.1 (or HTTP/1.0) request over a backing `ByteArray`. -/
 structure HttpRequest where
   method        : String
   path          : String
+  version       : String := "HTTP/1.1"
   headers       : Array (String × String)
   contentLength : Nat
   authBearer    : Option String
@@ -289,6 +290,7 @@ def parseRequestPrefix (raw : ByteArray) (expectedBearer? : Option String := non
         let req : HttpRequest := {
           method := method
           path := path
+          version := proto
           headers := headers
           contentLength := declContentLen
           authBearer := authBearer
@@ -930,7 +932,7 @@ private def isValidSecWebSocketKey (k : String) : Bool := Id.run do
     no duplicate singleton handshake headers, and offered `Sec-WebSocket-Protocol` match)
     and build the `101 Switching Protocols` wire response. -/
 def buildWebSocketUpgradeResponse? (req : HttpRequest) (protocol? : Option String := none) : Option ByteArray := do
-  if req.method != "GET" then none
+  if req.method != "GET" || req.version != "HTTP/1.1" then none
   -- Reject duplicate singleton WebSocket handshake headers
   let mut keyCount : Nat := 0
   let mut verCount : Nat := 0

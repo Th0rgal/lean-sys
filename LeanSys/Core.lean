@@ -43,6 +43,7 @@ open LeanSys.Reactor
 open LeanSys.Sandbox
 open LeanSys.Par
 
+set_option maxRecDepth 2048 in
 /-- End-to-end self-test for Wave 1 subsystems (`P0.2` Reflink + 256-bit streaming CAS, `P0.3` `AF_UNIX` HTTP/1.1,
     `P0.4` `cgroup v2` metrics + atomic child placement, `P1.5` `StepReactorSpec` + governed state, `P1.6` non-blocking
     multi-FD `Reactor` multiplexer, `P1.7` AWS SigV4 + S3 presigned URLs, `P2.8` x86_64 Zen 4/5 ISA selection,
@@ -568,17 +569,22 @@ def selfTestWave1Features (testDir : String) : IO UInt32 := do
   let .ok sStore ← indexDoc sStore "m-003" "abc" false | return 1
   let .ok sStore ← Store.put sStore "doc:m-deleted" (ByteSlice.ofByteArray tombstoneMarker) false | return 1
   let .ok searchSst ← SstTable.flushStore sStore s!"{searchDir}/index.sst" | return 1
+  let .ok searchSstLazy ← SstTable.openSstLazy s!"{searchDir}/index.sst" | return 1
   let hitsLean := searchTrigramSst searchSst "lean4" 10
   let hitsQuic := searchTrigramSst searchSst "multiplexer" 10
   let hitsShort := searchTrigramSst searchSst "ab" 10
   let hitsLen3 := searchTrigramSst searchSst "abc" 10
   let hitsTombShort := searchTrigramSst searchSst "el" 10
+  let .ok hitsLazyLean ← searchTrigramSstIO searchSstLazy "lean4" 10 | return 1
+  let .ok hitsLazyShort ← searchTrigramSstIO searchSstLazy "ab" 10 | return 1
   if hitsLean.size != 1 || hitsLean[0]!.1 != "m-001" ||
      hitsQuic.size != 1 || hitsQuic[0]!.1 != "m-002" ||
      hitsShort.size != 1 || hitsShort[0]!.1 != "m-003" ||
      hitsLen3.size != 1 || hitsLen3[0]!.1 != "m-003" ||
-     hitsTombShort.any (fun p => p.1 == "m-deleted") then
-    IO.eprintln s!"[lean-sys-core] FAIL: searchTrigramSst mismatch: {repr hitsLean} / {repr hitsQuic} / {repr hitsShort} / {repr hitsLen3} / {repr hitsTombShort}"
+     hitsTombShort.any (fun p => p.1 == "m-deleted") ||
+     (searchTrigramSst? searchSstLazy "lean4" 10).isSome ||
+     hitsLazyLean != hitsLean || hitsLazyShort != hitsShort then
+    IO.eprintln s!"[lean-sys-core] FAIL: searchTrigramSst / lazy search mismatch: {repr hitsLean} / {repr hitsLazyLean}"
     return 1
 
   -- RFC 8259 JSON escape/unescape & nested object/array traversal (`LeanSys.Codec`)
@@ -614,18 +620,21 @@ def selfTestWave1Features (testDir : String) : IO UInt32 := do
     | do IO.eprintln "[lean-sys-core] FAIL: SseEventStream.pushChunk? part 1"; return 1
   let some (_, evs2) := stSse1.pushChunk? (ByteSlice.ofByteArray (combinedSse.extract splitMid combinedSse.size))
     | do IO.eprintln "[lean-sys-core] FAIL: SseEventStream.pushChunk? part 2"; return 1
-  -- Verify BOM + standalone `\r\r` + persistent `retry:` + accumulated multi-chunk memory cap
+  -- Verify BOM + standalone `\r\r` + persistent `retry:` + maximal UTF-8 subpart replacement + accumulated cap
   let bomAndCr := ByteArray.mk #[0xEF, 0xBB, 0xBF] ++ "retry: 1500\r\rdata: ok\r\r".toUTF8
   let some (_, evsCr) := (SseEventStream.init).pushChunk? (ByteSlice.ofByteArray bomAndCr)
     | do IO.eprintln "[lean-sys-core] FAIL: SseEventStream BOM + CR-only failed"; return 1
+  -- Truncated 3-byte UTF-8 prefix `0xE2 0x82` followed by `'A'` MUST produce single U+FFFD + "A" (Unicode §3.9 D93b)
+  let lossySubpart := decodeUtf8Lossy (ByteArray.mk #[0xE2, 0x82, 0x41])
   let capped0 := SseEventStream.init 16
   let some (capped1, _) := capped0.pushChunk? (ByteSlice.ofString "data: 12345678\n")
     | do IO.eprintln "[lean-sys-core] FAIL: SseEventStream first small chunk failed"; return 1
   let cappedOverflow := capped1.pushChunk? (ByteSlice.ofString "data: 12345678\n")
   if !evs1.isEmpty || evs2 != #[sseEv] ||
      evsCr.size != 1 || evsCr[0]!.retryMs? != some 1500 || evsCr[0]!.data != "ok" ||
+     lossySubpart != "\uFFFD" ++ "A" ||
      cappedOverflow.isSome then
-    IO.eprintln s!"[lean-sys-core] FAIL: SseEventStream reassembly/cap/CR mismatch: {repr evs2} / {repr evsCr}"
+    IO.eprintln s!"[lean-sys-core] FAIL: SseEventStream reassembly/cap/CR/UTF8 mismatch: {repr evs2} / {repr evsCr} / {repr lossySubpart}"
     return 1
 
   -- RFC 6455 WebSocket handshake + masked client / unmasked server frame roundtrip (`LeanSys.WebSocket`)
@@ -657,6 +666,19 @@ def selfTestWave1Features (testDir : String) : IO UInt32 := do
   | a, b, c, d =>
     IO.eprintln s!"[lean-sys-core] FAIL: decodeFramePrefix unexpected outcomes: {a.isOk} / {b.isOk} / {c.isOk} / {d.isOk}"
     return 1
+  -- Fragmented WebSocket message reassembly (`WsMessageAssembler`): split 4-byte UTF-8 rocket across 2 frames + interleaved ping + invalid UTF-8 rejection
+  let rocketUtf8 := "🚀".toUTF8
+  let asm0 := WsMessageAssembler.init
+  let .ok (asm1, none) := asm0.pushFrame { fin := false, opcode := .text, payload := rocketUtf8.extract 0 2 }
+    | do IO.eprintln "[lean-sys-core] FAIL: WsMessageAssembler fragment 1"; return 1
+  let .ok (asm2, some (.ping, _)) := asm1.pushFrame { fin := true, opcode := .ping, payload := "p".toUTF8 }
+    | do IO.eprintln "[lean-sys-core] FAIL: WsMessageAssembler interleaved ping"; return 1
+  let .ok (_, some (.text, rocketDone)) := asm2.pushFrame { fin := true, opcode := .continuation, payload := rocketUtf8.extract 2 4 }
+    | do IO.eprintln "[lean-sys-core] FAIL: WsMessageAssembler final continuation"; return 1
+  let badFragRes := asm1.pushFrame { fin := true, opcode := .continuation, payload := ByteArray.mk #[0xFF] }
+  if rocketDone != rocketUtf8 || badFragRes.isOk then
+    IO.eprintln "[lean-sys-core] FAIL: WsMessageAssembler fragmented UTF-8 validation mismatch"
+    return 1
 
   -- Parameterized HTTP routes, query params, chunked body (with trailers) & 101 WebSocket Upgrade (`LeanSys.Http`)
   let routeHit := matchRoutePattern? "/api/missions/:id/events" "/api/missions/m-77/events?limit=20&q=hello+world%21"
@@ -668,15 +690,19 @@ def selfTestWave1Features (testDir : String) : IO UInt32 := do
   let wsUpgRaw := ("GET /api/console/ws HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\nConnection: keep-alive, Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n").toUTF8
   let wsBadNoConn := ("GET /api/console/ws HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n").toUTF8
   let wsBadKey := ("GET /api/console/ws HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: short\r\nSec-WebSocket-Version: 13\r\n\r\n").toUTF8
+  let wsHttp10 := ("GET /api/console/ws HTTP/1.0\r\nHost: localhost\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n").toUTF8
   let patchRaw := ("PATCH /api/missions/m-77 HTTP/1.1\r\nHost: localhost\r\nContent-Length: 2\r\n\r\n{}").toUTF8
   let wsUpgOk := match parseRequest wsUpgRaw none with
     | .ok r => match buildWebSocketUpgradeResponse? r with
       | some w => ((String.fromUTF8! w).splitOn "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=").length == 2
       | none => false
     | .error _ => false
-  let wsRejectOk := match parseRequest wsBadNoConn none, parseRequest wsBadKey none with
-    | .ok r1, .ok r2 => (buildWebSocketUpgradeResponse? r1).isNone && (buildWebSocketUpgradeResponse? r2).isNone
-    | _, _ => false
+  let wsRejectOk := match parseRequest wsBadNoConn none, parseRequest wsBadKey none, parseRequest wsHttp10 none with
+    | .ok r1, .ok r2, .ok r3 =>
+      (buildWebSocketUpgradeResponse? r1).isNone &&
+      (buildWebSocketUpgradeResponse? r2).isNone &&
+      (buildWebSocketUpgradeResponse? r3).isNone
+    | _, _, _ => false
   if routeHit != some #[("id", "m-77")] || routeTraversal.isSome ||
      qParams != #[("limit", "20"), ("q", "hello world!")] ||
      decodeChunkedBody? chWire != some "chunk-one-chunk-two".toUTF8 ||
