@@ -1874,4 +1874,257 @@ theorem stream_relay_keepalive_boundary_safe
     · contradiction
   · contradiction
 
+/-! ## Wave 0.B Composable Spec Blocks: Compaction, Search, RFC 6455 WS & W3C SSE -/
+
+/-- Pure LSM compaction merge winner selection: newer generation always wins;
+    when `dropTombstones` is enabled (bottom-most compaction), a winning tombstone
+    is dropped (`0`), otherwise retained (`2` = newer value, `1` = older value). -/
+@[inline, export leansys_verify_compaction_winner]
+def verifyCompactionWinner
+    (hasNewer newerIsTomb hasOlder olderIsTomb dropTombstones : UInt8) : UInt8 :=
+  if hasNewer == 1 then
+    if newerIsTomb == 1 && dropTombstones == 1 then 0 else 2
+  else if hasOlder == 1 then
+    if olderIsTomb == 1 && dropTombstones == 1 then 0 else 1
+  else 0
+
+/-- Mutant 1 of `verifyCompactionWinner`: wrongly falls through to `older` when
+    `newer` is a tombstone (classic LSM deletion resurrection bug). -/
+@[inline]
+def verifyCompactionWinnerMutantResurrect
+    (hasNewer newerIsTomb hasOlder olderIsTomb dropTombstones : UInt8) : UInt8 :=
+  if hasNewer == 1 && !(newerIsTomb == 1 && dropTombstones == 1) then 2
+  else if hasOlder == 1 && !(olderIsTomb == 1 && dropTombstones == 1) then 1
+  else 0
+
+/-- Compaction merge check parameters (≤ 3 fields via tuple packing). -/
+structure CompactionWinnerCheck where
+  newerFlags : UInt8 × UInt8
+  olderFlags : UInt8 × UInt8
+  dropFlag   : UInt8
+  deriving Repr, DecidableEq
+
+@[inline]
+def compactionNoTombstoneResurrection (c : CompactionWinnerCheck) : Bool :=
+  if c.newerFlags.1 == 1 && c.newerFlags.2 == 1 && c.dropFlag == 1 then
+    verifyCompactionWinner c.newerFlags.1 c.newerFlags.2
+      c.olderFlags.1 c.olderFlags.2 c.dropFlag == 0
+  else true
+
+/-- Layer II Bundle 43: LSM compaction merge tombstone-masking safety gate. -/
+def compactionWinnerMetaSpec : MetaGateSpec Unit CompactionWinnerCheck where
+  inv _ := True
+  gate _ c :=
+    verifyCompactionWinner c.newerFlags.1 c.newerFlags.2
+      c.olderFlags.1 c.olderFlags.2 c.dropFlag == 0
+  step _ _ := ()
+  safe _ c :=
+    !(c.newerFlags.1 == 1 && c.newerFlags.2 == 1 && c.dropFlag == 1) ||
+      verifyCompactionWinner c.newerFlags.1 c.newerFlags.2
+        c.olderFlags.1 c.olderFlags.2 c.dropFlag == 0
+  preserves_inv _ _ _ h := h
+  ensures_safe _ c h := by simp [h]
+
+/-- Corollary 45: Newer-generation deletion tombstones strictly mask older SST
+    entries even during bottom-most compaction (`dropTombstones == 1`). -/
+theorem compaction_newer_tombstone_masks_older
+    (olderPresent olderTomb : UInt8) :
+    verifyCompactionWinner 1 1 olderPresent olderTomb 1 = 0 :=
+  rfl
+
+/-- Theorem 46 (Mutant Kill #1): `verifyCompactionWinner` kills the LSM
+    tombstone-resurrection mutant (`hasNewer=1, newerIsTomb=1, hasOlder=1`). -/
+theorem compaction_kills_resurrection_mutant :
+    verifyCompactionWinner 1 1 1 0 1 ≠
+      verifyCompactionWinnerMutantResurrect 1 1 1 0 1 := by
+  decide
+
+/-- Pure inverted-trigram posting intersection predicate: if every trigram of
+    `queryTrigrams` is present in `docTrigrams`, `docId` is retained. -/
+@[inline, export leansys_verify_trigram_candidate]
+def verifyTrigramCandidate
+    (queryTriCount matchedTriCount : UInt32) (docLen : UInt64) : UInt8 :=
+  if queryTriCount == 0 then
+    if docLen > 0 then 1 else 0
+  else if matchedTriCount == queryTriCount && docLen ≥ 3 then 1 else 0
+
+/-- Mutant 2 of `verifyTrigramCandidate`: off-by-one `docLen > 3` drops exact
+    3-byte ASCII document matches. -/
+@[inline]
+def verifyTrigramCandidateMutantLen3
+    (queryTriCount matchedTriCount : UInt32) (docLen : UInt64) : UInt8 :=
+  if queryTriCount == 0 then
+    if docLen > 0 then 1 else 0
+  else if matchedTriCount == queryTriCount && docLen > 3 then 1 else 0
+
+/-- Trigram candidate check parameters (≤ 3 fields). -/
+structure TrigramCandidateCheck where
+  queryTriCount   : UInt32
+  matchedTriCount : UInt32
+  docLen          : UInt64
+  deriving Repr, DecidableEq
+
+@[inline]
+def trigramCandidateSafe (c : TrigramCandidateCheck) : Bool :=
+  if c.queryTriCount == 0 then c.docLen > 0
+  else c.matchedTriCount == c.queryTriCount && c.docLen ≥ 3
+
+/-- Layer II Bundle 43b: Trigram candidate posting-intersection safety gate. -/
+def trigramCandidateMetaSpec : MetaGateSpec Unit TrigramCandidateCheck where
+  inv _ := True
+  gate _ c := verifyTrigramCandidate c.queryTriCount c.matchedTriCount c.docLen == 1
+  step _ _ := ()
+  safe _ c := trigramCandidateSafe c
+  preserves_inv _ _ _ h := h
+  ensures_safe _ c h := by
+    unfold verifyTrigramCandidate at h
+    unfold trigramCandidateSafe
+    split at h <;> split at h <;> simp_all
+
+/-- Corollary 47: `verifyTrigramCandidate` rejects insufficient trigram matches
+    or sub-3-byte documents when `queryTriCount > 0`. -/
+theorem trigram_candidate_no_false_negative (c : TrigramCandidateCheck)
+    (h_bad : trigramCandidateSafe c = false) :
+    (verifyTrigramCandidate c.queryTriCount c.matchedTriCount c.docLen == 1) = false :=
+  trigramCandidateMetaSpec.rejects_unsafe () c h_bad
+
+/-- Theorem 48 (Mutant Kill #2): `verifyTrigramCandidate` kills the 3-character
+    document boundary mutant. -/
+theorem trigram_kills_len3_mutant :
+    verifyTrigramCandidate 1 1 3 ≠ verifyTrigramCandidateMutantLen3 1 1 3 := by
+  decide
+
+/-- Pure RFC 6455 WebSocket frame header & role-masking admission gate (`0` C LOC):
+    - `rsvBits == 0` (no unnegotiated RSV1/2/3 extensions)
+    - Valid opcode: `0x0`, `0x1`, `0x2`, `0x8`, `0x9`, `0xA`
+    - Control frames (`opcode ≥ 0x8`) require `fin == 1` and `payloadLen ≤ 125`
+    - Client frames (`expectMasked == 1`) require `masked == 1`; server `masked == 0`
+    - Total frame size `headerLen + payloadLen ≤ maxFrameBytes` (`≤ 16 MiB`). -/
+@[inline, export leansys_verify_ws_frame_header]
+def verifyWsFrameHeader (fin rsvBits opcode masked expectMasked : UInt8)
+    (headerLen payloadLen maxFrameBytes : UInt64) : UInt8 :=
+  let validOpcode : Bool :=
+    opcode == 0 || opcode == 1 || opcode == 2 ||
+    opcode == 8 || opcode == 9 || opcode == 10
+  let isControl : Bool := opcode >= 8
+  let controlOk : Bool := !isControl || (fin == 1 && payloadLen ≤ 125)
+  let maskOk : Bool :=
+    (masked == 1) == (expectMasked == 1) && (masked == 0 || masked == 1)
+  let sizeOk : Bool :=
+    headerLen ≥ 2 && headerLen ≤ 14 && maxFrameBytes ≤ 16777216 &&
+    payloadLen ≤ maxFrameBytes && headerLen ≤ maxFrameBytes - payloadLen
+  if rsvBits == 0 && (fin == 0 || fin == 1) &&
+     validOpcode && controlOk && maskOk && sizeOk then 1 else 0
+
+/-- Mutant 3 of `verifyWsFrameHeader`: accepts fragmented or oversized (> 125 B)
+    control frames (`ping` / `close`). -/
+@[inline]
+def verifyWsFrameHeaderMutantControl (fin rsvBits opcode masked expectMasked : UInt8)
+    (headerLen payloadLen maxFrameBytes : UInt64) : UInt8 :=
+  let validOpcode : Bool :=
+    opcode == 0 || opcode == 1 || opcode == 2 ||
+    opcode == 8 || opcode == 9 || opcode == 10
+  let maskOk : Bool :=
+    (masked == 1) == (expectMasked == 1) && (masked == 0 || masked == 1)
+  let sizeOk : Bool :=
+    headerLen ≥ 2 && headerLen ≤ 14 && maxFrameBytes ≤ 16777216 &&
+    payloadLen ≤ maxFrameBytes && headerLen ≤ maxFrameBytes - payloadLen
+  if rsvBits == 0 && (fin == 0 || fin == 1) &&
+     validOpcode && maskOk && sizeOk then 1 else 0
+
+/-- WebSocket frame check parameters (≤ 3 fields via tuple packing). -/
+structure WsFrameCheck where
+  flags   : UInt8 × UInt8 × UInt8
+  maskCfg : UInt8 × UInt8
+  lengths : UInt64 × UInt64 × UInt64
+  deriving Repr, DecidableEq
+
+@[inline]
+def wsFrameSafe (w : WsFrameCheck) : Bool :=
+  let fin := w.flags.1
+  let rsv := w.flags.2.1
+  let op := w.flags.2.2
+  let m := w.maskCfg.1
+  let em := w.maskCfg.2
+  let hl := w.lengths.1
+  let pl := w.lengths.2.1
+  let cap := w.lengths.2.2
+  rsv == 0 && (fin == 0 || fin == 1) &&
+  (op == 0 || op == 1 || op == 2 || op == 8 || op == 9 || op == 10) &&
+  (!(op >= 8) || (fin == 1 && pl ≤ 125)) &&
+  ((m == 1) == (em == 1) && (m == 0 || m == 1)) &&
+  (hl ≥ 2 && hl ≤ 14 && cap ≤ 16777216 && pl ≤ cap && hl ≤ cap - pl)
+
+/-- Layer II Bundle 44: RFC 6455 WebSocket frame & masking role safety gate. -/
+def wsFrameMetaSpec : MetaGateSpec Unit WsFrameCheck where
+  inv _ := True
+  gate _ w :=
+    verifyWsFrameHeader w.flags.1 w.flags.2.1 w.flags.2.2
+      w.maskCfg.1 w.maskCfg.2 w.lengths.1 w.lengths.2.1 w.lengths.2.2 == 1
+  step _ _ := ()
+  safe _ w := wsFrameSafe w
+  preserves_inv _ _ _ h := h
+  ensures_safe _ w h := by
+    unfold verifyWsFrameHeader at h
+    unfold wsFrameSafe
+    dsimp only at h ⊢
+    split at h
+    · assumption
+    · contradiction
+
+/-- Corollary 49: `verifyWsFrameHeader` rejects unmasked client frames, masked
+    server frames, non-zero RSV bits, invalid control frames, or overflows. -/
+theorem ws_frame_rejects_invalid_or_unmasked (w : WsFrameCheck)
+    (h_bad : wsFrameSafe w = false) :
+    (verifyWsFrameHeader w.flags.1 w.flags.2.1 w.flags.2.2
+      w.maskCfg.1 w.maskCfg.2 w.lengths.1 w.lengths.2.1 w.lengths.2.2 == 1) = false :=
+  wsFrameMetaSpec.rejects_unsafe () w h_bad
+
+/-- Theorem 50 (Mutant Kill #3): `verifyWsFrameHeader` kills the oversized
+    RFC 6455 control-frame mutant (`opcode = 9` Ping with `payloadLen = 200`). -/
+theorem ws_frame_kills_control_len_mutant :
+    verifyWsFrameHeader 1 0 9 1 1 6 200 4096 ≠
+      verifyWsFrameHeaderMutantControl 1 0 9 1 1 6 200 4096 := by
+  decide
+
+/-- Pure W3C Server-Sent Events (SSE) outgoing event frame bounds & CR/LF gate:
+    rejects bare `\r` or `\n` inside `event` or `id` headers (`noHeaderCrLf == 1`)
+    and bounds total serialized chunk size `≤ maxChunkBytes`. -/
+@[inline, export leansys_verify_sse_event_encode]
+def verifySseEventEncode
+    (noHeaderCrLf : UInt8) (dataLines : UInt32) (encodedBytes maxChunkBytes : UInt64) : UInt8 :=
+  if noHeaderCrLf == 1 && dataLines ≥ 1 && maxChunkBytes ≤ 16777216 &&
+     encodedBytes ≥ 2 && encodedBytes ≤ maxChunkBytes then 1 else 0
+
+/-- SSE outgoing event check parameters (≤ 3 fields via tuple packing). -/
+structure SseEventEncodeCheck where
+  noHeaderCrLf : UInt8
+  dataLines    : UInt32
+  sizes        : UInt64 × UInt64
+  deriving Repr, DecidableEq
+
+@[inline]
+def sseEventEncodeSafe (e : SseEventEncodeCheck) : Bool :=
+  e.noHeaderCrLf == 1 && e.dataLines ≥ 1 && e.sizes.2 ≤ 16777216 &&
+  e.sizes.1 ≥ 2 && e.sizes.1 ≤ e.sizes.2
+
+/-- Layer II Bundle 45: W3C SSE outgoing event CR/LF & chunk-bounds safety gate. -/
+def sseEventEncodeMetaSpec : MetaGateSpec Unit SseEventEncodeCheck where
+  inv _ := True
+  gate _ e :=
+    verifySseEventEncode e.noHeaderCrLf e.dataLines e.sizes.1 e.sizes.2 == 1
+  step _ _ := ()
+  safe _ e := sseEventEncodeSafe e
+  preserves_inv _ _ _ h := h
+  ensures_safe _ e h := by
+    unfold verifySseEventEncode at h; unfold sseEventEncodeSafe
+    split at h <;> simp_all
+
+/-- Corollary 51: `verifySseEventEncode` rejects CR/LF header injection, empty
+    `dataLines`, or chunks exceeding `maxChunkBytes`. -/
+theorem sse_event_encode_rejects_crlf_injection (e : SseEventEncodeCheck)
+    (h_bad : sseEventEncodeSafe e = false) :
+    (verifySseEventEncode e.noHeaderCrLf e.dataLines e.sizes.1 e.sizes.2 == 1) = false :=
+  sseEventEncodeMetaSpec.rejects_unsafe () e h_bad
+
 end LeanSys.Spec

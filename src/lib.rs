@@ -308,6 +308,38 @@ extern "C" {
         pending_tx_bytes: u64,
         max_buffer_bytes: u64,
     ) -> u8;
+
+    pub fn leansys_verify_compaction_winner(
+        has_newer: u8,
+        newer_is_tomb: u8,
+        has_older: u8,
+        older_is_tomb: u8,
+        drop_tombstones: u8,
+    ) -> u8;
+
+    pub fn leansys_verify_trigram_candidate(
+        query_tri_count: u32,
+        matched_tri_count: u32,
+        doc_len: u64,
+    ) -> u8;
+
+    pub fn leansys_verify_ws_frame_header(
+        fin: u8,
+        rsv_bits: u8,
+        opcode: u8,
+        masked: u8,
+        expect_masked: u8,
+        header_len: u64,
+        payload_len: u64,
+        max_frame_bytes: u64,
+    ) -> u8;
+
+    pub fn leansys_verify_sse_event_encode(
+        no_header_crlf: u8,
+        data_lines: u32,
+        encoded_bytes: u64,
+        max_chunk_bytes: u64,
+    ) -> u8;
 }
 
 pub const WAL_MAGIC: u32 = 0x4C53_5953;
@@ -1043,6 +1075,72 @@ pub fn verify_stream_relay(
     }
 }
 
+#[inline]
+pub fn verify_compaction_winner(
+    has_newer: bool,
+    newer_is_tomb: bool,
+    has_older: bool,
+    older_is_tomb: bool,
+    drop_tombstones: bool,
+) -> u8 {
+    unsafe {
+        leansys_verify_compaction_winner(
+            u8::from(has_newer),
+            u8::from(newer_is_tomb),
+            u8::from(has_older),
+            u8::from(older_is_tomb),
+            u8::from(drop_tombstones),
+        )
+    }
+}
+
+#[inline]
+pub fn verify_trigram_candidate(query_tri_count: u32, matched_tri_count: u32, doc_len: u64) -> bool {
+    unsafe { leansys_verify_trigram_candidate(query_tri_count, matched_tri_count, doc_len) == 1 }
+}
+
+#[inline]
+pub fn verify_ws_frame_header(
+    fin: bool,
+    rsv_bits: u8,
+    opcode: u8,
+    masked: bool,
+    expect_masked: bool,
+    header_len: u64,
+    payload_len: u64,
+    max_frame_bytes: u64,
+) -> bool {
+    unsafe {
+        leansys_verify_ws_frame_header(
+            u8::from(fin),
+            rsv_bits,
+            opcode,
+            u8::from(masked),
+            u8::from(expect_masked),
+            header_len,
+            payload_len,
+            max_frame_bytes,
+        ) == 1
+    }
+}
+
+#[inline]
+pub fn verify_sse_event_encode(
+    no_header_crlf: bool,
+    data_lines: u32,
+    encoded_bytes: u64,
+    max_chunk_bytes: u64,
+) -> bool {
+    unsafe {
+        leansys_verify_sse_event_encode(
+            u8::from(no_header_crlf),
+            data_lines,
+            encoded_bytes,
+            max_chunk_bytes,
+        ) == 1
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1392,5 +1490,20 @@ mod tests {
             ),
             StreamRelayVerdict::Abort
         );
+
+        // Wave 0.B compaction, trigram, WebSocket frame, and SSE encode gates
+        assert_eq!(verify_compaction_winner(true, true, true, false, true), 0);
+        assert_eq!(verify_compaction_winner(true, false, true, false, true), 2);
+        assert_eq!(verify_compaction_winner(false, false, true, false, true), 1);
+
+        assert!(verify_trigram_candidate(2, 2, 3));
+        assert!(!verify_trigram_candidate(2, 1, 3));
+
+        assert!(verify_ws_frame_header(true, 0, 1, true, true, 6, 128, 4096));
+        assert!(!verify_ws_frame_header(true, 0, 1, false, true, 2, 128, 4096));
+        assert!(!verify_ws_frame_header(true, 0, 9, true, true, 6, 200, 4096));
+
+        assert!(verify_sse_event_encode(true, 2, 24, 4096));
+        assert!(!verify_sse_event_encode(false, 2, 24, 4096));
     }
 }

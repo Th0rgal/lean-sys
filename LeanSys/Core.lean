@@ -11,9 +11,12 @@ import LeanSys.Store
 import LeanSys.Mmap
 import LeanSys.Lsm
 import LeanSys.Table
+import LeanSys.Search
 import LeanSys.Auth
 import LeanSys.ProcLog
 import LeanSys.JsonRpc
+import LeanSys.Sse
+import LeanSys.WebSocket
 import LeanSys.Http
 import LeanSys.Reactor
 import LeanSys.Sandbox
@@ -29,14 +32,18 @@ open LeanSys.Store
 open LeanSys.Mmap
 open LeanSys.Lsm
 open LeanSys.Table
+open LeanSys.Search
 open LeanSys.Auth
 open LeanSys.ProcLog
 open LeanSys.JsonRpc
+open LeanSys.Sse
+open LeanSys.WebSocket
 open LeanSys.Http
 open LeanSys.Reactor
 open LeanSys.Sandbox
 open LeanSys.Par
 
+set_option maxRecDepth 2048 in
 /-- End-to-end self-test for Wave 1 subsystems (`P0.2` Reflink + 256-bit streaming CAS, `P0.3` `AF_UNIX` HTTP/1.1,
     `P0.4` `cgroup v2` metrics + atomic child placement, `P1.5` `StepReactorSpec` + governed state, `P1.6` non-blocking
     multi-FD `Reactor` multiplexer, `P1.7` AWS SigV4 + S3 presigned URLs, `P2.8` x86_64 Zen 4/5 ISA selection,
@@ -520,6 +527,207 @@ def selfTestWave1Features (testDir : String) : IO UInt32 := do
       return 1
   | none =>
     IO.eprintln "[lean-sys-core] FAIL: relayHttpStream disconnect test returned none"
+    return 1
+
+  -- 10. Wave 0.B: Multi-SST Compaction (`mergeTables` / `compactLevels` no-resurrection),
+  --     Pure-Lean Trigram Search (`Search.lean`), RFC 8259 JSON Escape/Unescape & Nested Traversal,
+  --     W3C SSE (`Sse.lean`), RFC 6455 WebSocket (`WebSocket.lean`), and Route/Query/Chunked HTTP Helpers!
+  let lsmDir := s!"{testDir}/w0b-lsm"
+  let .ok gen0 ← openStore s!"{lsmDir}/g0" | return 1
+  let .ok gen0 ← Store.putString gen0 "alpha" "v0-alpha" false | return 1
+  let .ok gen0 ← Store.putString gen0 "beta" "v0-beta" false | return 1
+  let .ok _sst0 ← SstTable.flushStore gen0 s!"{lsmDir}/l0.sst" | return 1
+
+  let .ok gen1 ← openStore s!"{lsmDir}/g1" | return 1
+  -- Delete "alpha" with explicit tombstone in gen1, update "beta", add "gamma"
+  let .ok gen1 ← Store.put gen1 "alpha" (ByteSlice.ofByteArray tombstoneMarker) false | return 1
+  let .ok gen1 ← Store.putString gen1 "beta" "v1-beta" false | return 1
+  let .ok gen1 ← Store.putString gen1 "gamma" "v1-gamma" false | return 1
+  let .ok _sst1 ← SstTable.flushStore gen1 s!"{lsmDir}/l1.sst" | return 1
+
+  let .ok gen2 ← openStore s!"{lsmDir}/g2" | return 1
+  let .ok gen2 ← Store.putString gen2 "delta" "v2-delta" false | return 1
+  let .ok sst2 ← SstTable.flushStore gen2 s!"{lsmDir}/l2.sst" | return 1
+
+  -- Open `l0.sst` and `l1.sst` lazily (`rawBuf.isEmpty`) to verify lazy SST compaction reads values from disk!
+  let .ok sst0Lazy ← SstTable.openSstLazy s!"{lsmDir}/l0.sst" | return 1
+  let .ok sst1Lazy ← SstTable.openSstLazy s!"{lsmDir}/l1.sst" | return 1
+  let .ok compacted ← SstTable.compactLevels #[sst0Lazy, sst1Lazy, sst2] s!"{lsmDir}/compacted.sst" true
+    | do IO.eprintln "[lean-sys-core] FAIL: SstTable.compactLevels"; return 1
+  if (SstTable.getString? compacted "alpha").isSome ||
+     SstTable.getString? compacted "beta" != some "v1-beta" ||
+     SstTable.getString? compacted "gamma" != some "v1-gamma" ||
+     SstTable.getString? compacted "delta" != some "v2-delta" then
+    IO.eprintln "[lean-sys-core] FAIL: compactLevels tombstone masking or newer-wins violated!"
+    return 1
+
+  -- Trigram search (`LeanSys.Search`), including tombstone exclusion on short 1..2 byte queries ("del" / "el")
+  let searchDir := s!"{testDir}/w0b-search"
+  let .ok sStore ← openStore searchDir | return 1
+  let .ok sStore ← indexDoc sStore "m-001" "Refactor Orb control plane to native Lean4" false | return 1
+  let .ok sStore ← indexDoc sStore "m-002" "QUIC RFC 9000 stream multiplexer and HTTP/3 QPACK" false | return 1
+  let .ok sStore ← indexDoc sStore "m-003" "abc" false | return 1
+  let .ok sStore ← Store.put sStore "doc:m-deleted" (ByteSlice.ofByteArray tombstoneMarker) false | return 1
+  let .ok searchSst ← SstTable.flushStore sStore s!"{searchDir}/index.sst" | return 1
+  let .ok searchSstLazy ← SstTable.openSstLazy s!"{searchDir}/index.sst" | return 1
+  let hitsLean := searchTrigramSst searchSst "lean4" 10
+  let hitsQuic := searchTrigramSst searchSst "multiplexer" 10
+  let hitsShort := searchTrigramSst searchSst "ab" 10
+  let hitsLen3 := searchTrigramSst searchSst "abc" 10
+  let hitsTombShort := searchTrigramSst searchSst "el" 10
+  let .ok hitsLazyLean ← searchTrigramSstIO searchSstLazy "lean4" 10 | return 1
+  let .ok hitsLazyShort ← searchTrigramSstIO searchSstLazy "ab" 10 | return 1
+  -- Compact searchSst with `dropTombstones := true` after tombstoning `doc:m-002` (leaving `tri:` postings for "QUIC")
+  -- and verify lazy search skips the absent `doc:m-002` cleanly instead of failing with `.error .eio`!
+  let .ok sTombStore ← openStore s!"{searchDir}/tomb" | return 1
+  let .ok sTombStore ← Store.put sTombStore "doc:m-002" (ByteSlice.ofByteArray tombstoneMarker) false | return 1
+  let .ok tombSst ← SstTable.flushStore sTombStore s!"{searchDir}/tomb.sst" | return 1
+  let .ok compactedSearchSst ← SstTable.compactLevels #[searchSst, tombSst] s!"{searchDir}/compacted_search.sst" true | return 1
+  let _ := compactedSearchSst
+  let .ok compactedSearchLazy ← SstTable.openSstLazy s!"{searchDir}/compacted_search.sst" | return 1
+  let .ok hitsAfterCompactQuic ← searchTrigramSstIO compactedSearchLazy "multiplexer" 10 | return 1
+  let .ok hitsAfterCompactLean ← searchTrigramSstIO compactedSearchLazy "lean4" 10 | return 1
+  if hitsLean.size != 1 || hitsLean[0]!.1 != "m-001" ||
+     hitsQuic.size != 1 || hitsQuic[0]!.1 != "m-002" ||
+     hitsShort.size != 1 || hitsShort[0]!.1 != "m-003" ||
+     hitsLen3.size != 1 || hitsLen3[0]!.1 != "m-003" ||
+     hitsTombShort.any (fun p => p.1 == "m-deleted") ||
+     (searchTrigramSst? searchSstLazy "lean4" 10).isSome ||
+     hitsLazyLean != hitsLean || hitsLazyShort != hitsShort ||
+     !hitsAfterCompactQuic.isEmpty || hitsAfterCompactLean != hitsLean then
+    IO.eprintln s!"[lean-sys-core] FAIL: searchTrigramSst / lazy search mismatch: {repr hitsLean} / {repr hitsLazyLean}"
+    return 1
+
+  -- RFC 8259 JSON escape/unescape & nested object/array traversal (`LeanSys.Codec`)
+  let nestedRaw := "{\"msg\":\"line1\\n\\\"quoted\\\"\\u0021\\uD83D\\uDE80\",\"meta\":{\"ok\":true,\"count\":7},\"items\":[\"x\",{\"k\":9},42]}"
+  let rootTape := JsonTape.indexJsonObject (ByteSlice.ofString nestedRaw)
+  let unescMsg? := JsonTape.lookupStringUnescaped? rootTape "msg"
+  let subObj? := JsonTape.lookupObjectTape? rootTape "meta"
+  let itemsArr := match JsonTape.lookupSlice? rootTape "items" with
+    | some (sl, false) => scanJsonArraySlices sl
+    | _ => #[]
+  let roundTripStr := "tab\there\n\"slash\\end"
+  if unescMsg? != some "line1\n\"quoted\"!🚀" ||
+     (subObj?.bind (fun t => JsonTape.lookupNat? t "count")) != some 7 ||
+     itemsArr.size != 3 || !itemsArr[0]!.2 || itemsArr[1]!.2 ||
+     unescapeJsonString? (escapeJsonString roundTripStr) != some roundTripStr ||
+     (unescapeJsonString? "raw\nnewline").isSome ||
+     (unescapeJsonString? "raw\"quote").isSome then
+    IO.eprintln s!"[lean-sys-core] FAIL: RFC 8259 JSON unescape/nested traversal mismatch: {repr unescMsg?}"
+    return 1
+
+  -- W3C SSE encode + multi-chunk accumulator + CR-only/BOM/retry persistence & cap (`LeanSys.Sse`)
+  let sseEv : SseEvent := { event := "delta", id? := some "42", data := "first line\nsecond: line" }
+  let some sseWire := formatSseEvent? sseEv
+    | do IO.eprintln "[lean-sys-core] FAIL: formatSseEvent? valid event"; return 1
+  -- CR/LF header injection MUST fail closed (`none`)
+  if (formatSseEvent? { event := "bad\nevent", data := "x" }).isSome then
+    IO.eprintln "[lean-sys-core] FAIL: formatSseEvent? accepted CR/LF injection!"
+    return 1
+  let combinedSse := formatSseKeepalive "ping" ++ sseWire
+  let splitMid := combinedSse.size / 2
+  let stSse0 := SseEventStream.init
+  let some (stSse1, evs1) := stSse0.pushChunk? (ByteSlice.ofByteArray (combinedSse.extract 0 splitMid))
+    | do IO.eprintln "[lean-sys-core] FAIL: SseEventStream.pushChunk? part 1"; return 1
+  let some (_, evs2) := stSse1.pushChunk? (ByteSlice.ofByteArray (combinedSse.extract splitMid combinedSse.size))
+    | do IO.eprintln "[lean-sys-core] FAIL: SseEventStream.pushChunk? part 2"; return 1
+  -- Verify BOM + standalone `\r\r` + persistent `retry:` + maximal UTF-8 subpart replacement + accumulated cap
+  let bomAndCr := ByteArray.mk #[0xEF, 0xBB, 0xBF] ++ "retry: 1500\r\rdata: ok\r\r".toUTF8
+  let some (_, evsCr) := (SseEventStream.init).pushChunk? (ByteSlice.ofByteArray bomAndCr)
+    | do IO.eprintln "[lean-sys-core] FAIL: SseEventStream BOM + CR-only failed"; return 1
+  -- Truncated 3-byte UTF-8 prefix `0xE2 0x82` followed by `'A'` MUST produce single U+FFFD + "A" (Unicode §3.9 D93b)
+  let lossySubpart := decodeUtf8Lossy (ByteArray.mk #[0xE2, 0x82, 0x41])
+  let capped0 := SseEventStream.init 16
+  let some (capped1, _) := capped0.pushChunk? (ByteSlice.ofString "data: 12345678\n")
+    | do IO.eprintln "[lean-sys-core] FAIL: SseEventStream first small chunk failed"; return 1
+  -- Completing event 1 (`\n`) and starting event 2 (`data: x\n\n`) in one chunk MUST succeed under cap 16!
+  let some (_, cappedDispatchAndNext) := capped1.pushChunk? (ByteSlice.ofString "\ndata: x\n\n")
+    | do IO.eprintln "[lean-sys-core] FAIL: SseEventStream chunk boundary across dispatch rejected!"; return 1
+  let cappedOverflow := capped1.pushChunk? (ByteSlice.ofString "data: 12345678\n")
+  -- Combined `event:` + `data:` retained size must also be gated before dispatch (8 + 9 > 16 -> `none`)
+  let cappedCombinedEvData := (SseEventStream.init 16).pushChunk? (ByteSlice.ofString "event: 12345678\ndata: 12345678\n\n")
+  if !evs1.isEmpty || evs2 != #[sseEv] ||
+     evsCr.size != 1 || evsCr[0]!.retryMs? != some 1500 || evsCr[0]!.data != "ok" ||
+     lossySubpart != "\uFFFD" ++ "A" ||
+     cappedDispatchAndNext.size != 2 ||
+     cappedOverflow.isSome ||
+     cappedCombinedEvData.isSome then
+    IO.eprintln s!"[lean-sys-core] FAIL: SseEventStream reassembly/cap/CR/UTF8 mismatch: {repr evs2} / {repr evsCr} / {repr lossySubpart}"
+    return 1
+
+  -- RFC 6455 WebSocket handshake + masked client / unmasked server frame roundtrip (`LeanSys.WebSocket`)
+  if computeAcceptKey "dGhlIHNhbXBsZSBub25jZQ==" != "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=" then
+    IO.eprintln "[lean-sys-core] FAIL: RFC 6455 computeAcceptKey vector mismatch"
+    return 1
+  let mask4 := ByteArray.mk #[0x37, 0xFA, 0x21, 0x3D]
+  let clientPayload := (String.ofList (List.replicate 300 'W')).toUTF8
+  let some clientWire := encodeFrame? { fin := true, opcode := .text, payload := clientPayload } (some mask4)
+    | do IO.eprintln "[lean-sys-core] FAIL: encodeFrame? masked 16-bit extended frame"; return 1
+  -- Server rejecting unmasked client frame, oversized (>125 B) Ping, reserved 1005 close, 1-byte close, and invalid UTF-8 text
+  let some serverWire := encodeFrame? { fin := true, opcode := .binary, payload := "srv".toUTF8 } none
+    | do IO.eprintln "[lean-sys-core] FAIL: encodeFrame? server frame"; return 1
+  if (encodeFrame? { fin := true, opcode := .ping, payload := clientPayload } (some mask4)).isSome ||
+     (makeServerClose? 1005).isSome ||
+     (decodeFramePrefix (ByteArray.mk #[0x88, 0x01, 0x00]) false).isOk ||
+     (decodeFramePrefix (ByteArray.mk #[0x81, 0x01, 0xFF]) false).isOk then
+    IO.eprintln "[lean-sys-core] FAIL: WebSocket frame validation allowed prohibited close/UTF-8/ping payload!"
+    return 1
+  match decodeFramePrefix (clientWire.extract 0 5) true,
+        decodeFramePrefix clientWire true,
+        decodeFramePrefix serverWire true,
+        decodeFramePrefix serverWire false with
+  | .ok none, .ok (some (decCli, usedCli)), .error "ws_mask_role_violation", .ok (some (decSrv, _)) =>
+    if usedCli != clientWire.size || decCli.payload != clientPayload || decCli.opcode != .text ||
+       decSrv.payload != "srv".toUTF8 then
+      IO.eprintln "[lean-sys-core] FAIL: decodeFramePrefix payload mismatch"
+      return 1
+  | a, b, c, d =>
+    IO.eprintln s!"[lean-sys-core] FAIL: decodeFramePrefix unexpected outcomes: {a.isOk} / {b.isOk} / {c.isOk} / {d.isOk}"
+    return 1
+  -- Fragmented WebSocket message reassembly (`WsMessageAssembler`): split 4-byte UTF-8 rocket across 2 frames + interleaved ping + invalid UTF-8 rejection
+  let rocketUtf8 := "🚀".toUTF8
+  let asm0 := WsMessageAssembler.init
+  let .ok (asm1, none) := asm0.pushFrame { fin := false, opcode := .text, payload := rocketUtf8.extract 0 2 }
+    | do IO.eprintln "[lean-sys-core] FAIL: WsMessageAssembler fragment 1"; return 1
+  let .ok (asm2, some (.ping, _)) := asm1.pushFrame { fin := true, opcode := .ping, payload := "p".toUTF8 }
+    | do IO.eprintln "[lean-sys-core] FAIL: WsMessageAssembler interleaved ping"; return 1
+  let .ok (_, some (.text, rocketDone)) := asm2.pushFrame { fin := true, opcode := .continuation, payload := rocketUtf8.extract 2 4 }
+    | do IO.eprintln "[lean-sys-core] FAIL: WsMessageAssembler final continuation"; return 1
+  let badFragRes := asm1.pushFrame { fin := true, opcode := .continuation, payload := ByteArray.mk #[0xFF] }
+  if rocketDone != rocketUtf8 || badFragRes.isOk then
+    IO.eprintln "[lean-sys-core] FAIL: WsMessageAssembler fragmented UTF-8 validation mismatch"
+    return 1
+
+  -- Parameterized HTTP routes, query params, chunked body (with trailers) & 101 WebSocket Upgrade (`LeanSys.Http`)
+  let routeHit := matchRoutePattern? "/api/missions/:id/events" "/api/missions/m-77/events?limit=20&q=hello+world%21"
+  let routeTraversal := matchRoutePattern? "/api/files/:name" "/api/files/.."
+  let qParams := parseQueryParams "/api/missions/m-77/events?limit=20&q=hello+world%21"
+  let qRawQuestion := parseQueryParams "q=what?ever&limit=2"
+  let chWire := encodeHttpChunk (ByteSlice.ofString "chunk-one-") ++
+                encodeHttpChunk (ByteSlice.ofString "chunk-two") ++
+                "0\r\nX-Checksum: ok\r\n\r\n".toUTF8
+  let wsUpgRaw := ("GET /api/console/ws HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\nConnection: keep-alive, Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n").toUTF8
+  let wsBadNoConn := ("GET /api/console/ws HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n").toUTF8
+  let wsBadKey := ("GET /api/console/ws HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: short\r\nSec-WebSocket-Version: 13\r\n\r\n").toUTF8
+  let wsHttp10 := ("GET /api/console/ws HTTP/1.0\r\nHost: localhost\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n").toUTF8
+  let patchRaw := ("PATCH /api/missions/m-77 HTTP/1.1\r\nHost: localhost\r\nContent-Length: 2\r\n\r\n{}").toUTF8
+  let wsUpgOk := match parseRequest wsUpgRaw none with
+    | .ok r => match buildWebSocketUpgradeResponse? r with
+      | some w => ((String.fromUTF8! w).splitOn "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=").length == 2
+      | none => false
+    | .error _ => false
+  let wsRejectOk := match parseRequest wsBadNoConn none, parseRequest wsBadKey none, parseRequest wsHttp10 none with
+    | .ok r1, .ok r2, .ok r3 =>
+      (buildWebSocketUpgradeResponse? r1).isNone &&
+      (buildWebSocketUpgradeResponse? r2).isNone &&
+      (buildWebSocketUpgradeResponse? r3).isNone
+    | _, _, _ => false
+  if routeHit != some #[("id", "m-77")] || routeTraversal.isSome ||
+     qParams != #[("limit", "20"), ("q", "hello world!")] ||
+     qRawQuestion != #[("q", "what?ever"), ("limit", "2")] ||
+     decodeChunkedBody? chWire != some "chunk-one-chunk-two".toUTF8 ||
+     !wsUpgOk || !wsRejectOk || (parseRequest patchRaw none).toOption.isNone then
+    IO.eprintln "[lean-sys-core] FAIL: HTTP route/query/chunked/WS-upgrade/PATCH check failed"
     return 1
 
   return 0
@@ -1230,7 +1438,7 @@ def runSelfTest : IO UInt32 := do
       IO.eprintln s!"[lean-sys-core] FAIL: unexpected HTTP/pipelined response (served={servedCount}): {respBody} / {pipeRespStr}"
       return 1
 
-  IO.println s!"\{ \"ok\": true, \"binary\": \"lean-sys-core\", \"c_abi_gates\": 41, \"wave1_verified\": true, \"fd_32bit_high\": true, \"hmac_sha256_rfc4231\": true, \"par_scheduler\": true, \"wal_torn_recovery\": true, \"wal_68mib_streaming\": true, \"cas_immutable\": true, \"sst_bloom\": true, \"table_range_scan\": true, \"auth_rotation\": true, \"proc_log\": true, \"proc_stat_scanner\": true, \"jsonrpc_2_0\": true, \"shm_ring_mmap\": true, \"mmap_seqlock\": true, \"jsonl_tape\": true, \"reactor_keepalive\": true, \"stream_relay_sse\": true, \"sandbox_landlock\": true, \"pgid_reaper\": true, \"http_loopback_port\": {boundPort} }"
+  IO.println s!"\{ \"ok\": true, \"binary\": \"lean-sys-core\", \"c_abi_gates\": 45, \"wave1_verified\": true, \"fd_32bit_high\": true, \"hmac_sha256_rfc4231\": true, \"par_scheduler\": true, \"wal_torn_recovery\": true, \"wal_68mib_streaming\": true, \"cas_immutable\": true, \"sst_bloom\": true, \"table_range_scan\": true, \"auth_rotation\": true, \"proc_log\": true, \"proc_stat_scanner\": true, \"jsonrpc_2_0\": true, \"shm_ring_mmap\": true, \"mmap_seqlock\": true, \"jsonl_tape\": true, \"reactor_keepalive\": true, \"stream_relay_sse\": true, \"sandbox_landlock\": true, \"pgid_reaper\": true, \"http_loopback_port\": {boundPort} }"
   return 0
 
 /-- Run deterministic micro-benchmarks for `lean-sys-core bench` and emit JSON metrics. -/
@@ -1301,7 +1509,7 @@ def main (args : List String) : IO UInt32 := do
   | ["bench"] | ["--bench"] => LeanSys.Core.runBench 4000
   | ["bench", nStr] | ["--bench", nStr] => LeanSys.Core.runBench (nStr.toNat?.getD 4000)
   | ["--c-abi"] =>
-    IO.println "{\"ok\":true,\"exports\":[\"leansys_verify_slice_bounds\",\"leansys_verify_wal_frame\",\"leansys_verify_cas_digest\",\"leansys_check_http_bounds\",\"leansys_verify_jsonl_tape\",\"leansys_verify_ring_cursor\",\"leansys_verify_sst_block\",\"leansys_verify_poll_interest\",\"leansys_verify_rlimit_budget\",\"leansys_mix64_word\",\"leansys_verify_composite_key_order\",\"leansys_verify_token_auth\",\"leansys_verify_log_window\",\"leansys_verify_jsonrpc_frame\",\"leansys_gate_admit\",\"leansys_verify_mmap_seqlock\",\"leansys_verify_proc_stat_fields\",\"leansys_sse_frame_scan\",\"leansys_gfm_pipe_scan\",\"leansys_tag_scan\",\"leansys_transcript_index\",\"leansys_verify_par_chunk\",\"leansys_verify_arena_disjoint\",\"leansys_verify_snapshot_visibility\",\"leansys_verify_http_route_match\",\"leansys_verify_counterexample_triage\",\"leansys_verify_dag_wave_step\",\"leansys_verify_ios_jetsam_budget\",\"leansys_verify_worker_budget\",\"leansys_verify_page_aligned_buffer\",\"leansys_select_isa\",\"leansys_verify_isa_selection\",\"leansys_verify_fd_bounds\",\"leansys_verify_unix_path_bounds\",\"leansys_verify_cas_digest256\",\"leansys_verify_sigv4_envelope\",\"leansys_verify_cgroup_v2_budget\",\"leansys_verify_io_uring_ring\",\"leansys_verify_borrowed_view\",\"leansys_verify_step_reactor\",\"leansys_verify_stream_relay\"]}"
+    IO.println "{\"ok\":true,\"exports\":[\"leansys_verify_slice_bounds\",\"leansys_verify_wal_frame\",\"leansys_verify_cas_digest\",\"leansys_check_http_bounds\",\"leansys_verify_jsonl_tape\",\"leansys_verify_ring_cursor\",\"leansys_verify_sst_block\",\"leansys_verify_poll_interest\",\"leansys_verify_rlimit_budget\",\"leansys_mix64_word\",\"leansys_verify_composite_key_order\",\"leansys_verify_token_auth\",\"leansys_verify_log_window\",\"leansys_verify_jsonrpc_frame\",\"leansys_gate_admit\",\"leansys_verify_mmap_seqlock\",\"leansys_verify_proc_stat_fields\",\"leansys_sse_frame_scan\",\"leansys_gfm_pipe_scan\",\"leansys_tag_scan\",\"leansys_transcript_index\",\"leansys_verify_par_chunk\",\"leansys_verify_arena_disjoint\",\"leansys_verify_snapshot_visibility\",\"leansys_verify_http_route_match\",\"leansys_verify_counterexample_triage\",\"leansys_verify_dag_wave_step\",\"leansys_verify_ios_jetsam_budget\",\"leansys_verify_worker_budget\",\"leansys_verify_page_aligned_buffer\",\"leansys_select_isa\",\"leansys_verify_isa_selection\",\"leansys_verify_fd_bounds\",\"leansys_verify_unix_path_bounds\",\"leansys_verify_cas_digest256\",\"leansys_verify_sigv4_envelope\",\"leansys_verify_cgroup_v2_budget\",\"leansys_verify_io_uring_ring\",\"leansys_verify_borrowed_view\",\"leansys_verify_step_reactor\",\"leansys_verify_stream_relay\",\"leansys_verify_compaction_winner\",\"leansys_verify_trigram_candidate\",\"leansys_verify_ws_frame_header\",\"leansys_verify_sse_event_encode\"]}"
     return 0
   | _ =>
     IO.println "usage: lean-sys-core [self-test | bench | --c-abi]"

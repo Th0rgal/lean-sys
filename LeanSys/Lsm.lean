@@ -34,6 +34,7 @@ structure SstTable where
   rawBuf    : ByteArray
   bloomMask : UInt64
   entries   : Array SstIndexEntry
+  deriving Inhabited
 
 /-- Unsigned byte-wise compare of `buf[off, off+len)` against `q` (memcmp order, then length). -/
 @[inline]
@@ -223,11 +224,36 @@ def openSstLazy (sstPath : String) : IO (SysResult SstTable) := do
       p := p + 12 + kLen
     return .ok { path := sstPath, rawBuf := ByteArray.empty, bloomMask := bloom, entries := entries }
 
-/-- Lookup a value by `key` in `SstTable`, using in-memory `rawBuf` when resident or lazy `preadByteArray`
-    when opened via `openSstLazy`. -/
-def getLazyIO? (tbl : SstTable) (key : String) : IO (Option ByteArray) := do
+/-- Load an SST entry's value bytes from resident `rawBuf` when available, or via `preadByteArray`
+    when the `SstTable` was opened with `openSstLazy` (`rawBuf.isEmpty`). Fails closed with `.eio`
+    on short/corrupted reads so compaction and lazy search never silently drop keys. -/
+def readEntryValue (tbl : SstTable) (e : SstIndexEntry) : IO (SysResult ByteArray) := do
+  if !tbl.rawBuf.isEmpty then
+    if verifySliceBounds e.valOff.toUInt64 e.valLen.toUInt64 tbl.rawBuf.size.toUInt64 == 1 then
+      return .ok (tbl.rawBuf.extract e.valOff (e.valOff + e.valLen))
+    else
+      return .error .eio
+  else if e.valLen == 0 then
+    if tbl.path.isEmpty then return .error .einval
+    else return .ok ByteArray.empty
+  else
+    if tbl.path.isEmpty then
+      return .error .einval
+    match ← withFd tbl.path 0 (fun fd => do
+      let b ← preadByteArray fd e.valOff.toUInt64 e.valLen
+      if verifySliceBounds 0 e.valLen.toUInt64 b.size.toUInt64 == 1 &&
+         verifySliceBounds 0 b.size.toUInt64 e.valLen.toUInt64 == 1 then
+        pure (.ok b)
+      else
+        pure (.error .eio)) with
+    | .ok b => return .ok b
+    | .error err => return .error err
+
+/-- Lookup a value by `key` in `SstTable` on resident or lazy (`openSstLazy`) handles, distinguishing
+    clean key absence (`.ok none`) from short/corrupt disk read failures (`.error .eio`). -/
+def getLazyResult (tbl : SstTable) (key : String) : IO (SysResult (Option ByteArray)) := do
   if !bloomContains tbl.bloomMask (xxh64String key) then
-    return none
+    return .ok none
   let es := tbl.entries
   let mut lo : Nat := 0
   let mut hi : Nat := es.size
@@ -241,16 +267,18 @@ def getLazyIO? (tbl : SstTable) (key : String) : IO (Option ByteArray) := do
     else if e.key < key then lo := mid + 1
     else hi := mid
   match found? with
-  | none => return none
+  | none => return .ok none
   | some e =>
-    if e.valOff + e.valLen ≤ tbl.rawBuf.size then
-      return some (tbl.rawBuf.extract e.valOff (e.valOff + e.valLen))
-    else
-      match ← withFd tbl.path 0 (fun fd => do
-        let b ← preadByteArray fd e.valOff.toUInt64 e.valLen
-        pure (.ok b)) with
-      | .ok b => return if b.size == e.valLen then some b else none
-      | .error _ => return none
+    match ← readEntryValue tbl e with
+    | .ok b => return .ok (some b)
+    | .error err => return .error err
+
+/-- Lookup a value by `key` in `SstTable`, using in-memory `rawBuf` when resident or lazy `preadByteArray`
+    when opened via `openSstLazy`. -/
+def getLazyIO? (tbl : SstTable) (key : String) : IO (Option ByteArray) := do
+  match ← getLazyResult tbl key with
+  | .ok v? => return v?
+  | .error _ => return none
 
 /-- Atomically flush `st` into a sorted SST file at `sstPath` and compact the WAL,
     returning the compacted `(Store.Handle × SstTable)` pair. -/
@@ -261,6 +289,147 @@ def flushAndCompactStore (st : Store.Handle) (sstPath : String) : IO (SysResult 
     match ← Store.compact st with
     | .error e => pure (.error e)
     | .ok stCompacted => pure (.ok (stCompacted, tbl))
+
+/-- Explicit 5-byte LSM tombstone sentinel (`0xFF 0x00 'D' 'E' 'L'`), matching `LeanSys.Table.tombstoneMarker`. -/
+@[inline]
+private def isSstTombstoneBytes (ba : ByteArray) (off len : Nat) : Bool :=
+  len == 5 && verifySliceBounds off.toUInt64 5 ba.size.toUInt64 == 1 &&
+  ba.get! off == 0xFF &&
+  ba.get! (off + 1) == 0x00 &&
+  ba.get! (off + 2) == 0x44 &&
+  ba.get! (off + 3) == 0x45 &&
+  ba.get! (off + 4) == 0x4C
+
+/-- Maximum SST file size (`64 MiB`), matching `openSst`'s bounded resident read cap
+    and ensuring 32-bit `kLen`/`vOff`/`vLen`/`numEntries` directory fields never wrap. -/
+def maxSstFileBytes : Nat := 67108864
+
+/-- Write a pre-sorted, deduplicated array of `(key, keyUtf8, valBytes)` entries into an immutable SST file at `outPath`,
+    gated by `maxSstFileBytes`, `leansys_verify_sst_block`, and atomic `rename`. -/
+def writeSortedPairs (pairs : Array (String × ByteArray × ByteArray)) (outPath : String) : IO (SysResult SstTable) := do
+  if verifySliceBounds 0 pairs.size.toUInt64 0xFFFFFFFF != 1 then
+    return .error .enospc
+  let mut cap := 24
+  for (_, kb, v) in pairs do
+    if verifySliceBounds 0 kb.size.toUInt64 maxSstFileBytes.toUInt64 != 1 ||
+       verifySliceBounds 0 v.size.toUInt64 maxSstFileBytes.toUInt64 != 1 ||
+       verifySliceBounds cap.toUInt64 (12 + kb.size + v.size).toUInt64 maxSstFileBytes.toUInt64 != 1 then
+      return .error .enospc
+    cap := cap + 12 + kb.size + v.size
+  let mut buf := ByteArray.emptyWithCapacity cap
+  let mut bloom : UInt64 := 0
+  for (k, _, v) in pairs do
+    bloom := bloomInsert bloom (xxh64String k)
+    buf := v.copySlice 0 buf buf.size v.size false
+  let indexOff := buf.size
+  let mut entries : Array SstIndexEntry := Array.mkEmpty pairs.size
+  let mut vOff := 0
+  for (k, kb, v) in pairs do
+    buf := pushUInt32LE buf kb.size.toUInt32
+    buf := pushUInt32LE buf vOff.toUInt32
+    buf := pushUInt32LE buf v.size.toUInt32
+    let kOff := buf.size
+    buf := kb.copySlice 0 buf buf.size kb.size false
+    entries := entries.push { key := k, keyOff := kOff, keyLen := kb.size, valOff := vOff, valLen := v.size }
+    vOff := vOff + v.size
+  let footerOff := buf.size.toUInt64
+  buf := pushUInt32LE buf sstMagic
+  buf := pushUInt32LE buf entries.size.toUInt32
+  buf := pushUInt64LE buf indexOff.toUInt64
+  buf := pushUInt64LE buf bloom
+  if verifySstBlock sstMagic entries.size.toUInt32 indexOff.toUInt64 footerOff buf.size.toUInt64 bloom != 1 then
+    return .error .einval
+  let tmpPath := outPath ++ ".tmp"
+  match ← withFd tmpPath 4 (fun fd => writeAll fd buf true) with
+  | .error e => pure (.error e)
+  | .ok _ =>
+    match ← atomicRename tmpPath outPath with
+    | .error e => pure (.error e)
+    | .ok () => pure (.ok { path := outPath, rawBuf := buf, bloomMask := bloom, entries := entries })
+
+/-- Two-way sorted SST compaction (`older` + `newer` → `outPath`) gated by `LeanSys.Spec.verifyCompactionWinner`:
+    - Linear `O(|older| + |newer|)` merge scan over already-sorted SST directories.
+    - When both tables contain `key`, `newer` strictly wins (never resurrecting `older` when `newer` is a tombstone!).
+    - When `dropTombstones := true` (bottom-most level compaction), winning tombstones are dropped cleanly. -/
+def mergeTables (older newer : SstTable) (outPath : String) (dropTombstones : Bool := false) :
+    IO (SysResult SstTable) := do
+  let esOld := older.entries
+  let esNew := newer.entries
+  let mut merged : Array (String × ByteArray × ByteArray) := Array.mkEmpty (esOld.size + esNew.size)
+  let mut i : Nat := 0
+  let mut j : Nat := 0
+  let dropFlag : UInt8 := if dropTombstones then 1 else 0
+  while i < esOld.size || j < esNew.size do
+    if i < esOld.size && j < esNew.size then
+      let eo := esOld[i]!
+      let en := esNew[j]!
+      if eo.key == en.key then
+        let .ok vo ← readEntryValue older eo | return .error .eio
+        let .ok vn ← readEntryValue newer en | return .error .eio
+        let oTomb : UInt8 := if isSstTombstoneBytes vo 0 vo.size then 1 else 0
+        let nTomb : UInt8 := if isSstTombstoneBytes vn 0 vn.size then 1 else 0
+        let win := verifyCompactionWinner 1 nTomb 1 oTomb dropFlag
+        if win == 2 then
+          merged := merged.push (en.key, en.key.toUTF8, vn)
+        i := i + 1
+        j := j + 1
+      else if keyBytesLt eo.key.toUTF8 en.key.toUTF8 then
+        let .ok vo ← readEntryValue older eo | return .error .eio
+        let oTomb : UInt8 := if isSstTombstoneBytes vo 0 vo.size then 1 else 0
+        if verifyCompactionWinner 0 0 1 oTomb dropFlag == 1 then
+          merged := merged.push (eo.key, eo.key.toUTF8, vo)
+        i := i + 1
+      else
+        let .ok vn ← readEntryValue newer en | return .error .eio
+        let nTomb : UInt8 := if isSstTombstoneBytes vn 0 vn.size then 1 else 0
+        if verifyCompactionWinner 1 nTomb 0 0 dropFlag == 2 then
+          merged := merged.push (en.key, en.key.toUTF8, vn)
+        j := j + 1
+    else if i < esOld.size then
+      let eo := esOld[i]!
+      let .ok vo ← readEntryValue older eo | return .error .eio
+      let oTomb : UInt8 := if isSstTombstoneBytes vo 0 vo.size then 1 else 0
+      if verifyCompactionWinner 0 0 1 oTomb dropFlag == 1 then
+        merged := merged.push (eo.key, eo.key.toUTF8, vo)
+      i := i + 1
+    else
+      let en := esNew[j]!
+      let .ok vn ← readEntryValue newer en | return .error .eio
+      let nTomb : UInt8 := if isSstTombstoneBytes vn 0 vn.size then 1 else 0
+      if verifyCompactionWinner 1 nTomb 0 0 dropFlag == 2 then
+        merged := merged.push (en.key, en.key.toUTF8, vn)
+      j := j + 1
+  writeSortedPairs merged outPath
+
+/-- Multi-level SST compaction (`tablesOldestToNewest` → `outPath`):
+    folds `mergeTables` from oldest to newest, applying `dropTombstones` only on the final pass
+    so intermediate merges never lose tombstones that must still mask older generations! -/
+def compactLevels (tablesOldestToNewest : Array SstTable) (outPath : String)
+    (dropTombstones : Bool := true) : IO (SysResult SstTable) := do
+  if tablesOldestToNewest.isEmpty then
+    writeSortedPairs #[] outPath
+  else if tablesOldestToNewest.size == 1 then
+    let only := tablesOldestToNewest[0]!
+    if !dropTombstones && only.path == outPath then
+      return .ok only
+    let emptyTbl : SstTable := { path := "", rawBuf := ByteArray.empty, bloomMask := 0, entries := #[] }
+    mergeTables emptyTbl only outPath dropTombstones
+  else
+    let mut acc := tablesOldestToNewest[0]!
+    let lastIdx := tablesOldestToNewest.size - 1
+    for k in [1:tablesOldestToNewest.size] do
+      let isFinal := k == lastIdx
+      let stepPath := if isFinal then outPath else s!"{outPath}.merge.{k}"
+      let stepDrop := if isFinal then dropTombstones else false
+      match ← mergeTables acc tablesOldestToNewest[k]! stepPath stepDrop with
+      | .error e => return .error e
+      | .ok nextTbl =>
+        if k > 1 then
+          discard <| unlinkFile s!"{outPath}.merge.{k - 1}"
+        acc := nextTbl
+    if tablesOldestToNewest.size > 2 then
+      discard <| unlinkFile s!"{outPath}.merge.{lastIdx - 1}"
+    return .ok acc
 
 end SstTable
 

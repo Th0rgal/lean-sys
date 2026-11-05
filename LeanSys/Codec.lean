@@ -547,4 +547,184 @@ def lookupNat? (tape : BorrowedJsonTape) (key : String) : Option Nat := Id.run d
 
 end BorrowedJsonTape
 
+/-! ## RFC 8259 JSON String Escape/Unescape & Nested Object/Array Slice Traversal -/
+
+@[inline]
+private def hexNib? (b : UInt8) : Option UInt32 :=
+  if 48 ≤ b && b ≤ 57 then some (b - 48).toUInt32
+  else if 65 ≤ b && b ≤ 70 then some (b - 55).toUInt32
+  else if 97 ≤ b && b ≤ 102 then some (b - 87).toUInt32
+  else none
+
+@[inline]
+private def parseHex4? (ba : ByteArray) (pos limit : Nat) : Option UInt32 := do
+  if verifySliceBounds pos.toUInt64 4 limit.toUInt64 != 1 then none
+  let n0 ← hexNib? (byteAt ba pos)
+  let n1 ← hexNib? (byteAt ba (pos + 1))
+  let n2 ← hexNib? (byteAt ba (pos + 2))
+  let n3 ← hexNib? (byteAt ba (pos + 3))
+  some ((n0 <<< 12) ||| (n1 <<< 8) ||| (n2 <<< 4) ||| n3)
+
+private def pushUtf8Codepoint (out : ByteArray) (cp : UInt32) : ByteArray :=
+  if cp ≤ 0x7F then
+    out.push cp.toUInt8
+  else if cp ≤ 0x7FF then
+    out.push ((0xC0 : UInt32) ||| ((cp >>> 6) &&& (0x1F : UInt32))).toUInt8
+      |>.push ((0x80 : UInt32) ||| (cp &&& (0x3F : UInt32))).toUInt8
+  else if cp ≤ 0xFFFF then
+    out.push ((0xE0 : UInt32) ||| ((cp >>> 12) &&& (0x0F : UInt32))).toUInt8
+      |>.push ((0x80 : UInt32) ||| ((cp >>> 6) &&& (0x3F : UInt32))).toUInt8
+      |>.push ((0x80 : UInt32) ||| (cp &&& (0x3F : UInt32))).toUInt8
+  else if cp ≤ 0x10FFFF then
+    out.push ((0xF0 : UInt32) ||| ((cp >>> 18) &&& (0x07 : UInt32))).toUInt8
+      |>.push ((0x80 : UInt32) ||| ((cp >>> 12) &&& (0x3F : UInt32))).toUInt8
+      |>.push ((0x80 : UInt32) ||| ((cp >>> 6) &&& (0x3F : UInt32))).toUInt8
+      |>.push ((0x80 : UInt32) ||| (cp &&& (0x3F : UInt32))).toUInt8
+  else
+    out
+
+/-- Unescape a raw JSON string payload slice (without surrounding `"`) per RFC 8259 §7:
+    handles `\"`, `\\`, `\/`, `\b`, `\f`, `\n`, `\r`, `\t`, `\uXXXX`, and UTF-16 surrogate pairs `\uD8xx\uDCxx`,
+    and rejects unescaped control characters (`< 0x20`) or raw unescaped `"` (`34`). -/
+def unescapeJsonSlice? (s : ByteSlice) : Option String := Id.run do
+  let ba := s.ba
+  let limit := if verifySliceBounds s.off.toUInt64 s.len.toUInt64 ba.size.toUInt64 == 1 then s.off + s.len else Nat.min (s.off + s.len) ba.size
+  let mut hasBackslash := false
+  let mut scanIdx := s.off
+  while verifySliceBounds scanIdx.toUInt64 1 limit.toUInt64 == 1 do
+    let b := byteAt ba scanIdx
+    if b < 0x20 then
+      return none
+    if b == 92 then
+      hasBackslash := true
+    else if !hasBackslash && b == 34 then
+      return none
+    scanIdx := scanIdx + 1
+  if !hasBackslash then
+    return String.fromUTF8? (ba.extract s.off limit)
+  let mut out := ByteArray.emptyWithCapacity s.len
+  let mut p := s.off
+  while verifySliceBounds p.toUInt64 1 limit.toUInt64 == 1 do
+    let c := byteAt ba p
+    if c < 0x20 || c == 34 then
+      return none
+    if c != 92 then
+      out := out.push c
+      p := p + 1
+    else
+      if verifySliceBounds p.toUInt64 2 limit.toUInt64 != 1 then return none
+      let esc := byteAt ba (p + 1)
+      if esc == 34 then out := out.push 34; p := p + 2
+      else if esc == 92 then out := out.push 92; p := p + 2
+      else if esc == 47 then out := out.push 47; p := p + 2
+      else if esc == 98 then out := out.push 8; p := p + 2
+      else if esc == 102 then out := out.push 12; p := p + 2
+      else if esc == 110 then out := out.push 10; p := p + 2
+      else if esc == 114 then out := out.push 13; p := p + 2
+      else if esc == 116 then out := out.push 9; p := p + 2
+      else if esc == 117 then -- 'u'
+        match parseHex4? ba (p + 2) limit with
+        | none => return none
+        | some u1 =>
+          if 0xD800 ≤ u1 && u1 ≤ 0xDBFF then
+            if verifySliceBounds p.toUInt64 12 limit.toUInt64 == 1 && byteAt ba (p + 6) == 92 && byteAt ba (p + 7) == 117 then
+              match parseHex4? ba (p + 8) limit with
+              | some u2 =>
+                if 0xDC00 ≤ u2 && u2 ≤ 0xDFFF then
+                  let cp : UInt32 := (0x10000 : UInt32) + (((u1 - (0xD800 : UInt32)) <<< 10) ||| (u2 - (0xDC00 : UInt32)))
+                  out := pushUtf8Codepoint out cp
+                  p := p + 12
+                else return none
+              | none => return none
+            else return none
+          else if 0xDC00 ≤ u1 && u1 ≤ 0xDFFF then
+            return none
+          else
+            out := pushUtf8Codepoint out u1
+            p := p + 6
+      else
+        return none
+  return String.fromUTF8? out
+
+/-- Unescape a raw JSON string content (without surrounding `"`) per RFC 8259 §7. -/
+@[inline]
+def unescapeJsonString? (raw : String) : Option String :=
+  unescapeJsonSlice? (ByteSlice.ofString raw)
+
+/-- Escape a UTF-8 `String` into RFC 8259 JSON string content (without surrounding `"`). -/
+def escapeJsonString (s : String) : String := Id.run do
+  let b := s.toUTF8
+  let hex := "0123456789abcdef".toUTF8
+  let mut out := ByteArray.emptyWithCapacity (b.size + 8)
+  for i in [0:b.size] do
+    let c := b.get! i
+    if c == 34 then out := out.push 92 |>.push 34
+    else if c == 92 then out := out.push 92 |>.push 92
+    else if c == 8 then out := out.push 92 |>.push 98
+    else if c == 12 then out := out.push 92 |>.push 102
+    else if c == 10 then out := out.push 92 |>.push 110
+    else if c == 13 then out := out.push 92 |>.push 114
+    else if c == 9 then out := out.push 92 |>.push 116
+    else if c < 0x20 then
+      out := out.push 92 |>.push 117 |>.push 48 |>.push 48
+        |>.push (hex.get! ((c >>> 4).toNat &&& 0xF))
+        |>.push (hex.get! (c.toNat &&& 0xF))
+    else
+      out := out.push c
+  return String.fromUTF8! out
+
+/-- Lookup and RFC 8259-unescape a string field in `JsonTape` by `key`. -/
+def JsonTape.lookupStringUnescaped? (tape : JsonTape) (key : String) : Option String := do
+  let (sl, isStr) ← JsonTape.lookupSlice? tape key
+  if isStr then unescapeJsonSlice? sl else String.fromUTF8? sl.toByteArray
+
+/-- Lookup a nested JSON object field in `JsonTape` by `key` as a zero-copy child `JsonTape`. -/
+def JsonTape.lookupObjectTape? (tape : JsonTape) (key : String) : Option JsonTape := do
+  let (sl, isStr) ← JsonTape.lookupSlice? tape key
+  if isStr || sl.len == 0 then none
+  else
+    let p := JsonTape.skipWs sl.ba sl.off (Nat.min (sl.off + sl.len) sl.ba.size)
+    if verifySliceBounds p.toUInt64 1 sl.ba.size.toUInt64 == 1 && byteAt sl.ba p == 123 then
+      some (JsonTape.indexJsonObject sl)
+    else
+      none
+
+/-- Scan a JSON array `ByteSlice` (`[...]`) into zero-copy element `(ByteSlice × isString)` views,
+    gating every element span via `leansys_verify_slice_bounds`. -/
+def scanJsonArraySlices (s : ByteSlice) : Array (ByteSlice × Bool) := Id.run do
+  let ba := s.ba
+  let cap := ba.size
+  let limit := Nat.min (s.off + s.len) cap
+  let mut p := JsonTape.skipWs ba s.off limit
+  if verifySliceBounds p.toUInt64 1 limit.toUInt64 != 1 || byteAt ba p != 91 then -- '['
+    return #[]
+  p := p + 1
+  let mut out : Array (ByteSlice × Bool) := #[]
+  while verifySliceBounds p.toUInt64 1 limit.toUInt64 == 1 do
+    p := JsonTape.skipWs ba p limit
+    if verifySliceBounds p.toUInt64 1 limit.toUInt64 != 1 then break
+    let c := byteAt ba p
+    if c == 93 then break -- ']'
+    if c == 44 then
+      p := JsonTape.skipWs ba (p + 1) limit
+      if verifySliceBounds p.toUInt64 1 limit.toUInt64 != 1 || byteAt ba p == 93 then break
+    if byteAt ba p == 34 then
+      let vStart := p + 1
+      match JsonTape.scanQuotedString ba vStart limit with
+      | none => break
+      | some vEnd =>
+        let vLen := vEnd - vStart
+        if verifySliceBounds vStart.toUInt64 vLen.toUInt64 cap.toUInt64 == 1 then
+          out := out.push ({ ba := ba, off := vStart, len := vLen }, true)
+        p := vEnd + 1
+    else
+      let vStart := p
+      let (vEnd, _) := JsonTape.scanRawValue ba vStart limit
+      let vLen := vEnd - vStart
+      if vLen == 0 then break
+      if verifySliceBounds vStart.toUInt64 vLen.toUInt64 cap.toUInt64 == 1 then
+        out := out.push ({ ba := ba, off := vStart, len := vLen }, false)
+      p := vEnd
+  return out
+
 end LeanSys.Codec
