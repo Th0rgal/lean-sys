@@ -919,7 +919,8 @@ private def headerContainsTokenCI (hdrVal : String) (needle : String) : Bool := 
 /-- Validate an incoming RFC 6455 §4.2.1 `Sec-WebSocket-Key` (24-char Base64 encoding of a 16-byte nonce ending in `==`). -/
 private def isValidSecWebSocketKey (k : String) : Bool := Id.run do
   let b := k.toUTF8
-  if b.size != 24 then return false
+  if verifySliceBounds 0 24 b.size.toUInt64 != 1 || verifySliceBounds 0 b.size.toUInt64 24 != 1 then
+    return false
   if b.get! 22 != 61 || b.get! 23 != 61 then return false
   let isB64 (c : UInt8) : Bool :=
     (65 ≤ c && c ≤ 90) || (97 ≤ c && c ≤ 122) || (48 ≤ c && c ≤ 57) || c == 43 || c == 47

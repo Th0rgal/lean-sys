@@ -238,7 +238,9 @@ def encodeFrame? (frame : WsFrame) (maskKey4? : Option ByteArray := none)
   let (maskedBit, maskBytes) : UInt8 × ByteArray :=
     match maskKey4? with
     | none => (0, ByteArray.empty)
-    | some k => if k.size == 4 then (1, k) else (2, ByteArray.empty)
+    | some k =>
+      if verifySliceBounds 0 4 k.size.toUInt64 == 1 && verifySliceBounds 0 k.size.toUInt64 4 == 1 then (1, k)
+      else (2, ByteArray.empty)
   if maskedBit == 2 then return none
   let pLen := frame.payload.size
   let extLenBytes : Nat := if pLen ≤ 125 then 0 else if pLen ≤ 65535 then 2 else 8

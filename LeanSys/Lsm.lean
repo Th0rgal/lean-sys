@@ -241,7 +241,11 @@ def readEntryValue (tbl : SstTable) (e : SstIndexEntry) : IO (SysResult ByteArra
       return .error .einval
     match ← withFd tbl.path 0 (fun fd => do
       let b ← preadByteArray fd e.valOff.toUInt64 e.valLen
-      if b.size == e.valLen then pure (.ok b) else pure (.error .eio)) with
+      if verifySliceBounds 0 e.valLen.toUInt64 b.size.toUInt64 == 1 &&
+         verifySliceBounds 0 b.size.toUInt64 e.valLen.toUInt64 == 1 then
+        pure (.ok b)
+      else
+        pure (.error .eio)) with
     | .ok b => return .ok b
     | .error err => return .error err
 
