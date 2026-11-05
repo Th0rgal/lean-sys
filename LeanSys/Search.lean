@@ -156,10 +156,12 @@ def searchTrigramSst (tbl : SstTable) (query : String) (limit : Nat := 64) : Arr
       let e := es[idx]!
       if !e.key.startsWith docPrefix then break
       if e.valOff + e.valLen ≤ tbl.rawBuf.size then
-        let docBytes := tbl.rawBuf.extract e.valOff (e.valOff + e.valLen)
-        if verifyTrigramCandidate 0 0 docBytes.size.toUInt64 == 1 && containsBytesLower docBytes qLower then
-          let docId := String.fromUTF8! (e.key.toUTF8.extract 4 e.key.utf8ByteSize)
-          out := out.push (docId, String.fromUTF8? docBytes |>.getD "")
+        let docSlice : ByteSlice := { ba := tbl.rawBuf, off := e.valOff, len := e.valLen }
+        if !LeanSys.Table.isTombstoneSlice docSlice then
+          let docBytes := docSlice.toByteArray
+          if verifyTrigramCandidate 0 0 docBytes.size.toUInt64 == 1 && containsBytesLower docBytes qLower then
+            let docId := String.fromUTF8! (e.key.toUTF8.extract 4 e.key.utf8ByteSize)
+            out := out.push (docId, String.fromUTF8? docBytes |>.getD "")
       idx := idx + 1
     return out
   else

@@ -1879,7 +1879,7 @@ theorem stream_relay_keepalive_boundary_safe
 /-- Pure LSM compaction merge winner selection: newer generation always wins;
     when `dropTombstones` is enabled (bottom-most compaction), a winning tombstone
     is dropped (`0`), otherwise retained (`2` = newer value, `1` = older value). -/
-@[inline]
+@[inline, export leansys_verify_compaction_winner]
 def verifyCompactionWinner
     (hasNewer newerIsTomb hasOlder olderIsTomb dropTombstones : UInt8) : UInt8 :=
   if hasNewer == 1 then
@@ -1927,7 +1927,7 @@ theorem compaction_kills_resurrection_mutant :
 
 /-- Pure inverted-trigram posting intersection predicate: if every trigram of
     `queryTrigrams` is present in `docTrigrams`, `docId` is retained. -/
-@[inline]
+@[inline, export leansys_verify_trigram_candidate]
 def verifyTrigramCandidate
     (queryTriCount matchedTriCount : UInt32) (docLen : UInt64) : UInt8 :=
   if queryTriCount == 0 then
@@ -1969,7 +1969,7 @@ theorem trigram_kills_len3_mutant :
     - Control frames (`opcode ≥ 0x8`) require `fin == 1` and `payloadLen ≤ 125`
     - Client frames (`expectMasked == 1`) require `masked == 1`; server `masked == 0`
     - Total frame size `headerLen + payloadLen ≤ maxFrameBytes` (`≤ 16 MiB`). -/
-@[inline]
+@[inline, export leansys_verify_ws_frame_header]
 def verifyWsFrameHeader (fin rsvBits opcode masked expectMasked : UInt8)
     (headerLen payloadLen maxFrameBytes : UInt64) : UInt8 :=
   let validOpcode : Bool :=
@@ -2059,7 +2059,7 @@ theorem ws_frame_kills_control_len_mutant :
 /-- Pure W3C Server-Sent Events (SSE) outgoing event frame bounds & CR/LF gate:
     rejects bare `\r` or `\n` inside `event` or `id` headers (`noHeaderCrLf == 1`)
     and bounds total serialized chunk size `≤ maxChunkBytes`. -/
-@[inline]
+@[inline, export leansys_verify_sse_event_encode]
 def verifySseEventEncode
     (noHeaderCrLf : UInt8) (dataLines : UInt32) (encodedBytes maxChunkBytes : UInt64) : UInt8 :=
   if noHeaderCrLf == 1 && dataLines ≥ 1 && maxChunkBytes ≤ 16777216 &&

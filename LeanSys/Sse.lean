@@ -3,8 +3,12 @@
   (`0 import Lean`, `0 sorryAx`)
   - Serializes `event:` / `id:` / `retry:` / multi-line `data:` SSE frames gated by `LeanSys.Spec.verifySseEventEncode`
     (strictly rejecting CR/LF header injection in `event` / `id` fields)
-  - Provides stateful `SseEventStream` incremental parser over arbitrary TCP/HTTP chunk boundaries,
-    accumulating multi-line `data:` payloads and dispatching completed events on empty-line (`\n\n` / `\r\n\r\n`) boundaries
+  - Provides stateful `SseEventStream` incremental parser over arbitrary TCP/HTTP chunk boundaries:
+    - W3C SSE §9.2.5 / §9.2.6 line endings (`\r\n`, `\n`, and standalone `\r`, including cross-chunk `\r` + `\n`)
+    - Initial UTF-8 BOM (`0xEF 0xBB 0xBF`) stripping on the first chunk
+    - Lossy UTF-8 replacement (`U+FFFD`) on invalid byte sequences instead of dropping field lines
+    - Strict `retry:` digits-only parsing (after stripping at most one leading space) and persistent `lastRetryMs?`
+    - Bounded pending event memory (`carry + pendingBytes <= maxCarryCap`) across chunks
 -/
 import LeanSys.Spec
 import LeanSys.Posix
@@ -63,22 +67,76 @@ def formatSseEvent? (ev : SseEvent) (maxChunkBytes : Nat := 4194304) : Option By
   else
     return none
 
+/-- Decode `ba` as UTF-8, replacing any invalid byte sequence with `U+FFFD` (`0xEF 0xBF 0xBD`). -/
+private def decodeUtf8Lossy (ba : ByteArray) : String :=
+  match String.fromUTF8? ba with
+  | some s => s
+  | none => Id.run do
+    let mut out := ByteArray.emptyWithCapacity (ba.size * 3)
+    let mut i : Nat := 0
+    while i < ba.size do
+      let b0 := ba.get! i
+      if b0 < 0x80 then
+        out := out.push b0
+        i := i + 1
+      else if 0xC2 ≤ b0 && b0 ≤ 0xDF && i + 1 < ba.size then
+        let b1 := ba.get! (i + 1)
+        if (b1 &&& 0xC0) == 0x80 then
+          out := out.push b0 |>.push b1
+          i := i + 2
+        else
+          out := out.push 0xEF |>.push 0xBF |>.push 0xBD
+          i := i + 1
+      else if 0xE0 ≤ b0 && b0 ≤ 0xEF && i + 2 < ba.size then
+        let b1 := ba.get! (i + 1)
+        let b2 := ba.get! (i + 2)
+        let validE :=
+          (b1 &&& 0xC0) == 0x80 && (b2 &&& 0xC0) == 0x80 &&
+          !(b0 == 0xE0 && b1 < 0xA0) && !(b0 == 0xED && b1 ≥ 0xA0)
+        if validE then
+          out := out.push b0 |>.push b1 |>.push b2
+          i := i + 3
+        else
+          out := out.push 0xEF |>.push 0xBF |>.push 0xBD
+          i := i + 1
+      else if 0xF0 ≤ b0 && b0 ≤ 0xF4 && i + 3 < ba.size then
+        let b1 := ba.get! (i + 1)
+        let b2 := ba.get! (i + 2)
+        let b3 := ba.get! (i + 3)
+        let validF :=
+          (b1 &&& 0xC0) == 0x80 && (b2 &&& 0xC0) == 0x80 && (b3 &&& 0xC0) == 0x80 &&
+          !(b0 == 0xF0 && b1 < 0x90) && !(b0 == 0xF4 && b1 ≥ 0x90)
+        if validF then
+          out := out.push b0 |>.push b1 |>.push b2 |>.push b3
+          i := i + 4
+        else
+          out := out.push 0xEF |>.push 0xBF |>.push 0xBD
+          i := i + 1
+      else
+        out := out.push 0xEF |>.push 0xBF |>.push 0xBD
+        i := i + 1
+    return String.fromUTF8? out |>.getD ""
+
 /-- Stateful incremental W3C SSE stream parser handling arbitrary chunk splits and multi-line `data:` concatenation. -/
 structure SseEventStream where
-  carry       : ByteArray := ByteArray.empty
-  curEvent    : String := ""
-  lastEventId : Option String := none
-  curRetryMs? : Option Nat := none
-  dataLines   : Array String := #[]
-  maxCarryCap : Nat := 4194304
+  carry        : ByteArray := ByteArray.empty
+  curEvent     : String := ""
+  lastEventId  : Option String := none
+  lastRetryMs? : Option Nat := none
+  dataLines    : Array String := #[]
+  pendingBytes : Nat := 0
+  sawFirstByte : Bool := false
+  skipNextLf   : Bool := false
+  maxCarryCap  : Nat := 4194304
 
 namespace SseEventStream
 
 def init (maxCarryCap : Nat := 4194304) : SseEventStream :=
   { maxCarryCap := maxCarryCap }
 
-private def parseAsciiNat? (s : String) : Option Nat := Id.run do
-  let b := s.trimAscii.toString.toUTF8
+/-- W3C SSE §9.2.6 `retry`: digits `0..9` ONLY (no extra leading/trailing whitespace). -/
+private def parseDigitsOnlyNat? (s : String) : Option Nat := Id.run do
+  let b := s.toUTF8
   if b.isEmpty then return none
   let mut acc : Nat := 0
   for i in [0:b.size] do
@@ -92,19 +150,47 @@ private def parseAsciiNat? (s : String) : Option Nat := Id.run do
 /-- Feed a raw `ByteSlice` chunk into `st`, returning `(updatedState, dispatchedEvents)` or `none` if buffer cap is exceeded. -/
 def pushChunk? (st : SseEventStream) (chunk : ByteSlice) : Option (SseEventStream × Array SseEvent) := Id.run do
   let chunkBytes := chunk.toByteArray
-  if st.carry.size + chunkBytes.size > st.maxCarryCap then
+  if st.carry.size + chunkBytes.size + st.pendingBytes > st.maxCarryCap then
     return none
-  let buf := if st.carry.isEmpty then chunkBytes else st.carry ++ chunkBytes
+  let rawBuf := if st.carry.isEmpty then chunkBytes else st.carry ++ chunkBytes
+  if rawBuf.isEmpty then
+    return some (st, #[])
+  let mut startIdx : Nat := 0
+  let mut skipLf := st.skipNextLf
+  if skipLf then
+    skipLf := false
+    if rawBuf.get! 0 == 10 then
+      startIdx := 1
+  let mut sawFirst := st.sawFirstByte
+  if !sawFirst then
+    if rawBuf.size - startIdx < 3 then
+      -- Could still be a partial UTF-8 BOM (`0xEF` or `0xEF 0xBB`) at stream start
+      let b0 := rawBuf.get! startIdx
+      if b0 == 0xEF && (rawBuf.size - startIdx == 1 || rawBuf.get! (startIdx + 1) == 0xBB) then
+        return some ({ st with carry := rawBuf.extract startIdx rawBuf.size, skipNextLf := false }, #[])
+      sawFirst := true
+    else
+      sawFirst := true
+      if rawBuf.get! startIdx == 0xEF && rawBuf.get! (startIdx + 1) == 0xBB && rawBuf.get! (startIdx + 2) == 0xBF then
+        startIdx := startIdx + 3
   let mut curEv := st.curEvent
   let mut lastId := st.lastEventId
-  let mut curRetry := st.curRetryMs?
+  let mut lastRetry := st.lastRetryMs?
   let mut dLines := st.dataLines
+  let mut pendBytes := st.pendingBytes
   let mut emitted : Array SseEvent := #[]
-  let mut lineStart : Nat := 0
-  let mut i : Nat := 0
-  while i < buf.size do
-    if buf.get! i == 10 then -- '\n'
-      let lineEnd := if i > lineStart && buf.get! (i - 1) == 13 then i - 1 else i
+  let mut lineStart : Nat := startIdx
+  let mut i : Nat := startIdx
+  while i < rawBuf.size do
+    let b := rawBuf.get! i
+    if b == 10 || b == 13 then -- '\n' or '\r'
+      let lineEnd := i
+      let nextPos :=
+        if b == 13 then
+          if i + 1 < rawBuf.size && rawBuf.get! (i + 1) == 10 then i + 2 else i + 1
+        else i + 1
+      if b == 13 && i + 1 == rawBuf.size then
+        skipLf := true
       if lineEnd == lineStart then
         -- Blank line dispatches event iff at least one `data:` field was accumulated (W3C SSE §9.2.6)
         if !dLines.isEmpty then
@@ -113,49 +199,67 @@ def pushChunk? (st : SseEventStream) (chunk : ByteSlice) : Option (SseEventStrea
           emitted := emitted.push {
             event := evName
             id? := lastId
-            retryMs? := curRetry
+            retryMs? := lastRetry
             data := joined
           }
         curEv := ""
-        curRetry := none
         dLines := #[]
-      else if buf.get! lineStart == 58 then
+        pendBytes := 0
+      else if rawBuf.get! lineStart == 58 then
         -- Comment / keepalive line (`:...`): ignore
         pure ()
       else
-        if let some lineStr := String.fromUTF8? (buf.extract lineStart lineEnd) then
-          match lineStr.splitOn ":" with
-          | [] => pure ()
-          | [fieldOnly] =>
-            if fieldOnly == "data" then
-              dLines := dLines.push ""
-            else if fieldOnly == "event" then
-              curEv := ""
-            else if fieldOnly == "id" then
-              lastId := some ""
-          | field :: rest =>
-            let rawVal := String.intercalate ":" rest
-            let val := if rawVal.startsWith " " then (rawVal.drop 1).toString else rawVal
-            if field == "data" then
-              dLines := dLines.push val
-            else if field == "event" then
-              curEv := val
-            else if field == "id" then
-              -- W3C SSE §9.2.6: ignore `id` containing NULL
-              if (val.splitOn "\x00").length == 1 then
-                lastId := some val
-            else if field == "retry" then
-              if let some ms := parseAsciiNat? val then
-                curRetry := some ms
-      lineStart := i + 1
-    i := i + 1
-  let rem := if lineStart < buf.size then buf.extract lineStart buf.size else ByteArray.empty
+        let lineStr := decodeUtf8Lossy (rawBuf.extract lineStart lineEnd)
+        match lineStr.splitOn ":" with
+        | [] => pure ()
+        | [fieldOnly] =>
+          if fieldOnly == "data" then
+            if pendBytes + 1 > st.maxCarryCap then
+              return none
+            dLines := dLines.push ""
+            pendBytes := pendBytes + 1
+          else if fieldOnly == "event" then
+            curEv := ""
+          else if fieldOnly == "id" then
+            lastId := some ""
+        | field :: rest =>
+          let rawVal := String.intercalate ":" rest
+          let val := if rawVal.startsWith " " then (rawVal.drop 1).toString else rawVal
+          if field == "data" then
+            let addBytes := val.utf8ByteSize + 1
+            if pendBytes + addBytes > st.maxCarryCap then
+              return none
+            dLines := dLines.push val
+            pendBytes := pendBytes + addBytes
+          else if field == "event" then
+            if val.utf8ByteSize > st.maxCarryCap then
+              return none
+            curEv := val
+          else if field == "id" then
+            if val.utf8ByteSize > st.maxCarryCap then
+              return none
+            -- W3C SSE §9.2.6: ignore `id` containing NULL
+            if (val.splitOn "\x00").length == 1 then
+              lastId := some val
+          else if field == "retry" then
+            if let some ms := parseDigitsOnlyNat? val then
+              lastRetry := some ms
+      lineStart := nextPos
+      i := nextPos
+    else
+      i := i + 1
+  let rem := if lineStart < rawBuf.size then rawBuf.extract lineStart rawBuf.size else ByteArray.empty
+  if rem.size + pendBytes + curEv.utf8ByteSize > st.maxCarryCap then
+    return none
   return some ({
     carry := rem
     curEvent := curEv
     lastEventId := lastId
-    curRetryMs? := curRetry
+    lastRetryMs? := lastRetry
     dataLines := dLines
+    pendingBytes := pendBytes
+    sawFirstByte := sawFirst
+    skipNextLf := skipLf
     maxCarryCap := st.maxCarryCap
   }, emitted)
 

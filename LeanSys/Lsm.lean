@@ -273,12 +273,43 @@ private def isSstTombstoneBytes (ba : ByteArray) (off len : Nat) : Bool :=
   ba.get! (off + 3) == 0x45 &&
   ba.get! (off + 4) == 0x4C
 
+/-- Load an SST entry's value bytes from resident `rawBuf` when available, or via `preadByteArray`
+    when the `SstTable` was opened with `openSstLazy` (`rawBuf.isEmpty`). Fails closed with `.eio`
+    on short/corrupted reads so compaction never silently drops keys. -/
+private def readEntryValue (tbl : SstTable) (e : SstIndexEntry) : IO (SysResult ByteArray) := do
+  if !tbl.rawBuf.isEmpty then
+    if e.valOff + e.valLen ≤ tbl.rawBuf.size then
+      return .ok (tbl.rawBuf.extract e.valOff (e.valOff + e.valLen))
+    else
+      return .error .eio
+  else if e.valLen == 0 then
+    if tbl.path.isEmpty then return .error .einval
+    else return .ok ByteArray.empty
+  else
+    if tbl.path.isEmpty then
+      return .error .einval
+    match ← withFd tbl.path 0 (fun fd => do
+      let b ← preadByteArray fd e.valOff.toUInt64 e.valLen
+      if b.size == e.valLen then pure (.ok b) else pure (.error .eio)) with
+    | .ok b => return .ok b
+    | .error err => return .error err
+
+/-- Maximum SST file size (`64 MiB`), matching `openSst`'s bounded resident read cap
+    and ensuring 32-bit `kLen`/`vOff`/`vLen`/`numEntries` directory fields never wrap. -/
+def maxSstFileBytes : Nat := 67108864
+
 /-- Write a pre-sorted, deduplicated array of `(key, keyUtf8, valBytes)` entries into an immutable SST file at `outPath`,
-    gated by `leansys_verify_sst_block` and atomic `rename`. -/
+    gated by `maxSstFileBytes`, `leansys_verify_sst_block`, and atomic `rename`. -/
 def writeSortedPairs (pairs : Array (String × ByteArray × ByteArray)) (outPath : String) : IO (SysResult SstTable) := do
+  if pairs.size > 0xFFFFFFFF then
+    return .error .enospc
   let mut cap := 24
   for (_, kb, v) in pairs do
+    if kb.size > maxSstFileBytes || v.size > maxSstFileBytes then
+      return .error .enospc
     cap := cap + 12 + kb.size + v.size
+    if cap > maxSstFileBytes then
+      return .error .enospc
   let mut buf := ByteArray.emptyWithCapacity cap
   let mut bloom : UInt64 := 0
   for (k, _, v) in pairs do
@@ -327,44 +358,40 @@ def mergeTables (older newer : SstTable) (outPath : String) (dropTombstones : Bo
       let eo := esOld[i]!
       let en := esNew[j]!
       if eo.key == en.key then
-        let oTomb : UInt8 := if isSstTombstoneBytes older.rawBuf eo.valOff eo.valLen then 1 else 0
-        let nTomb : UInt8 := if isSstTombstoneBytes newer.rawBuf en.valOff en.valLen then 1 else 0
+        let .ok vo ← readEntryValue older eo | return .error .eio
+        let .ok vn ← readEntryValue newer en | return .error .eio
+        let oTomb : UInt8 := if isSstTombstoneBytes vo 0 vo.size then 1 else 0
+        let nTomb : UInt8 := if isSstTombstoneBytes vn 0 vn.size then 1 else 0
         let win := verifyCompactionWinner 1 nTomb 1 oTomb dropFlag
         if win == 2 then
-          if en.valOff + en.valLen ≤ newer.rawBuf.size then
-            let v := newer.rawBuf.extract en.valOff (en.valOff + en.valLen)
-            merged := merged.push (en.key, en.key.toUTF8, v)
+          merged := merged.push (en.key, en.key.toUTF8, vn)
         i := i + 1
         j := j + 1
       else if keyBytesLt eo.key.toUTF8 en.key.toUTF8 then
-        let oTomb : UInt8 := if isSstTombstoneBytes older.rawBuf eo.valOff eo.valLen then 1 else 0
+        let .ok vo ← readEntryValue older eo | return .error .eio
+        let oTomb : UInt8 := if isSstTombstoneBytes vo 0 vo.size then 1 else 0
         if verifyCompactionWinner 0 0 1 oTomb dropFlag == 1 then
-          if eo.valOff + eo.valLen ≤ older.rawBuf.size then
-            let v := older.rawBuf.extract eo.valOff (eo.valOff + eo.valLen)
-            merged := merged.push (eo.key, eo.key.toUTF8, v)
+          merged := merged.push (eo.key, eo.key.toUTF8, vo)
         i := i + 1
       else
-        let nTomb : UInt8 := if isSstTombstoneBytes newer.rawBuf en.valOff en.valLen then 1 else 0
+        let .ok vn ← readEntryValue newer en | return .error .eio
+        let nTomb : UInt8 := if isSstTombstoneBytes vn 0 vn.size then 1 else 0
         if verifyCompactionWinner 1 nTomb 0 0 dropFlag == 2 then
-          if en.valOff + en.valLen ≤ newer.rawBuf.size then
-            let v := newer.rawBuf.extract en.valOff (en.valOff + en.valLen)
-            merged := merged.push (en.key, en.key.toUTF8, v)
+          merged := merged.push (en.key, en.key.toUTF8, vn)
         j := j + 1
     else if i < esOld.size then
       let eo := esOld[i]!
-      let oTomb : UInt8 := if isSstTombstoneBytes older.rawBuf eo.valOff eo.valLen then 1 else 0
+      let .ok vo ← readEntryValue older eo | return .error .eio
+      let oTomb : UInt8 := if isSstTombstoneBytes vo 0 vo.size then 1 else 0
       if verifyCompactionWinner 0 0 1 oTomb dropFlag == 1 then
-        if eo.valOff + eo.valLen ≤ older.rawBuf.size then
-          let v := older.rawBuf.extract eo.valOff (eo.valOff + eo.valLen)
-          merged := merged.push (eo.key, eo.key.toUTF8, v)
+        merged := merged.push (eo.key, eo.key.toUTF8, vo)
       i := i + 1
     else
       let en := esNew[j]!
-      let nTomb : UInt8 := if isSstTombstoneBytes newer.rawBuf en.valOff en.valLen then 1 else 0
+      let .ok vn ← readEntryValue newer en | return .error .eio
+      let nTomb : UInt8 := if isSstTombstoneBytes vn 0 vn.size then 1 else 0
       if verifyCompactionWinner 1 nTomb 0 0 dropFlag == 2 then
-        if en.valOff + en.valLen ≤ newer.rawBuf.size then
-          let v := newer.rawBuf.extract en.valOff (en.valOff + en.valLen)
-          merged := merged.push (en.key, en.key.toUTF8, v)
+        merged := merged.push (en.key, en.key.toUTF8, vn)
       j := j + 1
   writeSortedPairs merged outPath
 

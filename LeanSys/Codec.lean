@@ -584,22 +584,27 @@ private def pushUtf8Codepoint (out : ByteArray) (cp : UInt32) : ByteArray :=
     out
 
 /-- Unescape a raw JSON string payload slice (without surrounding `"`) per RFC 8259 §7:
-    handles `\"`, `\\`, `\/`, `\b`, `\f`, `\n`, `\r`, `\t`, `\uXXXX`, and UTF-16 surrogate pairs `\uD8xx\uDCxx`. -/
+    handles `\"`, `\\`, `\/`, `\b`, `\f`, `\n`, `\r`, `\t`, `\uXXXX`, and UTF-16 surrogate pairs `\uD8xx\uDCxx`,
+    and rejects unescaped control characters (`< 0x20`) or raw unescaped `"` (`34`). -/
 def unescapeJsonSlice? (s : ByteSlice) : Option String := Id.run do
   let ba := s.ba
   let limit := Nat.min (s.off + s.len) ba.size
   let mut hasBackslash := false
   for idx in [s.off : limit] do
-    if byteAt ba idx == 92 then
+    let b := byteAt ba idx
+    if b < 0x20 then
+      return none
+    if b == 92 then
       hasBackslash := true
-      break
+    else if !hasBackslash && b == 34 then
+      return none
   if !hasBackslash then
     return String.fromUTF8? (ba.extract s.off limit)
   let mut out := ByteArray.emptyWithCapacity s.len
   let mut p := s.off
   while p < limit do
     let c := byteAt ba p
-    if c < 0x20 then
+    if c < 0x20 || c == 34 then
       return none
     if c != 92 then
       out := out.push c

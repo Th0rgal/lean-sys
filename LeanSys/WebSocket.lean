@@ -204,12 +204,35 @@ def applyMask (payload : ByteArray) (maskKey4 : ByteArray) : ByteArray := Id.run
     out := out.push (payload.get! i ^^^ m)
   return out
 
+/-- RFC 6455 §7.4 valid wire close status code predicate:
+    allows `1000..1003`, `1007..1014`, and `3000..4999`; rejects `1004`, `1005`, `1006`, `1015`, `< 1000`, `>= 5000`. -/
+def isValidCloseCode (code : UInt16) : Bool :=
+  (code ≥ 1000 && code ≤ 1003) ||
+  (code ≥ 1007 && code ≤ 1014) ||
+  (code ≥ 3000 && code ≤ 4999)
+
+/-- RFC 6455 §5.5.1 / §5.6 frame payload validation (close payload length/code/UTF-8 & complete text UTF-8). -/
+def validateFramePayload (frame : WsFrame) : Bool :=
+  match frame.opcode with
+  | .close =>
+    if frame.payload.isEmpty then true
+    else if frame.payload.size == 1 then false
+    else
+      let code : UInt16 := ((frame.payload.get! 0).toUInt16 <<< 8) ||| (frame.payload.get! 1).toUInt16
+      let reasonBytes := frame.payload.extract 2 frame.payload.size
+      isValidCloseCode code && (String.fromUTF8? reasonBytes).isSome
+  | .text =>
+    if frame.fin then (String.fromUTF8? frame.payload).isSome else true
+  | _ => true
+
 /-- Encode a `WsFrame` into RFC 6455 wire bytes:
     - Server-to-client frames pass `maskKey4? := none` (`masked = 0`).
     - Client-to-server frames pass `maskKey4? := some key4` (`masked = 1`, `key4.size == 4`).
-    - Gated by `LeanSys.Spec.verifyWsFrameHeader`. -/
+    - Gated by `LeanSys.Spec.verifyWsFrameHeader` and `validateFramePayload`. -/
 def encodeFrame? (frame : WsFrame) (maskKey4? : Option ByteArray := none)
     (maxFrameBytes : Nat := 4194304) : Option ByteArray := Id.run do
+  if !validateFramePayload frame then
+    return none
   let finBit : UInt8 := if frame.fin then 1 else 0
   let opByte := frame.opcode.toUInt8
   let (maskedBit, maskBytes) : UInt8 × ByteArray :=
@@ -314,7 +337,10 @@ def decodeFramePrefix (buf : ByteArray) (expectMasked : Bool := true)
       applyMask rawPayload maskKey
     else
       rawPayload
-  return .ok (some ({ fin := finBit == 1, opcode := opcode, payload := unmasked }, totalFrame))
+  let decoded : WsFrame := { fin := finBit == 1, opcode := opcode, payload := unmasked }
+  if !validateFramePayload decoded then
+    return .error "ws_invalid_payload"
+  return .ok (some (decoded, totalFrame))
 
 /-- Build a server-side `pong` response frame echoing a `ping` frame's payload (≤ 125 bytes). -/
 def makeServerPong? (pingPayload : ByteArray) : Option ByteArray :=

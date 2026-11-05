@@ -871,10 +871,32 @@ def decodeChunkedBody? (raw : ByteArray) (maxBytes : Nat := maxHttpBodyBytes) : 
     if !digitsSeen then return none
     p := lineEnd + 2
     if chunkLen == 0 then
-      if p + 2 ≤ raw.size && raw.get! p == 13 && raw.get! (p + 1) == 10 then
-        return some out
-      else
-        return none
+      -- RFC 9112 §7.1.3: consume optional trailer lines up to terminating empty `\r\n`
+      let mut tp := p
+      let mut trailerLines : Nat := 0
+      while tp + 1 < raw.size do
+        if raw.get! tp == 13 && raw.get! (tp + 1) == 10 then
+          return some out
+        if trailerLines >= 64 then
+          return none
+        let mut tEnd : Option Nat := none
+        for j in [tp : raw.size - 1] do
+          if raw.get! j == 13 && raw.get! (j + 1) == 10 then
+            tEnd := some j
+            break
+        let some te := tEnd | return none
+        if te - tp > 8192 then return none
+        -- Require colon inside trailer header field and no bare control bytes
+        let mut colonAt : Option Nat := none
+        for j in [tp : te] do
+          let b := raw.get! j
+          if b == 58 && colonAt.isNone then colonAt := some j
+          if b < 0x20 && b != 9 then return none
+        let some cIdx := colonAt | return none
+        if cIdx == tp then return none
+        trailerLines := trailerLines + 1
+        tp := te + 2
+      return none
     if out.size + chunkLen > maxBytes || p + chunkLen + 2 > raw.size then
       return none
     if raw.get! (p + chunkLen) != 13 || raw.get! (p + chunkLen + 1) != 10 then
@@ -883,22 +905,60 @@ def decodeChunkedBody? (raw : ByteArray) (maxBytes : Nat := maxHttpBodyBytes) : 
     p := p + chunkLen + 2
   return none
 
-/-- Validate an incoming HTTP/1.1 RFC 6455 WebSocket upgrade request (`GET`, `Upgrade: websocket`,
-    `Sec-WebSocket-Version: 13`, non-empty `Sec-WebSocket-Key`) and build the `101 Switching Protocols` wire response. -/
+/-- Check whether a comma-separated HTTP header value contains case-insensitive token `needle`. -/
+private def headerContainsTokenCI (hdrVal : String) (needle : String) : Bool := Id.run do
+  for part in hdrVal.splitOn "," do
+    if asciiEqIgnoreCase part.trimAscii.toString needle then
+      return true
+  return false
+
+/-- Validate an incoming RFC 6455 §4.2.1 `Sec-WebSocket-Key` (24-char Base64 encoding of a 16-byte nonce ending in `==`). -/
+private def isValidSecWebSocketKey (k : String) : Bool := Id.run do
+  let b := k.toUTF8
+  if b.size != 24 then return false
+  if b.get! 22 != 61 || b.get! 23 != 61 then return false
+  let isB64 (c : UInt8) : Bool :=
+    (65 ≤ c && c ≤ 90) || (97 ≤ c && c ≤ 122) || (48 ≤ c && c ≤ 57) || c == 43 || c == 47
+  for i in [0:22] do
+    if !isB64 (b.get! i) then return false
+  -- 22nd Base64 char encodes 2 payload bits + 4 zero padding bits (`A`, `Q`, `g`, `w`)
+  let c21 := b.get! 21
+  return c21 == 65 || c21 == 81 || c21 == 103 || c21 == 119
+
+/-- Validate an incoming HTTP/1.1 RFC 6455 WebSocket upgrade request (`GET`, `Connection: Upgrade`,
+    `Upgrade: websocket`, `Sec-WebSocket-Version: 13`, valid 16-byte Base64 `Sec-WebSocket-Key`,
+    no duplicate singleton handshake headers, and offered `Sec-WebSocket-Protocol` match)
+    and build the `101 Switching Protocols` wire response. -/
 def buildWebSocketUpgradeResponse? (req : HttpRequest) (protocol? : Option String := none) : Option ByteArray := do
   if req.method != "GET" then none
-  let upg ← req.findHeader? "upgrade"
-  if !asciiEqIgnoreCase upg "websocket" then none
+  -- Reject duplicate singleton WebSocket handshake headers
+  let mut keyCount : Nat := 0
+  let mut verCount : Nat := 0
+  let mut connUpgrade := false
+  let mut upgWebsocket := false
+  let mut offeredProtos : Array String := #[]
+  for (hk, hv) in req.headers do
+    if asciiEqIgnoreCase hk "sec-websocket-key" then keyCount := keyCount + 1
+    else if asciiEqIgnoreCase hk "sec-websocket-version" then verCount := verCount + 1
+    else if asciiEqIgnoreCase hk "connection" then
+      if headerContainsTokenCI hv "upgrade" then connUpgrade := true
+    else if asciiEqIgnoreCase hk "upgrade" then
+      if headerContainsTokenCI hv "websocket" then upgWebsocket := true
+    else if asciiEqIgnoreCase hk "sec-websocket-protocol" then
+      for pTok in hv.splitOn "," do
+        let t := pTok.trimAscii.toString
+        if !t.isEmpty then offeredProtos := offeredProtos.push t
+  if !connUpgrade || !upgWebsocket || keyCount != 1 || verCount != 1 then none
   let ver ← req.findHeader? "sec-websocket-version"
   if ver.trimAscii.toString != "13" then none
   let wsKey ← req.findHeader? "sec-websocket-key"
   let keyTrim := wsKey.trimAscii.toString
-  if keyTrim.isEmpty || hasHttpFieldControlByte keyTrim then none
+  if !isValidSecWebSocketKey keyTrim || hasHttpFieldControlByte keyTrim then none
   let acceptVal := LeanSys.WebSocket.computeAcceptKey keyTrim
   let protoHdr ← match protocol? with
     | none => some ""
     | some pr =>
-      if pr.isEmpty || hasHttpFieldControlByte pr then none
+      if pr.isEmpty || !isHttpToken pr || !offeredProtos.contains pr then none
       else some s!"Sec-WebSocket-Protocol: {pr}\r\n"
   some (
     "HTTP/1.1 101 Switching Protocols\r\n" ++
