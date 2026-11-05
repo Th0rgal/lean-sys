@@ -279,7 +279,7 @@ def encodeFrame? (frame : WsFrame) (maskKey4? : Option ByteArray := none)
     - Returns `.error reason` immediately when `verifyWsFrameHeader` or minimal-length encoding rules reject the header! -/
 def decodeFramePrefix (buf : ByteArray) (expectMasked : Bool := true)
     (maxFrameBytes : Nat := 4194304) : Except String (Option (WsFrame × Nat)) := Id.run do
-  if buf.size < 2 then
+  if verifySliceBounds 0 2 buf.size.toUInt64 != 1 then
     return .ok none
   let b0 := buf.get! 0
   let b1 := buf.get! 1
@@ -301,7 +301,7 @@ def decodeFramePrefix (buf : ByteArray) (expectMasked : Bool := true)
   let some opcode := WsOpcode.ofUInt8? opByte
     | return .error "ws_invalid_opcode"
 
-  if buf.size < 2 + extLen then
+  if verifySliceBounds 0 (2 + extLen).toUInt64 buf.size.toUInt64 != 1 then
     return .ok none
 
   let payloadLenU64 : UInt64 ←
@@ -327,7 +327,7 @@ def decodeFramePrefix (buf : ByteArray) (expectMasked : Bool := true)
 
   let pLen := payloadLenU64.toNat
   let totalFrame := hdrLen + pLen
-  if buf.size < totalFrame then
+  if verifySliceBounds 0 totalFrame.toUInt64 buf.size.toUInt64 != 1 then
     return .ok none
 
   let rawPayload := buf.extract hdrLen totalFrame

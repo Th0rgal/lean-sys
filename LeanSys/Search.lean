@@ -112,7 +112,7 @@ def lookupTrigramPostings (tbl : SstTable) (tri : UInt32) : Array String := Id.r
   while idx < es.size do
     let e := es[idx]!
     if !e.key.startsWith prefixStr then break
-    if e.valOff + e.valLen ≤ tbl.rawBuf.size then
+    if verifySliceBounds e.valOff.toUInt64 e.valLen.toUInt64 tbl.rawBuf.size.toUInt64 == 1 then
       let sl : ByteSlice := { ba := tbl.rawBuf, off := e.valOff, len := e.valLen }
       if !LeanSys.Table.isTombstoneSlice sl then
         let docId := String.fromUTF8! (e.key.toUTF8.extract prefixLen e.key.utf8ByteSize)
@@ -184,7 +184,7 @@ def searchTrigramSst (tbl : SstTable) (query : String) (limit : Nat := 64) : Arr
     while idx < es.size && out.size < limit do
       let e := es[idx]!
       if !e.key.startsWith docPrefix then break
-      if e.valOff + e.valLen ≤ tbl.rawBuf.size then
+      if verifySliceBounds e.valOff.toUInt64 e.valLen.toUInt64 tbl.rawBuf.size.toUInt64 == 1 then
         let docSlice : ByteSlice := { ba := tbl.rawBuf, off := e.valOff, len := e.valLen }
         if !LeanSys.Table.isTombstoneSlice docSlice then
           let docBytes := docSlice.toByteArray

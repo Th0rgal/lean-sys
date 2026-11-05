@@ -558,7 +558,7 @@ private def hexNib? (b : UInt8) : Option UInt32 :=
 
 @[inline]
 private def parseHex4? (ba : ByteArray) (pos limit : Nat) : Option UInt32 := do
-  if pos + 4 > limit then none
+  if verifySliceBounds pos.toUInt64 4 limit.toUInt64 != 1 then none
   let n0 ← hexNib? (byteAt ba pos)
   let n1 ← hexNib? (byteAt ba (pos + 1))
   let n2 ← hexNib? (byteAt ba (pos + 2))
@@ -610,7 +610,7 @@ def unescapeJsonSlice? (s : ByteSlice) : Option String := Id.run do
       out := out.push c
       p := p + 1
     else
-      if p + 1 ≥ limit then return none
+      if verifySliceBounds p.toUInt64 2 limit.toUInt64 != 1 then return none
       let esc := byteAt ba (p + 1)
       if esc == 34 then out := out.push 34; p := p + 2
       else if esc == 92 then out := out.push 92; p := p + 2
@@ -625,7 +625,7 @@ def unescapeJsonSlice? (s : ByteSlice) : Option String := Id.run do
         | none => return none
         | some u1 =>
           if 0xD800 ≤ u1 && u1 ≤ 0xDBFF then
-            if p + 12 ≤ limit && byteAt ba (p + 6) == 92 && byteAt ba (p + 7) == 117 then
+            if verifySliceBounds p.toUInt64 12 limit.toUInt64 == 1 && byteAt ba (p + 6) == 92 && byteAt ba (p + 7) == 117 then
               match parseHex4? ba (p + 8) limit with
               | some u2 =>
                 if 0xDC00 ≤ u2 && u2 ≤ 0xDFFF then

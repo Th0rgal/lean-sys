@@ -759,7 +759,7 @@ def percentDecode (s : String) (plusAsSpace : Bool := false) : String := Id.run 
   let mut i : Nat := 0
   while i < b.size do
     let c := b.get! i
-    if c == 37 && i + 2 < b.size then -- '%'
+    if c == 37 && verifySliceBounds i.toUInt64 3 b.size.toUInt64 == 1 then -- '%'
       match pctNib? (b.get! (i + 1)), pctNib? (b.get! (i + 2)) with
       | some hi, some lo =>
         out := out.push ((hi <<< 4) ||| lo)

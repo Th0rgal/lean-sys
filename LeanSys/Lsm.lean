@@ -229,7 +229,7 @@ def openSstLazy (sstPath : String) : IO (SysResult SstTable) := do
     on short/corrupted reads so compaction and lazy search never silently drop keys. -/
 def readEntryValue (tbl : SstTable) (e : SstIndexEntry) : IO (SysResult ByteArray) := do
   if !tbl.rawBuf.isEmpty then
-    if e.valOff + e.valLen ≤ tbl.rawBuf.size then
+    if verifySliceBounds e.valOff.toUInt64 e.valLen.toUInt64 tbl.rawBuf.size.toUInt64 == 1 then
       return .ok (tbl.rawBuf.extract e.valOff (e.valOff + e.valLen))
     else
       return .error .eio
@@ -289,7 +289,7 @@ def flushAndCompactStore (st : Store.Handle) (sstPath : String) : IO (SysResult 
 /-- Explicit 5-byte LSM tombstone sentinel (`0xFF 0x00 'D' 'E' 'L'`), matching `LeanSys.Table.tombstoneMarker`. -/
 @[inline]
 private def isSstTombstoneBytes (ba : ByteArray) (off len : Nat) : Bool :=
-  len == 5 && off + 5 ≤ ba.size &&
+  len == 5 && verifySliceBounds off.toUInt64 5 ba.size.toUInt64 == 1 &&
   ba.get! off == 0xFF &&
   ba.get! (off + 1) == 0x00 &&
   ba.get! (off + 2) == 0x44 &&
