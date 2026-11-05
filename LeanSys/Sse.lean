@@ -195,7 +195,8 @@ def pushChunk? (st : SseEventStream) (chunk : ByteSlice) : Option (SseEventStrea
     let b := rawBuf.get! i
     if b == 10 || b == 13 then -- '\n' or '\r'
       let lineEnd := i
-      if lineEnd - lineStart > st.maxCarryCap then
+      if verifySliceBounds lineStart.toUInt64 (lineEnd - lineStart).toUInt64 (rawBuf.size).toUInt64 != 1 ||
+         verifySliceBounds 0 (lineEnd - lineStart).toUInt64 st.maxCarryCap.toUInt64 != 1 then
         return none
       let nextPos :=
         if b == 13 then
@@ -226,7 +227,7 @@ def pushChunk? (st : SseEventStream) (chunk : ByteSlice) : Option (SseEventStrea
         | [] => pure ()
         | [fieldOnly] =>
           if fieldOnly == "data" then
-            if pendBytes + 1 > st.maxCarryCap then
+            if verifySliceBounds (pendBytes + curEv.utf8ByteSize).toUInt64 1 st.maxCarryCap.toUInt64 != 1 then
               return none
             dLines := dLines.push ""
             pendBytes := pendBytes + 1
@@ -239,16 +240,16 @@ def pushChunk? (st : SseEventStream) (chunk : ByteSlice) : Option (SseEventStrea
           let val := if rawVal.startsWith " " then (rawVal.drop 1).toString else rawVal
           if field == "data" then
             let addBytes := val.utf8ByteSize + 1
-            if pendBytes + addBytes > st.maxCarryCap then
+            if verifySliceBounds (pendBytes + curEv.utf8ByteSize).toUInt64 addBytes.toUInt64 st.maxCarryCap.toUInt64 != 1 then
               return none
             dLines := dLines.push val
             pendBytes := pendBytes + addBytes
           else if field == "event" then
-            if val.utf8ByteSize > st.maxCarryCap then
+            if verifySliceBounds pendBytes.toUInt64 val.utf8ByteSize.toUInt64 st.maxCarryCap.toUInt64 != 1 then
               return none
             curEv := val
           else if field == "id" then
-            if val.utf8ByteSize > st.maxCarryCap then
+            if verifySliceBounds 0 val.utf8ByteSize.toUInt64 st.maxCarryCap.toUInt64 != 1 then
               return none
             -- W3C SSE §9.2.6: ignore `id` containing NULL
             if (val.splitOn "\x00").length == 1 then
@@ -261,7 +262,7 @@ def pushChunk? (st : SseEventStream) (chunk : ByteSlice) : Option (SseEventStrea
     else
       i := i + 1
   let rem := if lineStart < rawBuf.size then rawBuf.extract lineStart rawBuf.size else ByteArray.empty
-  if rem.size + pendBytes + curEv.utf8ByteSize > st.maxCarryCap then
+  if verifySliceBounds (pendBytes + curEv.utf8ByteSize).toUInt64 rem.size.toUInt64 st.maxCarryCap.toUInt64 != 1 then
     return none
   return some ({
     carry := rem

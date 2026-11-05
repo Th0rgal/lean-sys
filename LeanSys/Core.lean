@@ -644,11 +644,14 @@ def selfTestWave1Features (testDir : String) : IO UInt32 := do
   let some (_, cappedDispatchAndNext) := capped1.pushChunk? (ByteSlice.ofString "\ndata: x\n\n")
     | do IO.eprintln "[lean-sys-core] FAIL: SseEventStream chunk boundary across dispatch rejected!"; return 1
   let cappedOverflow := capped1.pushChunk? (ByteSlice.ofString "data: 12345678\n")
+  -- Combined `event:` + `data:` retained size must also be gated before dispatch (8 + 9 > 16 -> `none`)
+  let cappedCombinedEvData := (SseEventStream.init 16).pushChunk? (ByteSlice.ofString "event: 12345678\ndata: 12345678\n\n")
   if !evs1.isEmpty || evs2 != #[sseEv] ||
      evsCr.size != 1 || evsCr[0]!.retryMs? != some 1500 || evsCr[0]!.data != "ok" ||
      lossySubpart != "\uFFFD" ++ "A" ||
      cappedDispatchAndNext.size != 2 ||
-     cappedOverflow.isSome then
+     cappedOverflow.isSome ||
+     cappedCombinedEvData.isSome then
     IO.eprintln s!"[lean-sys-core] FAIL: SseEventStream reassembly/cap/CR/UTF8 mismatch: {repr evs2} / {repr evsCr} / {repr lossySubpart}"
     return 1
 
@@ -699,6 +702,7 @@ def selfTestWave1Features (testDir : String) : IO UInt32 := do
   let routeHit := matchRoutePattern? "/api/missions/:id/events" "/api/missions/m-77/events?limit=20&q=hello+world%21"
   let routeTraversal := matchRoutePattern? "/api/files/:name" "/api/files/.."
   let qParams := parseQueryParams "/api/missions/m-77/events?limit=20&q=hello+world%21"
+  let qRawQuestion := parseQueryParams "q=what?ever&limit=2"
   let chWire := encodeHttpChunk (ByteSlice.ofString "chunk-one-") ++
                 encodeHttpChunk (ByteSlice.ofString "chunk-two") ++
                 "0\r\nX-Checksum: ok\r\n\r\n".toUTF8
@@ -720,6 +724,7 @@ def selfTestWave1Features (testDir : String) : IO UInt32 := do
     | _, _, _ => false
   if routeHit != some #[("id", "m-77")] || routeTraversal.isSome ||
      qParams != #[("limit", "20"), ("q", "hello world!")] ||
+     qRawQuestion != #[("q", "what?ever"), ("limit", "2")] ||
      decodeChunkedBody? chWire != some "chunk-one-chunk-two".toUTF8 ||
      !wsUpgOk || !wsRejectOk || (parseRequest patchRaw none).toOption.isNone then
     IO.eprintln "[lean-sys-core] FAIL: HTTP route/query/chunked/WS-upgrade/PATCH check failed"

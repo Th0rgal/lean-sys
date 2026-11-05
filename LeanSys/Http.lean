@@ -775,10 +775,11 @@ def percentDecode (s : String) (plusAsSpace : Bool := false) : String := Id.run 
       i := i + 1
   return String.fromUTF8? out |>.getD s
 
-/-- Parse a URL query string (`a=1&b=hello%20world`, with or without leading `?`) into `(key, value)` pairs (bounded `≤ 64` params). -/
+/-- Parse a URL query string (`a=1&b=hello%20world`, leading `?a=1`, or `/path?a=1`) into `(key, value)` pairs (bounded `≤ 64` params),
+    preserving literal `?` characters inside raw query values (`q=what?ever&limit=2`). -/
 def parseQueryParams (rawQueryOrTarget : String) : Array (String × String) := Id.run do
   let q :=
-    if (rawQueryOrTarget.splitOn "?").length > 1 then
+    if rawQueryOrTarget.startsWith "/" then
       (splitPathAndQuery rawQueryOrTarget).2
     else if rawQueryOrTarget.startsWith "?" then
       (rawQueryOrTarget.drop 1).toString
@@ -788,7 +789,7 @@ def parseQueryParams (rawQueryOrTarget : String) : Array (String × String) := I
   let parts := q.splitOn "&"
   let mut out : Array (String × String) := #[]
   for part in parts do
-    if out.size >= 64 then break
+    if verifySliceBounds out.size.toUInt64 1 64 != 1 then break
     if !part.isEmpty then
       match part.splitOn "=" with
       | [] => pure ()
@@ -879,7 +880,7 @@ def decodeChunkedBody? (raw : ByteArray) (maxBytes : Nat := maxHttpBodyBytes) : 
       while tp + 1 < raw.size do
         if raw.get! tp == 13 && raw.get! (tp + 1) == 10 then
           return some out
-        if trailerLines >= 64 then
+        if verifySliceBounds trailerLines.toUInt64 1 64 != 1 then
           return none
         let mut tEnd : Option Nat := none
         for j in [tp : raw.size - 1] do
@@ -887,7 +888,7 @@ def decodeChunkedBody? (raw : ByteArray) (maxBytes : Nat := maxHttpBodyBytes) : 
             tEnd := some j
             break
         let some te := tEnd | return none
-        if te - tp > 8192 then return none
+        if verifySliceBounds 0 (te - tp).toUInt64 8192 != 1 then return none
         -- Require colon inside trailer header field and no bare control bytes
         let mut colonAt : Option Nat := none
         for j in [tp : te] do
@@ -899,7 +900,8 @@ def decodeChunkedBody? (raw : ByteArray) (maxBytes : Nat := maxHttpBodyBytes) : 
         trailerLines := trailerLines + 1
         tp := te + 2
       return none
-    if out.size + chunkLen > maxBytes || p + chunkLen + 2 > raw.size then
+    if verifySliceBounds out.size.toUInt64 chunkLen.toUInt64 maxBytes.toUInt64 != 1 ||
+       verifySliceBounds p.toUInt64 (chunkLen + 2).toUInt64 raw.size.toUInt64 != 1 then
       return none
     if raw.get! (p + chunkLen) != 13 || raw.get! (p + chunkLen + 1) != 10 then
       return none
