@@ -11,9 +11,12 @@ import LeanSys.Store
 import LeanSys.Mmap
 import LeanSys.Lsm
 import LeanSys.Table
+import LeanSys.Search
 import LeanSys.Auth
 import LeanSys.ProcLog
 import LeanSys.JsonRpc
+import LeanSys.Sse
+import LeanSys.WebSocket
 import LeanSys.Http
 import LeanSys.Reactor
 import LeanSys.Sandbox
@@ -29,9 +32,12 @@ open LeanSys.Store
 open LeanSys.Mmap
 open LeanSys.Lsm
 open LeanSys.Table
+open LeanSys.Search
 open LeanSys.Auth
 open LeanSys.ProcLog
 open LeanSys.JsonRpc
+open LeanSys.Sse
+open LeanSys.WebSocket
 open LeanSys.Http
 open LeanSys.Reactor
 open LeanSys.Sandbox
@@ -520,6 +526,136 @@ def selfTestWave1Features (testDir : String) : IO UInt32 := do
       return 1
   | none =>
     IO.eprintln "[lean-sys-core] FAIL: relayHttpStream disconnect test returned none"
+    return 1
+
+  -- 10. Wave 0.B: Multi-SST Compaction (`mergeTables` / `compactLevels` no-resurrection),
+  --     Pure-Lean Trigram Search (`Search.lean`), RFC 8259 JSON Escape/Unescape & Nested Traversal,
+  --     W3C SSE (`Sse.lean`), RFC 6455 WebSocket (`WebSocket.lean`), and Route/Query/Chunked HTTP Helpers!
+  let lsmDir := s!"{testDir}/w0b-lsm"
+  let .ok gen0 ← openStore s!"{lsmDir}/g0" | return 1
+  let .ok gen0 ← Store.putString gen0 "alpha" "v0-alpha" false | return 1
+  let .ok gen0 ← Store.putString gen0 "beta" "v0-beta" false | return 1
+  let .ok sst0 ← SstTable.flushStore gen0 s!"{lsmDir}/l0.sst" | return 1
+
+  let .ok gen1 ← openStore s!"{lsmDir}/g1" | return 1
+  -- Delete "alpha" with explicit tombstone in gen1, update "beta", add "gamma"
+  let .ok gen1 ← Store.put gen1 "alpha" (ByteSlice.ofByteArray tombstoneMarker) false | return 1
+  let .ok gen1 ← Store.putString gen1 "beta" "v1-beta" false | return 1
+  let .ok gen1 ← Store.putString gen1 "gamma" "v1-gamma" false | return 1
+  let .ok sst1 ← SstTable.flushStore gen1 s!"{lsmDir}/l1.sst" | return 1
+
+  let .ok gen2 ← openStore s!"{lsmDir}/g2" | return 1
+  let .ok gen2 ← Store.putString gen2 "delta" "v2-delta" false | return 1
+  let .ok sst2 ← SstTable.flushStore gen2 s!"{lsmDir}/l2.sst" | return 1
+
+  let .ok compacted ← SstTable.compactLevels #[sst0, sst1, sst2] s!"{lsmDir}/compacted.sst" true
+    | do IO.eprintln "[lean-sys-core] FAIL: SstTable.compactLevels"; return 1
+  if (SstTable.getString? compacted "alpha").isSome ||
+     SstTable.getString? compacted "beta" != some "v1-beta" ||
+     SstTable.getString? compacted "gamma" != some "v1-gamma" ||
+     SstTable.getString? compacted "delta" != some "v2-delta" then
+    IO.eprintln "[lean-sys-core] FAIL: compactLevels tombstone masking or newer-wins violated!"
+    return 1
+
+  -- Trigram search (`LeanSys.Search`)
+  let searchDir := s!"{testDir}/w0b-search"
+  let .ok sStore ← openStore searchDir | return 1
+  let .ok sStore ← indexDoc sStore "m-001" "Refactor Orb control plane to native Lean4" false | return 1
+  let .ok sStore ← indexDoc sStore "m-002" "QUIC RFC 9000 stream multiplexer and HTTP/3 QPACK" false | return 1
+  let .ok sStore ← indexDoc sStore "m-003" "abc" false | return 1
+  let .ok searchSst ← SstTable.flushStore sStore s!"{searchDir}/index.sst" | return 1
+  let hitsLean := searchTrigramSst searchSst "lean4" 10
+  let hitsQuic := searchTrigramSst searchSst "multiplexer" 10
+  let hitsShort := searchTrigramSst searchSst "ab" 10
+  let hitsLen3 := searchTrigramSst searchSst "abc" 10
+  if hitsLean.size != 1 || hitsLean[0]!.1 != "m-001" ||
+     hitsQuic.size != 1 || hitsQuic[0]!.1 != "m-002" ||
+     hitsShort.size != 1 || hitsShort[0]!.1 != "m-003" ||
+     hitsLen3.size != 1 || hitsLen3[0]!.1 != "m-003" then
+    IO.eprintln s!"[lean-sys-core] FAIL: searchTrigramSst mismatch: {repr hitsLean} / {repr hitsQuic} / {repr hitsShort} / {repr hitsLen3}"
+    return 1
+
+  -- RFC 8259 JSON escape/unescape & nested object/array traversal (`LeanSys.Codec`)
+  let nestedRaw := "{\"msg\":\"line1\\n\\\"quoted\\\"\\u0021\\uD83D\\uDE80\",\"meta\":{\"ok\":true,\"count\":7},\"items\":[\"x\",{\"k\":9},42]}"
+  let rootTape := JsonTape.indexJsonObject (ByteSlice.ofString nestedRaw)
+  let unescMsg? := JsonTape.lookupStringUnescaped? rootTape "msg"
+  let subObj? := JsonTape.lookupObjectTape? rootTape "meta"
+  let itemsArr := match JsonTape.lookupSlice? rootTape "items" with
+    | some (sl, false) => scanJsonArraySlices sl
+    | _ => #[]
+  let roundTripStr := "tab\there\n\"slash\\end"
+  if unescMsg? != some "line1\n\"quoted\"!🚀" ||
+     (subObj?.bind (fun t => JsonTape.lookupNat? t "count")) != some 7 ||
+     itemsArr.size != 3 || !itemsArr[0]!.2 || itemsArr[1]!.2 ||
+     unescapeJsonString? (escapeJsonString roundTripStr) != some roundTripStr then
+    IO.eprintln s!"[lean-sys-core] FAIL: RFC 8259 JSON unescape/nested traversal mismatch: {repr unescMsg?}"
+    return 1
+
+  -- W3C SSE encode + multi-chunk accumulator (`LeanSys.Sse`)
+  let sseEv : SseEvent := { event := "delta", id? := some "42", data := "first line\nsecond: line" }
+  let some sseWire := formatSseEvent? sseEv
+    | do IO.eprintln "[lean-sys-core] FAIL: formatSseEvent? valid event"; return 1
+  -- CR/LF header injection MUST fail closed (`none`)
+  if (formatSseEvent? { event := "bad\nevent", data := "x" }).isSome then
+    IO.eprintln "[lean-sys-core] FAIL: formatSseEvent? accepted CR/LF injection!"
+    return 1
+  let combinedSse := formatSseKeepalive "ping" ++ sseWire
+  let splitMid := combinedSse.size / 2
+  let stSse0 := SseEventStream.init
+  let some (stSse1, evs1) := stSse0.pushChunk? (ByteSlice.ofByteArray (combinedSse.extract 0 splitMid))
+    | do IO.eprintln "[lean-sys-core] FAIL: SseEventStream.pushChunk? part 1"; return 1
+  let some (_, evs2) := stSse1.pushChunk? (ByteSlice.ofByteArray (combinedSse.extract splitMid combinedSse.size))
+    | do IO.eprintln "[lean-sys-core] FAIL: SseEventStream.pushChunk? part 2"; return 1
+  if !evs1.isEmpty || evs2 != #[sseEv] then
+    IO.eprintln s!"[lean-sys-core] FAIL: SseEventStream reassembly mismatch: {repr evs2}"
+    return 1
+
+  -- RFC 6455 WebSocket handshake + masked client / unmasked server frame roundtrip (`LeanSys.WebSocket`)
+  if computeAcceptKey "dGhlIHNhbXBsZSBub25jZQ==" != "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=" then
+    IO.eprintln "[lean-sys-core] FAIL: RFC 6455 computeAcceptKey vector mismatch"
+    return 1
+  let mask4 := ByteArray.mk #[0x37, 0xFA, 0x21, 0x3D]
+  let clientPayload := (String.ofList (List.replicate 300 'W')).toUTF8
+  let some clientWire := encodeFrame? { fin := true, opcode := .text, payload := clientPayload } (some mask4)
+    | do IO.eprintln "[lean-sys-core] FAIL: encodeFrame? masked 16-bit extended frame"; return 1
+  -- Server rejecting unmasked client frame & oversized (>125 B) Ping frame
+  let some serverWire := encodeFrame? { fin := true, opcode := .binary, payload := "srv".toUTF8 } none
+    | do IO.eprintln "[lean-sys-core] FAIL: encodeFrame? server frame"; return 1
+  if (encodeFrame? { fin := true, opcode := .ping, payload := clientPayload } (some mask4)).isSome then
+    IO.eprintln "[lean-sys-core] FAIL: encodeFrame? allowed >125B Ping control frame!"
+    return 1
+  match decodeFramePrefix (clientWire.extract 0 5) true,
+        decodeFramePrefix clientWire true,
+        decodeFramePrefix serverWire true,
+        decodeFramePrefix serverWire false with
+  | .ok none, .ok (some (decCli, usedCli)), .error "ws_mask_role_violation", .ok (some (decSrv, _)) =>
+    if usedCli != clientWire.size || decCli.payload != clientPayload || decCli.opcode != .text ||
+       decSrv.payload != "srv".toUTF8 then
+      IO.eprintln "[lean-sys-core] FAIL: decodeFramePrefix payload mismatch"
+      return 1
+  | a, b, c, d =>
+    IO.eprintln s!"[lean-sys-core] FAIL: decodeFramePrefix unexpected outcomes: {a.isOk} / {b.isOk} / {c.isOk} / {d.isOk}"
+    return 1
+
+  -- Parameterized HTTP routes, query params, chunked body & 101 WebSocket Upgrade (`LeanSys.Http`)
+  let routeHit := matchRoutePattern? "/api/missions/:id/events" "/api/missions/m-77/events?limit=20&q=hello+world%21"
+  let routeTraversal := matchRoutePattern? "/api/files/:name" "/api/files/.."
+  let qParams := parseQueryParams "/api/missions/m-77/events?limit=20&q=hello+world%21"
+  let chWire := encodeHttpChunk (ByteSlice.ofString "chunk-one-") ++
+                encodeHttpChunk (ByteSlice.ofString "chunk-two") ++
+                encodeHttpChunk (ByteSlice.ofByteArray ByteArray.empty)
+  let wsUpgRaw := ("GET /api/console/ws HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n").toUTF8
+  let patchRaw := ("PATCH /api/missions/m-77 HTTP/1.1\r\nHost: localhost\r\nContent-Length: 2\r\n\r\n{}").toUTF8
+  let wsUpgOk := match parseRequest wsUpgRaw none with
+    | .ok r => match buildWebSocketUpgradeResponse? r with
+      | some w => ((String.fromUTF8! w).splitOn "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=").length == 2
+      | none => false
+    | .error _ => false
+  if routeHit != some #[("id", "m-77")] || routeTraversal.isSome ||
+     qParams != #[("limit", "20"), ("q", "hello world!")] ||
+     decodeChunkedBody? chWire != some "chunk-one-chunk-two".toUTF8 ||
+     !wsUpgOk || (parseRequest patchRaw none).toOption.isNone then
+    IO.eprintln "[lean-sys-core] FAIL: HTTP route/query/chunked/WS-upgrade/PATCH check failed"
     return 1
 
   return 0

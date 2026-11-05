@@ -13,6 +13,7 @@
 import LeanSys.Spec
 import LeanSys.Posix
 import LeanSys.Auth
+import LeanSys.WebSocket
 
 namespace LeanSys.Http
 
@@ -51,6 +52,7 @@ def json (status : Nat) (jsonBody : String) : HttpResponse :=
 /-- Canonical HTTP/1.1 reason phrase for status code. -/
 def reasonPhrase (status : Nat) : String :=
   match status with
+  | 101 => "Switching Protocols"
   | 200 => "OK"
   | 201 => "Created"
   | 204 => "No Content"
@@ -61,6 +63,7 @@ def reasonPhrase (status : Nat) : String :=
   | 405 => "Method Not Allowed"
   | 408 => "Request Timeout"
   | 413 => "Payload Too Large"
+  | 426 => "Upgrade Required"
   | 431 => "Request Header Fields Too Large"
   | 500 => "Internal Server Error"
   | _   => "OK"
@@ -257,7 +260,8 @@ def parseRequestPrefix (raw : ByteArray) (expectedBearer? : Option String := non
       .error "unsupported_http_version"
     if path.isEmpty || !path.startsWith "/" then
       .error "malformed_request_target"
-    if method != "GET" && method != "POST" && method != "HEAD" && method != "PUT" && method != "DELETE" then
+    if method != "GET" && method != "POST" && method != "HEAD" && method != "PUT" &&
+       method != "DELETE" && method != "PATCH" && method != "OPTIONS" then
       .error s!"unsupported_method:{method}"
     let (headers, contentLen?, authBearer) ← parseValidatedHeaders hdrLines
     let declContentLen := contentLen?.getD 0
@@ -664,7 +668,8 @@ def parseRequestSourcePrefix (src : ByteSource) (expectedBearer? : Option String
       .error "unsupported_http_version"
     if path.isEmpty || !path.startsWith "/" then
       .error "malformed_request_target"
-    if method != "GET" && method != "POST" && method != "HEAD" && method != "PUT" && method != "DELETE" then
+    if method != "GET" && method != "POST" && method != "HEAD" && method != "PUT" &&
+       method != "DELETE" && method != "PATCH" && method != "OPTIONS" then
       .error s!"unsupported_method:{method}"
     let (headers, contentLen?, authBearer) ← parseValidatedHeaders hdrLines
     let declContentLen := contentLen?.getD 0
@@ -728,5 +733,180 @@ def tryParseIncremental (buf : ByteArray) (expectedBearer? : Option String := no
           let (req, consumed) ← parseRequestPrefix buf expectedBearer? true
           let rem := if consumed < buf.size then buf.extract consumed buf.size else ByteArray.empty
           .ok (some (req, rem))
+
+/-! ## Parameterized Route Matching, Query-String Parsing, Chunked Responses & RFC 6455 Upgrade -/
+
+/-- Strip any `?query` suffix from `rawTarget`, returning `(cleanPath, queryString)`. -/
+def splitPathAndQuery (rawTarget : String) : String × String :=
+  match rawTarget.splitOn "?" with
+  | [] => ("", "")
+  | [onlyPath] => (onlyPath, "")
+  | p :: rest => (p, String.intercalate "?" rest)
+
+@[inline]
+private def pctNib? (b : UInt8) : Option UInt8 :=
+  if 48 ≤ b && b ≤ 57 then some (b - 48)
+  else if 65 ≤ b && b ≤ 70 then some (b - 55)
+  else if 97 ≤ b && b ≤ 102 then some (b - 87)
+  else none
+
+/-- Percent-decode a URL query or path component (`%XX` and `+` → `' '` when `plusAsSpace := true`). -/
+def percentDecode (s : String) (plusAsSpace : Bool := false) : String := Id.run do
+  let b := s.toUTF8
+  let mut out := ByteArray.emptyWithCapacity b.size
+  let mut i : Nat := 0
+  while i < b.size do
+    let c := b.get! i
+    if c == 37 && i + 2 < b.size then -- '%'
+      match pctNib? (b.get! (i + 1)), pctNib? (b.get! (i + 2)) with
+      | some hi, some lo =>
+        out := out.push ((hi <<< 4) ||| lo)
+        i := i + 3
+      | _, _ =>
+        out := out.push c
+        i := i + 1
+    else if plusAsSpace && c == 43 then -- '+'
+      out := out.push 32
+      i := i + 1
+    else
+      out := out.push c
+      i := i + 1
+  return String.fromUTF8? out |>.getD s
+
+/-- Parse a URL query string (`a=1&b=hello%20world`, with or without leading `?`) into `(key, value)` pairs (bounded `≤ 64` params). -/
+def parseQueryParams (rawQueryOrTarget : String) : Array (String × String) := Id.run do
+  let q :=
+    if (rawQueryOrTarget.splitOn "?").length > 1 then
+      (splitPathAndQuery rawQueryOrTarget).2
+    else if rawQueryOrTarget.startsWith "?" then
+      (rawQueryOrTarget.drop 1).toString
+    else
+      rawQueryOrTarget
+  if q.isEmpty then return #[]
+  let parts := q.splitOn "&"
+  let mut out : Array (String × String) := #[]
+  for part in parts do
+    if out.size >= 64 then break
+    if !part.isEmpty then
+      match part.splitOn "=" with
+      | [] => pure ()
+      | [kOnly] => out := out.push (percentDecode kOnly true, "")
+      | k :: rest => out := out.push (percentDecode k true, percentDecode (String.intercalate "=" rest) true)
+  return out
+
+/-- Match a request path against a parameterized route pattern (e.g. `"/api/missions/:id/events"`),
+    ignoring any `?query` suffix and rejecting empty or `..` traversal parameter segments.
+    Returns `some #[("id", "m-123")]` on match, or `none` on mismatch. -/
+def matchRoutePattern? (pattern : String) (reqTarget : String) : Option (Array (String × String)) := Id.run do
+  let (cleanPath, _) := splitPathAndQuery reqTarget
+  let patSegs := (pattern.splitOn "/").filter (!·.isEmpty)
+  let reqSegs := (cleanPath.splitOn "/").filter (!·.isEmpty)
+  if patSegs.length != reqSegs.length then
+    return none
+  let mut params : Array (String × String) := #[]
+  let mut pairs := patSegs.zip reqSegs
+  while !pairs.isEmpty do
+    match pairs with
+    | [] => break
+    | (pSeg, rSeg) :: rest =>
+      pairs := rest
+      if pSeg.startsWith ":" then
+        let pName := (pSeg.drop 1).toString
+        let decoded := percentDecode rSeg false
+        if pName.isEmpty || decoded.isEmpty || decoded == "." || decoded == ".." ||
+           (decoded.splitOn "/").length > 1 then
+          return none
+        params := params.push (pName, decoded)
+      else if pSeg != rSeg then
+        return none
+  return some params
+
+/-- Case-insensitive lookup of a single header value on `HttpRequest`. -/
+def HttpRequest.findHeader? (req : HttpRequest) (name : String) : Option String := Id.run do
+  for (k, v) in req.headers do
+    if asciiEqIgnoreCase k name then
+      return some v
+  return none
+
+/-- Encode a single HTTP/1.1 `Transfer-Encoding: chunked` body chunk (`<hexLen>\r\n<bytes>\r\n`),
+    or the terminal `0\r\n\r\n` chunk when `chunk.isEmpty`. -/
+def encodeHttpChunk (chunk : ByteSlice) : ByteArray :=
+  if chunk.len == 0 then
+    "0\r\n\r\n".toUTF8
+  else
+    let hexChars := "0123456789abcdef".toUTF8
+    let hexStr : String := Id.run do
+      let mut n := chunk.len
+      let mut rev : List UInt8 := []
+      while n > 0 do
+        rev := hexChars.get! (n &&& 0xF) :: rev
+        n := n >>> 4
+      String.fromUTF8! (ByteArray.mk rev.toArray)
+    (hexStr ++ "\r\n").toUTF8 ++ chunk.toByteArray ++ "\r\n".toUTF8
+
+/-- Decode a complete HTTP/1.1 `Transfer-Encoding: chunked` response body (rejecting chunks exceeding `maxBytes`). -/
+def decodeChunkedBody? (raw : ByteArray) (maxBytes : Nat := maxHttpBodyBytes) : Option ByteArray := Id.run do
+  let mut p : Nat := 0
+  let mut out := ByteArray.empty
+  while p < raw.size do
+    let mut crlf : Option Nat := none
+    for i in [p : raw.size - 1] do
+      if raw.get! i == 13 && raw.get! (i + 1) == 10 then
+        crlf := some i
+        break
+    let some lineEnd := crlf | return none
+    if lineEnd == p || lineEnd - p > 64 then return none
+    -- Parse hex chunk size (ignoring optional `;chunk-ext`)
+    let mut chunkLen : Nat := 0
+    let mut digitsSeen := false
+    for i in [p : lineEnd] do
+      let b := raw.get! i
+      if b == 59 then break -- ';'
+      match pctNib? b with
+      | some nib =>
+        digitsSeen := true
+        chunkLen := (chunkLen <<< 4) + nib.toNat
+        if chunkLen > maxBytes then return none
+      | none => return none
+    if !digitsSeen then return none
+    p := lineEnd + 2
+    if chunkLen == 0 then
+      if p + 2 ≤ raw.size && raw.get! p == 13 && raw.get! (p + 1) == 10 then
+        return some out
+      else
+        return none
+    if out.size + chunkLen > maxBytes || p + chunkLen + 2 > raw.size then
+      return none
+    if raw.get! (p + chunkLen) != 13 || raw.get! (p + chunkLen + 1) != 10 then
+      return none
+    out := out ++ raw.extract p (p + chunkLen)
+    p := p + chunkLen + 2
+  return none
+
+/-- Validate an incoming HTTP/1.1 RFC 6455 WebSocket upgrade request (`GET`, `Upgrade: websocket`,
+    `Sec-WebSocket-Version: 13`, non-empty `Sec-WebSocket-Key`) and build the `101 Switching Protocols` wire response. -/
+def buildWebSocketUpgradeResponse? (req : HttpRequest) (protocol? : Option String := none) : Option ByteArray := do
+  if req.method != "GET" then none
+  let upg ← req.findHeader? "upgrade"
+  if !asciiEqIgnoreCase upg "websocket" then none
+  let ver ← req.findHeader? "sec-websocket-version"
+  if ver.trimAscii.toString != "13" then none
+  let wsKey ← req.findHeader? "sec-websocket-key"
+  let keyTrim := wsKey.trimAscii.toString
+  if keyTrim.isEmpty || hasHttpFieldControlByte keyTrim then none
+  let acceptVal := LeanSys.WebSocket.computeAcceptKey keyTrim
+  let protoHdr ← match protocol? with
+    | none => some ""
+    | some pr =>
+      if pr.isEmpty || hasHttpFieldControlByte pr then none
+      else some s!"Sec-WebSocket-Protocol: {pr}\r\n"
+  some (
+    "HTTP/1.1 101 Switching Protocols\r\n" ++
+    "Upgrade: websocket\r\n" ++
+    "Connection: Upgrade\r\n" ++
+    s!"Sec-WebSocket-Accept: {acceptVal}\r\n" ++
+    protoHdr ++
+    "\r\n"
+  ).toUTF8
 
 end LeanSys.Http

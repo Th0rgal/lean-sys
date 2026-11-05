@@ -34,6 +34,7 @@ structure SstTable where
   rawBuf    : ByteArray
   bloomMask : UInt64
   entries   : Array SstIndexEntry
+  deriving Inhabited
 
 /-- Unsigned byte-wise compare of `buf[off, off+len)` against `q` (memcmp order, then length). -/
 @[inline]
@@ -261,6 +262,141 @@ def flushAndCompactStore (st : Store.Handle) (sstPath : String) : IO (SysResult 
     match ← Store.compact st with
     | .error e => pure (.error e)
     | .ok stCompacted => pure (.ok (stCompacted, tbl))
+
+/-- Explicit 5-byte LSM tombstone sentinel (`0xFF 0x00 'D' 'E' 'L'`), matching `LeanSys.Table.tombstoneMarker`. -/
+@[inline]
+private def isSstTombstoneBytes (ba : ByteArray) (off len : Nat) : Bool :=
+  len == 5 && off + 5 ≤ ba.size &&
+  ba.get! off == 0xFF &&
+  ba.get! (off + 1) == 0x00 &&
+  ba.get! (off + 2) == 0x44 &&
+  ba.get! (off + 3) == 0x45 &&
+  ba.get! (off + 4) == 0x4C
+
+/-- Write a pre-sorted, deduplicated array of `(key, keyUtf8, valBytes)` entries into an immutable SST file at `outPath`,
+    gated by `leansys_verify_sst_block` and atomic `rename`. -/
+def writeSortedPairs (pairs : Array (String × ByteArray × ByteArray)) (outPath : String) : IO (SysResult SstTable) := do
+  let mut cap := 24
+  for (_, kb, v) in pairs do
+    cap := cap + 12 + kb.size + v.size
+  let mut buf := ByteArray.emptyWithCapacity cap
+  let mut bloom : UInt64 := 0
+  for (k, _, v) in pairs do
+    bloom := bloomInsert bloom (xxh64String k)
+    buf := v.copySlice 0 buf buf.size v.size false
+  let indexOff := buf.size
+  let mut entries : Array SstIndexEntry := Array.mkEmpty pairs.size
+  let mut vOff := 0
+  for (k, kb, v) in pairs do
+    buf := pushUInt32LE buf kb.size.toUInt32
+    buf := pushUInt32LE buf vOff.toUInt32
+    buf := pushUInt32LE buf v.size.toUInt32
+    let kOff := buf.size
+    buf := kb.copySlice 0 buf buf.size kb.size false
+    entries := entries.push { key := k, keyOff := kOff, keyLen := kb.size, valOff := vOff, valLen := v.size }
+    vOff := vOff + v.size
+  let footerOff := buf.size.toUInt64
+  buf := pushUInt32LE buf sstMagic
+  buf := pushUInt32LE buf entries.size.toUInt32
+  buf := pushUInt64LE buf indexOff.toUInt64
+  buf := pushUInt64LE buf bloom
+  if verifySstBlock sstMagic entries.size.toUInt32 indexOff.toUInt64 footerOff buf.size.toUInt64 bloom != 1 then
+    return .error .einval
+  let tmpPath := outPath ++ ".tmp"
+  match ← withFd tmpPath 4 (fun fd => writeAll fd buf true) with
+  | .error e => pure (.error e)
+  | .ok _ =>
+    match ← atomicRename tmpPath outPath with
+    | .error e => pure (.error e)
+    | .ok () => pure (.ok { path := outPath, rawBuf := buf, bloomMask := bloom, entries := entries })
+
+/-- Two-way sorted SST compaction (`older` + `newer` → `outPath`) gated by `LeanSys.Spec.verifyCompactionWinner`:
+    - Linear `O(|older| + |newer|)` merge scan over already-sorted SST directories.
+    - When both tables contain `key`, `newer` strictly wins (never resurrecting `older` when `newer` is a tombstone!).
+    - When `dropTombstones := true` (bottom-most level compaction), winning tombstones are dropped cleanly. -/
+def mergeTables (older newer : SstTable) (outPath : String) (dropTombstones : Bool := false) :
+    IO (SysResult SstTable) := do
+  let esOld := older.entries
+  let esNew := newer.entries
+  let mut merged : Array (String × ByteArray × ByteArray) := Array.mkEmpty (esOld.size + esNew.size)
+  let mut i : Nat := 0
+  let mut j : Nat := 0
+  let dropFlag : UInt8 := if dropTombstones then 1 else 0
+  while i < esOld.size || j < esNew.size do
+    if i < esOld.size && j < esNew.size then
+      let eo := esOld[i]!
+      let en := esNew[j]!
+      if eo.key == en.key then
+        let oTomb : UInt8 := if isSstTombstoneBytes older.rawBuf eo.valOff eo.valLen then 1 else 0
+        let nTomb : UInt8 := if isSstTombstoneBytes newer.rawBuf en.valOff en.valLen then 1 else 0
+        let win := verifyCompactionWinner 1 nTomb 1 oTomb dropFlag
+        if win == 2 then
+          if en.valOff + en.valLen ≤ newer.rawBuf.size then
+            let v := newer.rawBuf.extract en.valOff (en.valOff + en.valLen)
+            merged := merged.push (en.key, en.key.toUTF8, v)
+        i := i + 1
+        j := j + 1
+      else if keyBytesLt eo.key.toUTF8 en.key.toUTF8 then
+        let oTomb : UInt8 := if isSstTombstoneBytes older.rawBuf eo.valOff eo.valLen then 1 else 0
+        if verifyCompactionWinner 0 0 1 oTomb dropFlag == 1 then
+          if eo.valOff + eo.valLen ≤ older.rawBuf.size then
+            let v := older.rawBuf.extract eo.valOff (eo.valOff + eo.valLen)
+            merged := merged.push (eo.key, eo.key.toUTF8, v)
+        i := i + 1
+      else
+        let nTomb : UInt8 := if isSstTombstoneBytes newer.rawBuf en.valOff en.valLen then 1 else 0
+        if verifyCompactionWinner 1 nTomb 0 0 dropFlag == 2 then
+          if en.valOff + en.valLen ≤ newer.rawBuf.size then
+            let v := newer.rawBuf.extract en.valOff (en.valOff + en.valLen)
+            merged := merged.push (en.key, en.key.toUTF8, v)
+        j := j + 1
+    else if i < esOld.size then
+      let eo := esOld[i]!
+      let oTomb : UInt8 := if isSstTombstoneBytes older.rawBuf eo.valOff eo.valLen then 1 else 0
+      if verifyCompactionWinner 0 0 1 oTomb dropFlag == 1 then
+        if eo.valOff + eo.valLen ≤ older.rawBuf.size then
+          let v := older.rawBuf.extract eo.valOff (eo.valOff + eo.valLen)
+          merged := merged.push (eo.key, eo.key.toUTF8, v)
+      i := i + 1
+    else
+      let en := esNew[j]!
+      let nTomb : UInt8 := if isSstTombstoneBytes newer.rawBuf en.valOff en.valLen then 1 else 0
+      if verifyCompactionWinner 1 nTomb 0 0 dropFlag == 2 then
+        if en.valOff + en.valLen ≤ newer.rawBuf.size then
+          let v := newer.rawBuf.extract en.valOff (en.valOff + en.valLen)
+          merged := merged.push (en.key, en.key.toUTF8, v)
+      j := j + 1
+  writeSortedPairs merged outPath
+
+/-- Multi-level SST compaction (`tablesOldestToNewest` → `outPath`):
+    folds `mergeTables` from oldest to newest, applying `dropTombstones` only on the final pass
+    so intermediate merges never lose tombstones that must still mask older generations! -/
+def compactLevels (tablesOldestToNewest : Array SstTable) (outPath : String)
+    (dropTombstones : Bool := true) : IO (SysResult SstTable) := do
+  if tablesOldestToNewest.isEmpty then
+    writeSortedPairs #[] outPath
+  else if tablesOldestToNewest.size == 1 then
+    let only := tablesOldestToNewest[0]!
+    if !dropTombstones && only.path == outPath then
+      return .ok only
+    let emptyTbl : SstTable := { path := "", rawBuf := ByteArray.empty, bloomMask := 0, entries := #[] }
+    mergeTables emptyTbl only outPath dropTombstones
+  else
+    let mut acc := tablesOldestToNewest[0]!
+    let lastIdx := tablesOldestToNewest.size - 1
+    for k in [1:tablesOldestToNewest.size] do
+      let isFinal := k == lastIdx
+      let stepPath := if isFinal then outPath else s!"{outPath}.merge.{k}"
+      let stepDrop := if isFinal then dropTombstones else false
+      match ← mergeTables acc tablesOldestToNewest[k]! stepPath stepDrop with
+      | .error e => return .error e
+      | .ok nextTbl =>
+        if k > 1 then
+          discard <| unlinkFile s!"{outPath}.merge.{k - 1}"
+        acc := nextTbl
+    if tablesOldestToNewest.size > 2 then
+      discard <| unlinkFile s!"{outPath}.merge.{lastIdx - 1}"
+    return .ok acc
 
 end SstTable
 

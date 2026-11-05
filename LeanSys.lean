@@ -12,9 +12,12 @@ import LeanSys.Store
 import LeanSys.Mmap
 import LeanSys.Lsm
 import LeanSys.Table
+import LeanSys.Search
 import LeanSys.Auth
 import LeanSys.ProcLog
 import LeanSys.JsonRpc
+import LeanSys.Sse
+import LeanSys.WebSocket
 import LeanSys.Http
 import LeanSys.Reactor
 import LeanSys.Sandbox
@@ -120,7 +123,12 @@ namespace Db
   abbrev SstTable := LeanSys.Lsm.SstTable
   abbrev flushStore := LeanSys.Lsm.SstTable.flushStore
   abbrev flushAndCompactStore := LeanSys.Lsm.SstTable.flushAndCompactStore
+  abbrev mergeTables := LeanSys.Lsm.SstTable.mergeTables
+  abbrev compactLevels := LeanSys.Lsm.SstTable.compactLevels
   abbrev openSst := LeanSys.Lsm.SstTable.openSst
+  abbrev indexDoc := LeanSys.Search.indexDoc
+  abbrev searchTrigramSst := LeanSys.Search.searchTrigramSst
+  abbrev searchStoreSubstring := LeanSys.Search.searchStoreSubstring
   abbrev CompositeKey := LeanSys.Table.CompositeKey
   abbrev tombstoneMarker := LeanSys.Table.tombstoneMarker
   abbrev isTombstoneSlice := LeanSys.Table.isTombstoneSlice
@@ -164,6 +172,18 @@ namespace Web
   abbrev presignS3Url := LeanSys.Auth.presignS3Url
   abbrev mintLease := LeanSys.Auth.mintLease
   abbrev validateLease := LeanSys.Auth.validateLease
+  abbrev SseEvent := LeanSys.Sse.SseEvent
+  abbrev SseEventStream := LeanSys.Sse.SseEventStream
+  abbrev formatSseEvent? := LeanSys.Sse.formatSseEvent?
+  abbrev formatSseKeepalive := LeanSys.Sse.formatSseKeepalive
+  abbrev WsOpcode := LeanSys.WebSocket.WsOpcode
+  abbrev WsFrame := LeanSys.WebSocket.WsFrame
+  abbrev computeAcceptKey := LeanSys.WebSocket.computeAcceptKey
+  abbrev encodeWsFrame? := LeanSys.WebSocket.encodeFrame?
+  abbrev decodeWsFramePrefix := LeanSys.WebSocket.decodeFramePrefix
+  abbrev matchRoutePattern? := LeanSys.Http.matchRoutePattern?
+  abbrev parseQueryParams := LeanSys.Http.parseQueryParams
+  abbrev buildWebSocketUpgradeResponse? := LeanSys.Http.buildWebSocketUpgradeResponse?
 end Web
 
 end LeanSys
