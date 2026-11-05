@@ -303,15 +303,15 @@ def maxSstFileBytes : Nat := 67108864
 /-- Write a pre-sorted, deduplicated array of `(key, keyUtf8, valBytes)` entries into an immutable SST file at `outPath`,
     gated by `maxSstFileBytes`, `leansys_verify_sst_block`, and atomic `rename`. -/
 def writeSortedPairs (pairs : Array (String × ByteArray × ByteArray)) (outPath : String) : IO (SysResult SstTable) := do
-  if pairs.size > 0xFFFFFFFF then
+  if verifySliceBounds 0 pairs.size.toUInt64 0xFFFFFFFF != 1 then
     return .error .enospc
   let mut cap := 24
   for (_, kb, v) in pairs do
-    if kb.size > maxSstFileBytes || v.size > maxSstFileBytes then
+    if verifySliceBounds 0 kb.size.toUInt64 maxSstFileBytes.toUInt64 != 1 ||
+       verifySliceBounds 0 v.size.toUInt64 maxSstFileBytes.toUInt64 != 1 ||
+       verifySliceBounds cap.toUInt64 (12 + kb.size + v.size).toUInt64 maxSstFileBytes.toUInt64 != 1 then
       return .error .enospc
     cap := cap + 12 + kb.size + v.size
-    if cap > maxSstFileBytes then
-      return .error .enospc
   let mut buf := ByteArray.emptyWithCapacity cap
   let mut bloom : UInt64 := 0
   for (k, _, v) in pairs do

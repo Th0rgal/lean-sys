@@ -536,14 +536,14 @@ def selfTestWave1Features (testDir : String) : IO UInt32 := do
   let .ok gen0 ← openStore s!"{lsmDir}/g0" | return 1
   let .ok gen0 ← Store.putString gen0 "alpha" "v0-alpha" false | return 1
   let .ok gen0 ← Store.putString gen0 "beta" "v0-beta" false | return 1
-  let .ok sst0 ← SstTable.flushStore gen0 s!"{lsmDir}/l0.sst" | return 1
+  let .ok _sst0 ← SstTable.flushStore gen0 s!"{lsmDir}/l0.sst" | return 1
 
   let .ok gen1 ← openStore s!"{lsmDir}/g1" | return 1
   -- Delete "alpha" with explicit tombstone in gen1, update "beta", add "gamma"
   let .ok gen1 ← Store.put gen1 "alpha" (ByteSlice.ofByteArray tombstoneMarker) false | return 1
   let .ok gen1 ← Store.putString gen1 "beta" "v1-beta" false | return 1
   let .ok gen1 ← Store.putString gen1 "gamma" "v1-gamma" false | return 1
-  let .ok sst1 ← SstTable.flushStore gen1 s!"{lsmDir}/l1.sst" | return 1
+  let .ok _sst1 ← SstTable.flushStore gen1 s!"{lsmDir}/l1.sst" | return 1
 
   let .ok gen2 ← openStore s!"{lsmDir}/g2" | return 1
   let .ok gen2 ← Store.putString gen2 "delta" "v2-delta" false | return 1

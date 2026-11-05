@@ -858,7 +858,7 @@ def decodeChunkedBody? (raw : ByteArray) (maxBytes : Nat := maxHttpBodyBytes) : 
         crlf := some i
         break
     let some lineEnd := crlf | return none
-    if lineEnd == p || lineEnd - p > 64 then return none
+    if lineEnd == p || verifySliceBounds 0 (lineEnd - p).toUInt64 64 != 1 then return none
     -- Parse hex chunk size (ignoring optional `;chunk-ext`)
     let mut chunkLen : Nat := 0
     let mut digitsSeen := false
@@ -869,7 +869,7 @@ def decodeChunkedBody? (raw : ByteArray) (maxBytes : Nat := maxHttpBodyBytes) : 
       | some nib =>
         digitsSeen := true
         chunkLen := (chunkLen <<< 4) + nib.toNat
-        if chunkLen > maxBytes then return none
+        if verifySliceBounds 0 chunkLen.toUInt64 maxBytes.toUInt64 != 1 then return none
       | none => return none
     if !digitsSeen then return none
     p := lineEnd + 2

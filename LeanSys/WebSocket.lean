@@ -377,7 +377,7 @@ def pushFrame (st : WsMessageAssembler) (frame : WsFrame) :
     return .error "ws_invalid_payload"
   match frame.opcode with
   | .ping | .pong | .close =>
-    if !frame.fin || frame.payload.size > 125 then
+    if !frame.fin || verifySliceBounds 0 frame.payload.size.toUInt64 125 != 1 then
       return .error "ws_invalid_control_frame"
     return .ok (st, some (frame.opcode, frame.payload))
   | .text | .binary =>
