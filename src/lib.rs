@@ -340,6 +340,34 @@ extern "C" {
         encoded_bytes: u64,
         max_chunk_bytes: u64,
     ) -> u8;
+
+    pub fn leansys_verify_h2_frame_header(
+        payload_len: u32,
+        max_frame_size: u32,
+        frame_type: u8,
+        flags: u8,
+        stream_id: u32,
+        recv_window: u64,
+        buf_len: u64,
+    ) -> u8;
+
+    pub fn leansys_verify_quic_packet_window(
+        pkt_num: u64,
+        max_rx_pkt_num: u64,
+        window_mask: u64,
+        stream_bytes: u64,
+        max_stream_data: u64,
+        conn_bytes: u64,
+        max_conn_data: u64,
+    ) -> u8;
+
+    pub fn leansys_verify_h3_frame_capsule(
+        frame_type: u64,
+        payload_len: u64,
+        header_bytes: u8,
+        stream_role: u8,
+        buf_len: u64,
+    ) -> u8;
 }
 
 pub const WAL_MAGIC: u32 = 0x4C53_5953;
@@ -1141,6 +1169,66 @@ pub fn verify_sse_event_encode(
     }
 }
 
+#[inline]
+pub fn verify_h2_frame_header(
+    payload_len: u32,
+    max_frame_size: u32,
+    frame_type: u8,
+    flags: u8,
+    stream_id: u32,
+    recv_window: u64,
+    buf_len: u64,
+) -> bool {
+    unsafe {
+        leansys_verify_h2_frame_header(
+            payload_len,
+            max_frame_size,
+            frame_type,
+            flags,
+            stream_id,
+            recv_window,
+            buf_len,
+        ) == 1
+    }
+}
+
+#[inline]
+pub fn verify_quic_packet_window(
+    pkt_num: u64,
+    max_rx_pkt_num: u64,
+    window_mask: u64,
+    stream_bytes: u64,
+    max_stream_data: u64,
+    conn_bytes: u64,
+    max_conn_data: u64,
+) -> bool {
+    unsafe {
+        leansys_verify_quic_packet_window(
+            pkt_num,
+            max_rx_pkt_num,
+            window_mask,
+            stream_bytes,
+            max_stream_data,
+            conn_bytes,
+            max_conn_data,
+        ) == 1
+    }
+}
+
+#[inline]
+pub fn verify_h3_frame_capsule(
+    frame_type: u64,
+    payload_len: u64,
+    header_bytes: u8,
+    stream_role: u8,
+    buf_len: u64,
+) -> bool {
+    unsafe {
+        leansys_verify_h3_frame_capsule(frame_type, payload_len, header_bytes, stream_role, buf_len)
+            == 1
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1505,5 +1593,26 @@ mod tests {
 
         assert!(verify_sse_event_encode(true, 2, 24, 4096));
         assert!(!verify_sse_event_encode(false, 2, 24, 4096));
+
+        // Wave 5.A Sans-I/O HTTP/2, QUIC RFC 6479 anti-replay, and HTTP/3 capsule gates
+        assert!(verify_h2_frame_header(128, 16384, 0, 0, 1, 65535, 256));
+        assert!(!verify_h2_frame_header(4096, 16384, 0, 0, 1, 1024, 8192));
+        assert!(!verify_h2_frame_header(6, 16384, 4, 1, 0, 65535, 32));
+        assert!(!verify_h2_frame_header(3, 16384, 2, 0, 1, 65535, 32));
+        assert!(!verify_h2_frame_header(2, 16384, 3, 0, 1, 65535, 32));
+        assert!(!verify_h2_frame_header(8, 16384, 8, 0, 0, 65535, 32));
+
+        assert!(verify_quic_packet_window(101, 100, 1, 512, 4096, 1024, 8192));
+        assert!(!verify_quic_packet_window(97, 100, 9, 512, 4096, 1024, 8192));
+        assert!(!verify_quic_packet_window(101, 100, 1, 8192, 4096, 8192, 8192));
+
+        assert!(verify_h3_frame_capsule(1, 32, 2, 0, 64));
+        assert!(verify_h3_frame_capsule(4, 12, 2, 1, 32));
+        assert!(!verify_h3_frame_capsule(2, 5, 2, 0, 64));
+        assert!(!verify_h3_frame_capsule(4, 12, 2, 0, 32));
+        assert!(!verify_h3_frame_capsule(3, 4, 2, 0, 32));
+        assert!(!verify_h3_frame_capsule(13, 4, 2, 0, 32));
+        assert!(!verify_h3_frame_capsule(5, 4, 2, 1, 32));
+        assert!(!verify_h3_frame_capsule(33, 4, 2, 2, 32));
     }
 }

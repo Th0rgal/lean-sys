@@ -2127,4 +2127,296 @@ theorem sse_event_encode_rejects_crlf_injection (e : SseEventEncodeCheck)
     (verifySseEventEncode e.noHeaderCrLf e.dataLines e.sizes.1 e.sizes.2 == 1) = false :=
   sseEventEncodeMetaSpec.rejects_unsafe () e h_bad
 
+/-! ## Wave 5.A: Pure-Lean Sans-I/O HTTP/2 (RFC 9113), QUIC (RFC 9000/6479) & HTTP/3 (RFC 9114) Gates -/
+
+/-- Pure RFC 9113 HTTP/2 9-byte frame header & flow-control credit gate:
+    - `maxFrameSize` MUST sit within RFC 9113 `[16384, 16777215]` and `payloadLen ≤ maxFrameSize`
+    - `bufLen ≥ 9 + payloadLen` (complete 9-byte frame header + payload available)
+    - connection control frames (`SETTINGS = 4`, `PING = 6`, `GOAWAY = 7`) MUST use `streamId == 0`;
+      `PING` MUST carry `payloadLen == 8`; `GOAWAY` `payloadLen ≥ 8`; `SETTINGS` ACK (`flags &&& 1 == 1`)
+      MUST carry `payloadLen == 0` and non-ACK `SETTINGS` MUST be a multiple of 6 bytes
+    - `PRIORITY = 2` MUST use `streamId > 0` and `payloadLen == 5`; `RST_STREAM = 3` MUST use `streamId > 0`
+      and `payloadLen == 4`; `WINDOW_UPDATE = 8` MUST carry `payloadLen == 4`
+    - `DATA = 0`, `HEADERS = 1`, `PUSH_PROMISE = 5`, `CONTINUATION = 9` MUST use `streamId > 0` with
+      mandatory flag-dependent minimum payload sizes (`PADDED` + `PRIORITY` / Promised-Stream-ID), and
+      `DATA` frames MUST NOT exceed `recvWindow` flow-control credit (`payloadLen ≤ recvWindow`). -/
+@[inline, export leansys_verify_h2_frame_header]
+def verifyH2FrameHeader
+    (payloadLen maxFrameSize : UInt32) (frameType flags : UInt8)
+    (streamId : UInt32) (recvWindow bufLen : UInt64) : UInt8 :=
+  let pay64 := payloadLen.toUInt64
+  let padByte : UInt32 := ((flags >>> 3) &&& 1).toUInt32
+  let prioBytes : UInt32 := ((flags >>> 5) &&& 1).toUInt32 * 5
+  let hdrMin : UInt32 := padByte + prioBytes
+  let pushMin : UInt32 := 4 + padByte
+  if maxFrameSize ≥ 16384 && maxFrameSize ≤ 16777215 &&
+     payloadLen ≤ maxFrameSize && streamId ≤ 0x7FFFFFFF &&
+     bufLen ≤ 67108864 && 9 + pay64 ≤ bufLen &&
+     (frameType != 2 || (streamId > 0 && payloadLen == 5)) &&
+     (frameType != 3 || (streamId > 0 && payloadLen == 4)) &&
+     (frameType != 4 || (streamId == 0 && (((flags &&& 1) == 1 && payloadLen == 0) || ((flags &&& 1) != 1 && payloadLen % 6 == 0)))) &&
+     (frameType != 5 || (streamId > 0 && payloadLen ≥ pushMin)) &&
+     (frameType != 6 || (streamId == 0 && payloadLen == 8)) &&
+     (frameType != 7 || (streamId == 0 && payloadLen ≥ 8)) &&
+     (frameType != 8 || payloadLen == 4) &&
+     (frameType != 1 || (streamId > 0 && payloadLen ≥ hdrMin)) &&
+     (frameType != 0 || (streamId > 0 && payloadLen ≥ padByte && pay64 ≤ recvWindow)) &&
+     (frameType != 9 || streamId > 0) then 1 else 0
+
+/-- Mutant M4a (for mutation testing): off-by-64K lax RFC 9113 DATA flow-control credit check (`pay64 ≤ recvWindow + 65536`). -/
+@[inline]
+def verifyH2FrameHeaderMutantWindow
+    (payloadLen maxFrameSize : UInt32) (frameType flags : UInt8)
+    (streamId : UInt32) (recvWindow bufLen : UInt64) : UInt8 :=
+  let pay64 := payloadLen.toUInt64
+  let padByte : UInt32 := ((flags >>> 3) &&& 1).toUInt32
+  let prioBytes : UInt32 := ((flags >>> 5) &&& 1).toUInt32 * 5
+  let hdrMin : UInt32 := padByte + prioBytes
+  let pushMin : UInt32 := 4 + padByte
+  if maxFrameSize ≥ 16384 && maxFrameSize ≤ 16777215 &&
+     payloadLen ≤ maxFrameSize && streamId ≤ 0x7FFFFFFF &&
+     bufLen ≤ 67108864 && 9 + pay64 ≤ bufLen &&
+     (frameType != 2 || (streamId > 0 && payloadLen == 5)) &&
+     (frameType != 3 || (streamId > 0 && payloadLen == 4)) &&
+     (frameType != 4 || (streamId == 0 && (((flags &&& 1) == 1 && payloadLen == 0) || ((flags &&& 1) != 1 && payloadLen % 6 == 0)))) &&
+     (frameType != 5 || (streamId > 0 && payloadLen ≥ pushMin)) &&
+     (frameType != 6 || (streamId == 0 && payloadLen == 8)) &&
+     (frameType != 7 || (streamId == 0 && payloadLen ≥ 8)) &&
+     (frameType != 8 || payloadLen == 4) &&
+     (frameType != 1 || (streamId > 0 && payloadLen ≥ hdrMin)) &&
+     (frameType != 0 || (streamId > 0 && payloadLen ≥ padByte && recvWindow ≤ 67108864 && pay64 ≤ recvWindow + 65536)) &&
+     (frameType != 9 || streamId > 0) then 1 else 0
+
+/-- Packed HTTP/2 frame check parameters (≤ 3 fields via tuple packing). -/
+structure H2FrameCheck where
+  sizes  : UInt32 × UInt32
+  hdr    : UInt8 × UInt8 × UInt32
+  bounds : UInt64 × UInt64
+  deriving Repr, DecidableEq
+
+@[inline]
+def h2FrameSafe (c : H2FrameCheck) : Bool :=
+  let payloadLen := c.sizes.1
+  let maxFrameSize := c.sizes.2
+  let frameType := c.hdr.1
+  let flags := c.hdr.2.1
+  let streamId := c.hdr.2.2
+  let recvWindow := c.bounds.1
+  let bufLen := c.bounds.2
+  let pay64 := payloadLen.toUInt64
+  let padByte : UInt32 := ((flags >>> 3) &&& 1).toUInt32
+  let prioBytes : UInt32 := ((flags >>> 5) &&& 1).toUInt32 * 5
+  let hdrMin : UInt32 := padByte + prioBytes
+  let pushMin : UInt32 := 4 + padByte
+  maxFrameSize ≥ 16384 && maxFrameSize ≤ 16777215 &&
+  payloadLen ≤ maxFrameSize && streamId ≤ 0x7FFFFFFF &&
+  bufLen ≤ 67108864 && 9 + pay64 ≤ bufLen &&
+  (frameType != 2 || (streamId > 0 && payloadLen == 5)) &&
+  (frameType != 3 || (streamId > 0 && payloadLen == 4)) &&
+  (frameType != 4 || (streamId == 0 && (((flags &&& 1) == 1 && payloadLen == 0) || ((flags &&& 1) != 1 && payloadLen % 6 == 0)))) &&
+  (frameType != 5 || (streamId > 0 && payloadLen ≥ pushMin)) &&
+  (frameType != 6 || (streamId == 0 && payloadLen == 8)) &&
+  (frameType != 7 || (streamId == 0 && payloadLen ≥ 8)) &&
+  (frameType != 8 || payloadLen == 4) &&
+  (frameType != 1 || (streamId > 0 && payloadLen ≥ hdrMin)) &&
+  (frameType != 0 || (streamId > 0 && payloadLen ≥ padByte && pay64 ≤ recvWindow)) &&
+  (frameType != 9 || streamId > 0)
+
+/-- Layer II Bundle 46: RFC 9113 HTTP/2 9-byte frame header & flow-control credit gate. -/
+def h2FrameMetaSpec : MetaGateSpec Unit H2FrameCheck where
+  inv _ := True
+  gate _ c :=
+    verifyH2FrameHeader c.sizes.1 c.sizes.2 c.hdr.1 c.hdr.2.1 c.hdr.2.2 c.bounds.1 c.bounds.2 == 1
+  step _ _ := ()
+  safe _ c := h2FrameSafe c
+  preserves_inv _ _ _ h := h
+  ensures_safe _ c h := by
+    unfold verifyH2FrameHeader at h
+    unfold h2FrameSafe
+    dsimp only at h ⊢
+    split at h
+    · assumption
+    · contradiction
+
+/-- Corollary 52: `verifyH2FrameHeader` rejects oversized frames, malformed SETTINGS/PING,
+    stream-0 DATA/HEADERS, or DATA frames exceeding `recvWindow`. -/
+theorem h2_frame_rejects_invalid_or_window_overflow (c : H2FrameCheck)
+    (h_bad : h2FrameSafe c = false) :
+    (verifyH2FrameHeader c.sizes.1 c.sizes.2 c.hdr.1 c.hdr.2.1 c.hdr.2.2 c.bounds.1 c.bounds.2 == 1) = false :=
+  h2FrameMetaSpec.rejects_unsafe () c h_bad
+
+/-- Theorem 53 (Mutant Kill #4): `verifyH2FrameHeader` kills the DATA flow-control window overflow mutant. -/
+theorem h2_frame_kills_window_mutant :
+    verifyH2FrameHeader 4096 16384 0 0 1 1024 8192 ≠
+      verifyH2FrameHeaderMutantWindow 4096 16384 0 0 1 1024 8192 := by
+  decide
+
+/-- Pure RFC 9000 + RFC 6479 QUIC 64-packet sliding-window anti-replay & flow-control conservation gate:
+    - `pktNum` MUST sit below RFC 9000 `2^62` (`pktNum < 4611686018427387904`)
+    - if `pktNum > maxRxPktNum`: admits fresh forward packet (requiring `maxRxPktNum < 2^62`)
+    - if `pktNum ≤ maxRxPktNum`: admits iff `maxRxPktNum - pktNum < 64` AND the bit `(windowMask >>> diff) &&& 1 == 0`
+    - enforces stream + connection flow-control conservation (`streamBytes ≤ maxStreamData` and
+      `connBytes ≤ maxConnData` and `streamBytes ≤ connBytes`). -/
+@[inline, export leansys_verify_quic_packet_window]
+def verifyQuicPacketWindow
+    (pktNum maxRxPktNum windowMask : UInt64)
+    (streamBytes maxStreamData connBytes maxConnData : UInt64) : UInt8 :=
+  let limit62 : UInt64 := (1 : UInt64) <<< 62
+  let diff := maxRxPktNum - pktNum
+  let replayFree : Bool :=
+    pktNum > maxRxPktNum || (diff < 64 && ((windowMask >>> diff) &&& 1) == 0)
+  if pktNum < limit62 && maxRxPktNum < limit62 && replayFree &&
+     maxStreamData ≤ limit62 && maxConnData ≤ limit62 &&
+     streamBytes ≤ maxStreamData && connBytes ≤ maxConnData &&
+     streamBytes ≤ connBytes then 1 else 0
+
+/-- Mutant M5a (for mutation testing): checks bit `diff + 1` instead of `diff` in `windowMask`. -/
+@[inline]
+def verifyQuicPacketWindowMutantReplay
+    (pktNum maxRxPktNum windowMask : UInt64)
+    (streamBytes maxStreamData connBytes maxConnData : UInt64) : UInt8 :=
+  let limit62 : UInt64 := (1 : UInt64) <<< 62
+  let diff := maxRxPktNum - pktNum
+  let inWin : Bool := pktNum > maxRxPktNum || (diff < 63 && ((windowMask >>> (diff + 1)) &&& 1) == 0)
+  if pktNum < limit62 && maxRxPktNum < limit62 && inWin &&
+     maxStreamData ≤ limit62 && maxConnData ≤ limit62 &&
+     streamBytes ≤ maxStreamData && connBytes ≤ maxConnData &&
+     streamBytes ≤ connBytes then 1 else 0
+
+/-- Packed QUIC anti-replay & flow-control check parameters (≤ 3 fields via tuple packing). -/
+structure QuicPacketWindowCheck where
+  replay     : UInt64 × UInt64 × UInt64
+  streamFlow : UInt64 × UInt64
+  connFlow   : UInt64 × UInt64
+  deriving Repr, DecidableEq
+
+@[inline]
+def quicPacketWindowSafe (q : QuicPacketWindowCheck) : Bool :=
+  let pktNum := q.replay.1
+  let maxRx := q.replay.2.1
+  let mask := q.replay.2.2
+  let limit62 : UInt64 := (1 : UInt64) <<< 62
+  let diff := maxRx - pktNum
+  let replayFree : Bool :=
+    pktNum > maxRx || (diff < 64 && ((mask >>> diff) &&& 1) == 0)
+  pktNum < limit62 && maxRx < limit62 && replayFree &&
+  q.streamFlow.2 ≤ limit62 && q.connFlow.2 ≤ limit62 &&
+  q.streamFlow.1 ≤ q.streamFlow.2 && q.connFlow.1 ≤ q.connFlow.2 &&
+  q.streamFlow.1 ≤ q.connFlow.1
+
+/-- Layer II Bundle 47: RFC 9000 + RFC 6479 QUIC anti-replay & flow-control conservation gate. -/
+def quicPacketWindowMetaSpec : MetaGateSpec Unit QuicPacketWindowCheck where
+  inv _ := True
+  gate _ q :=
+    verifyQuicPacketWindow q.replay.1 q.replay.2.1 q.replay.2.2
+      q.streamFlow.1 q.streamFlow.2 q.connFlow.1 q.connFlow.2 == 1
+  step _ _ := ()
+  safe _ q := quicPacketWindowSafe q
+  preserves_inv _ _ _ h := h
+  ensures_safe _ q h := by
+    unfold verifyQuicPacketWindow at h
+    unfold quicPacketWindowSafe
+    dsimp only at h ⊢
+    split at h
+    · assumption
+    · contradiction
+
+/-- Corollary 54: `verifyQuicPacketWindow` rejects replayed packets, stale packets outside the 64-bit window,
+    packet numbers `≥ 2^62`, or stream/connection flow-control overruns. -/
+theorem quic_packet_window_rejects_replay_or_flow_overrun (q : QuicPacketWindowCheck)
+    (h_bad : quicPacketWindowSafe q = false) :
+    (verifyQuicPacketWindow q.replay.1 q.replay.2.1 q.replay.2.2
+      q.streamFlow.1 q.streamFlow.2 q.connFlow.1 q.connFlow.2 == 1) = false :=
+  quicPacketWindowMetaSpec.rejects_unsafe () q h_bad
+
+/-- Theorem 55 (Mutant Kill #5): `verifyQuicPacketWindow` kills the RFC 6479 replayed-packet mutant (`diff = 3`, bit 3 set). -/
+theorem quic_packet_window_kills_replay_mutant :
+    verifyQuicPacketWindow 97 100 9 512 4096 1024 8192 ≠
+      verifyQuicPacketWindowMutantReplay 97 100 9 512 4096 1024 8192 := by
+  decide
+
+/-- Pure RFC 9114 HTTP/3 capsule & stream-role gate (`0 = bidi_request`, `1 = uni_control`;
+    `2 = uni_qpack` carries raw QPACK instructions and NEVER HTTP/3 capsules):
+    - `headerBytes` in `[2, 16]`, `payloadLen < 2^62`, `bufLen ≤ 67108864`, `headerBytes + payloadLen ≤ bufLen`
+    - `DATA = 0x00`, `HEADERS = 0x01`, `PUSH_PROMISE = 0x05` require `streamRole == 0` (`0x05` `payloadLen ≥ 1`)
+    - `CANCEL_PUSH = 0x03`, `SETTINGS = 0x04`, `GOAWAY = 0x07`, `MAX_PUSH_ID = 0x0D` require `streamRole == 1`
+    - HTTP/2 reserved frame types (`0x02`, `0x06`, `0x08`, `0x09`) are forbidden in HTTP/3. -/
+@[inline, export leansys_verify_h3_frame_capsule]
+def verifyH3FrameCapsule
+    (frameType payloadLen : UInt64) (headerBytes streamRole : UInt8) (bufLen : UInt64) : UInt8 :=
+  let limit62 : UInt64 := (1 : UInt64) <<< 62
+  let hdr64 := headerBytes.toUInt64
+  if headerBytes ≥ 2 && headerBytes ≤ 16 &&
+     payloadLen < limit62 && bufLen ≤ 67108864 && hdr64 ≤ bufLen && payloadLen ≤ bufLen - hdr64 &&
+     frameType != 2 && frameType != 6 && frameType != 8 && frameType != 9 &&
+     streamRole ≤ 1 &&
+     (!(frameType == 0 || frameType == 1 || frameType == 5) || streamRole == 0) &&
+     (!(frameType == 3 || frameType == 4 || frameType == 7 || frameType == 13) || streamRole == 1) &&
+     (!(frameType == 3 || frameType == 5 || frameType == 7 || frameType == 13) || payloadLen ≥ 1) then 1 else 0
+
+/-- Mutant M6a (for mutation testing): fails to reject forbidden HTTP/2 reserved frame types (`0x02`, `0x06`, `0x08`, `0x09`) on HTTP/3. -/
+@[inline]
+def verifyH3FrameCapsuleMutantReserved
+    (frameType payloadLen : UInt64) (headerBytes streamRole : UInt8) (bufLen : UInt64) : UInt8 :=
+  let limit62 : UInt64 := (1 : UInt64) <<< 62
+  let hdr64 := headerBytes.toUInt64
+  if headerBytes ≥ 2 && headerBytes ≤ 16 &&
+     payloadLen < limit62 && bufLen ≤ 67108864 && hdr64 ≤ bufLen && payloadLen ≤ bufLen - hdr64 &&
+     streamRole ≤ 1 &&
+     (!(frameType == 0 || frameType == 1 || frameType == 5) || streamRole == 0) &&
+     (!(frameType == 3 || frameType == 4 || frameType == 7 || frameType == 13) || streamRole == 1) &&
+     (!(frameType == 3 || frameType == 5 || frameType == 7 || frameType == 13) || payloadLen ≥ 1) then 1 else 0
+
+/-- Packed HTTP/3 frame capsule check parameters (≤ 3 fields via tuple packing). -/
+structure H3FrameCapsuleCheck where
+  frame  : UInt64 × UInt64
+  hdr    : UInt8 × UInt8
+  bufLen : UInt64
+  deriving Repr, DecidableEq
+
+@[inline]
+def h3FrameCapsuleSafe (h : H3FrameCapsuleCheck) : Bool :=
+  let frameType := h.frame.1
+  let payloadLen := h.frame.2
+  let headerBytes := h.hdr.1
+  let streamRole := h.hdr.2
+  let limit62 : UInt64 := (1 : UInt64) <<< 62
+  let hdr64 := headerBytes.toUInt64
+  headerBytes ≥ 2 && headerBytes ≤ 16 &&
+  payloadLen < limit62 && h.bufLen ≤ 67108864 && hdr64 ≤ h.bufLen && payloadLen ≤ h.bufLen - hdr64 &&
+  frameType != 2 && frameType != 6 && frameType != 8 && frameType != 9 &&
+  streamRole ≤ 1 &&
+  (!(frameType == 0 || frameType == 1 || frameType == 5) || streamRole == 0) &&
+  (!(frameType == 3 || frameType == 4 || frameType == 7 || frameType == 13) || streamRole == 1) &&
+  (!(frameType == 3 || frameType == 5 || frameType == 7 || frameType == 13) || payloadLen ≥ 1)
+
+/-- Layer II Bundle 48: RFC 9114 HTTP/3 capsule framing, reserved-type & stream-role gate. -/
+def h3FrameCapsuleMetaSpec : MetaGateSpec Unit H3FrameCapsuleCheck where
+  inv _ := True
+  gate _ h :=
+    verifyH3FrameCapsule h.frame.1 h.frame.2 h.hdr.1 h.hdr.2 h.bufLen == 1
+  step _ _ := ()
+  safe _ h := h3FrameCapsuleSafe h
+  preserves_inv _ _ _ pf := pf
+  ensures_safe _ h pf := by
+    unfold verifyH3FrameCapsule at pf
+    unfold h3FrameCapsuleSafe
+    dsimp only at pf ⊢
+    split at pf
+    · assumption
+    · contradiction
+
+/-- Corollary 56: `verifyH3FrameCapsule` rejects truncated capsules, forbidden HTTP/2 frame types,
+    SETTINGS on request streams, or DATA/HEADERS on control streams. -/
+theorem h3_frame_capsule_rejects_reserved_or_wrong_stream (h : H3FrameCapsuleCheck)
+    (h_bad : h3FrameCapsuleSafe h = false) :
+    (verifyH3FrameCapsule h.frame.1 h.frame.2 h.hdr.1 h.hdr.2 h.bufLen == 1) = false :=
+  h3FrameCapsuleMetaSpec.rejects_unsafe () h h_bad
+
+/-- Theorem 57 (Mutant Kill #6): `verifyH3FrameCapsule` kills the HTTP/2 reserved `PRIORITY = 0x02` frame mutant on HTTP/3. -/
+theorem h3_frame_capsule_kills_reserved_h2_mutant :
+    verifyH3FrameCapsule 2 5 2 0 64 ≠
+      verifyH3FrameCapsuleMutantReserved 2 5 2 0 64 := by
+  decide
+
 end LeanSys.Spec
