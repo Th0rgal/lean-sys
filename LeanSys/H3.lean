@@ -107,8 +107,9 @@ def qpackStaticEntry? : Nat → Option (String × String)
   | 26 => some (":status", "304")
   | 27 => some (":status", "404")
   | 28 => some (":status", "503")
-  | 63 => some ("bad-request-400", "400")
-  | 64 => some (":status", "400")
+  | 63 => some (":status", "100")
+  | 64 => some (":status", "204")
+  | 67 => some (":status", "400")
   | 71 => some (":status", "500")
   | _  => none
 
@@ -119,9 +120,11 @@ def qpackStaticExactIndex? (name val : String) : Option Nat :=
   | ":method", "POST"  => some 20
   | ":scheme", "http"  => some 22
   | ":scheme", "https" => some 23
+  | ":status", "100"   => some 63
   | ":status", "200"   => some 25
+  | ":status", "204"   => some 64
+  | ":status", "400"   => some 67
   | ":status", "404"   => some 27
-  | ":status", "400"   => some 64
   | ":status", "500"   => some 71
   | _, _               => none
 

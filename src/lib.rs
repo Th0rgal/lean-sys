@@ -1598,6 +1598,9 @@ mod tests {
         assert!(verify_h2_frame_header(128, 16384, 0, 0, 1, 65535, 256));
         assert!(!verify_h2_frame_header(4096, 16384, 0, 0, 1, 1024, 8192));
         assert!(!verify_h2_frame_header(6, 16384, 4, 1, 0, 65535, 32));
+        assert!(!verify_h2_frame_header(3, 16384, 2, 0, 1, 65535, 32));
+        assert!(!verify_h2_frame_header(2, 16384, 3, 0, 1, 65535, 32));
+        assert!(!verify_h2_frame_header(8, 16384, 8, 0, 0, 65535, 32));
 
         assert!(verify_quic_packet_window(101, 100, 1, 512, 4096, 1024, 8192));
         assert!(!verify_quic_packet_window(97, 100, 9, 512, 4096, 1024, 8192));
@@ -1607,5 +1610,9 @@ mod tests {
         assert!(verify_h3_frame_capsule(4, 12, 2, 1, 32));
         assert!(!verify_h3_frame_capsule(2, 5, 2, 0, 64));
         assert!(!verify_h3_frame_capsule(4, 12, 2, 0, 32));
+        assert!(!verify_h3_frame_capsule(3, 4, 2, 0, 32));
+        assert!(!verify_h3_frame_capsule(13, 4, 2, 0, 32));
+        assert!(!verify_h3_frame_capsule(5, 4, 2, 1, 32));
+        assert!(!verify_h3_frame_capsule(33, 4, 2, 2, 32));
     }
 }

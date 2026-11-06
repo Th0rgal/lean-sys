@@ -79,7 +79,43 @@ inductive H2DecodeResult where
   | protocolError (reason : String)
   deriving Repr, DecidableEq
 
-/-- Encode an RFC 9113 9-byte frame header + payload gated by `verifyH2FrameHeader`. -/
+/-- Validate frame-specific payload invariants after `verifyH2FrameHeader` passes:
+    - `PADDED` (`0x08`) on `DATA` / `HEADERS` / `PUSH_PROMISE`: `padLength` byte + mandatory header fields MUST NOT reach or exceed `payload.size` (RFC 9113 §6.1, §6.2, §6.6)
+    - `WINDOW_UPDATE` (`0x08`): 31-bit increment MUST be nonzero (`1..0x7FFFFFFF`, RFC 9113 §6.9)
+    - `PUSH_PROMISE` (`0x05`): 31-bit promised stream ID MUST be nonzero (`RFC 9113 §6.6`). -/
+def payloadStructurallyValid (ft : H2FrameType) (flags : UInt8) (payload : ByteSource) : Bool :=
+  let payLen := payload.size
+  let padded := (flags &&& 0x08) != 0
+  match ft with
+  | .data =>
+    if !padded then true
+    else payLen ≥ 1 && (payload.getByteD 0).toNat < payLen
+  | .headers =>
+    let prioBytes := if (flags &&& 0x20) != 0 then 5 else 0
+    if !padded then payLen ≥ prioBytes
+    else payLen ≥ 1 + prioBytes && (payload.getByteD 0).toNat + 1 + prioBytes ≤ payLen
+  | .pushPromise =>
+    let padOff := if padded then 1 else 0
+    if payLen < padOff + 4 then false
+    else
+      let padLen := if padded then (payload.getByteD 0).toNat else 0
+      let p0 := (payload.getByteD padOff).toUInt32 &&& 0x7F
+      let p1 := (payload.getByteD (padOff + 1)).toUInt32
+      let p2 := (payload.getByteD (padOff + 2)).toUInt32
+      let p3 := (payload.getByteD (padOff + 3)).toUInt32
+      let promisedSid := (p0 <<< 24) ||| (p1 <<< 16) ||| (p2 <<< 8) ||| p3
+      promisedSid > 0 && padOff + 4 + padLen ≤ payLen
+  | .windowUpdate =>
+    if payLen != 4 then false
+    else
+      let w0 := (payload.getByteD 0).toUInt32 &&& 0x7F
+      let w1 := (payload.getByteD 1).toUInt32
+      let w2 := (payload.getByteD 2).toUInt32
+      let w3 := (payload.getByteD 3).toUInt32
+      ((w0 <<< 24) ||| (w1 <<< 16) ||| (w2 <<< 8) ||| w3) > 0
+  | _ => true
+
+/-- Encode an RFC 9113 9-byte frame header + payload gated by `verifyH2FrameHeader` and `payloadStructurallyValid`. -/
 def encodeFrame? (f : H2Frame) (maxFrameSize : UInt32 := 16384)
     (recvWindow : UInt64 := 65535) : Option ByteArray :=
   let payLen := f.payload.size
@@ -89,7 +125,8 @@ def encodeFrame? (f : H2Frame) (maxFrameSize : UInt32 := 16384)
     let pay32 := payLen.toUInt32
     let total := (9 + payLen).toUInt64
     let tyByte := f.frameType.toByte
-    if verifyH2FrameHeader pay32 maxFrameSize tyByte f.flags f.streamId recvWindow total != 1 then
+    if verifyH2FrameHeader pay32 maxFrameSize tyByte f.flags f.streamId recvWindow total != 1 ||
+       !payloadStructurallyValid f.frameType f.flags (ByteSource.ofByteArray f.payload) then
       none
     else Id.run do
       let mut out := ByteArray.emptyWithCapacity (9 + payLen)
@@ -107,7 +144,7 @@ def encodeFrame? (f : H2Frame) (maxFrameSize : UInt32 := 16384)
         out := out.push (f.payload.get! i)
       return some out
 
-/-- Decode one RFC 9113 HTTP/2 frame from `src` gated by `verifyH2FrameHeader`. -/
+/-- Decode one RFC 9113 HTTP/2 frame from `src` gated by `verifyH2FrameHeader` and `payloadStructurallyValid`. -/
 def decodeFramePrefix (src : ByteSource) (maxFrameSize : UInt32 := 16384)
     (recvWindow : UInt64 := 65535) : H2DecodeResult :=
   let total := src.size
@@ -125,6 +162,7 @@ def decodeFramePrefix (src : ByteSource) (maxFrameSize : UInt32 := 16384)
     let s2 := (src.getByteD 7).toUInt32
     let s3 := (src.getByteD 8).toUInt32
     let streamId := (s0 <<< 24) ||| (s1 <<< 16) ||| (s2 <<< 8) ||| s3
+    let ft := H2FrameType.ofByte tyByte
     if pay32 > maxFrameSize then
       .protocolError "FRAME_SIZE_ERROR"
     else if total < 9 + pay32.toNat then
@@ -135,9 +173,12 @@ def decodeFramePrefix (src : ByteSource) (maxFrameSize : UInt32 := 16384)
       match src.subSource? 9 pay32.toNat with
       | none => .protocolError "SLICE_BOUNDS_ERROR"
       | some sub =>
-        let payload := sub.toByteArray
-        .ok { frameType := H2FrameType.ofByte tyByte, flags := flags, streamId := streamId, payload := payload }
-          (9 + pay32.toNat)
+        if !payloadStructurallyValid ft flags sub then
+          .protocolError "PROTOCOL_PAYLOAD_ERROR"
+        else
+          let payload := sub.toByteArray
+          .ok { frameType := ft, flags := flags, streamId := streamId, payload := payload }
+            (9 + pay32.toNat)
 
 /-! ## RFC 7541 Subset HPACK Static Table + Literal Without Indexing Codec -/
 
@@ -256,10 +297,16 @@ def encodeHeadersBlock (headers : Array (String × String)) : ByteArray := Id.ru
       for i in [0:vb.size] do out := out.push (vb.get! i)
   return out
 
-/-- Decode an RFC 7541 header block (indexed static entries + literal with/without indexing, non-Huffman) with header-list cap `maxHeaders`. -/
+/-- Decode a static-table-only RFC 7541 header block (`SETTINGS_HEADER_TABLE_SIZE = 0`):
+    - Accepts static-table indexed entries (`1xxxxxxx`), literal-without-indexing (`0000xxxx`),
+      and literal-never-indexed (`0001xxxx`).
+    - Rejects literal-with-incremental-indexing (`01xxxxxx`, since our decoder maintains no dynamic table)
+      and rejects dynamic-table-size updates (`001xxxxx`) unless placed at the very start of the block
+      with size `0` (`RFC 7541 §4.2`). -/
 def decodeHeadersBlock? (src : ByteSource) (maxHeaders : Nat := 128) : Option (Array (String × String)) := Id.run do
   let mut out : Array (String × String) := #[]
   let mut off := 0
+  let mut sawField := false
   while off < src.size do
     if out.size >= maxHeaders then
       return none
@@ -272,17 +319,22 @@ def decodeHeadersBlock? (src : ByteSource) (maxHeaders : Nat := 128) : Option (A
         | none => return none
         | some kv =>
           out := out.push kv
+          sawField := true
           off := nextOff
+    else if (b &&& 0x40) != 0 then
+      -- Incremental indexing (`01xxxxxx`) requires a dynamic table; reject in static-only mode (`SETTINGS_HEADER_TABLE_SIZE = 0`)
+      return none
     else if (b &&& 0xE0) == 0x20 then
-      -- Dynamic table size update (`001xxxxx`): consume and enforce `≤ 65536`
+      -- Dynamic table size update (`001xxxxx`): RFC 7541 §4.2 requires placement before any header field and `sz == 0`
+      if sawField then
+        return none
       match decodeHpackInt? src off 5 with
       | some (sz, nextOff) =>
-        if sz > 65536 then return none
+        if sz != 0 then return none
         off := nextOff
       | none => return none
     else
-      let prefixBits := if (b &&& 0x40) != 0 then 6 else 4
-      match decodeHpackInt? src off prefixBits with
+      match decodeHpackInt? src off 4 with
       | none => return none
       | some (nameIdx, afterIdx) =>
         if nameIdx == 0 then
@@ -293,11 +345,13 @@ def decodeHeadersBlock? (src : ByteSource) (maxHeaders : Nat := 128) : Option (A
             | none => return none
             | some (val, afterVal) =>
               out := out.push (name, val)
+              sawField := true
               off := afterVal
         else
           match hpackStaticEntry? nameIdx, decodeHpackString? src afterIdx with
           | some (name, _), some (val, afterVal) =>
             out := out.push (name, val)
+            sawField := true
             off := afterVal
           | _, _ => return none
   return some out

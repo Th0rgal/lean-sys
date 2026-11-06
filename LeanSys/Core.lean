@@ -738,17 +738,27 @@ def selfTestWave1Features (testDir : String) : IO UInt32 := do
 
   -- 11. Wave 5.A: Pure-Lean Sans-I/O HTTP/2 (`LeanSys.H2`), QUIC RFC 6479 Anti-Replay & GSO (`LeanSys.Quic`),
   --     and HTTP/3 Capsule + Static QPACK (`LeanSys.H3`) Conformance!
-  let reqHdrs := #[(":method", "POST"), (":scheme", "https"), (":path", "/v1/responses"), ("content-type", "application/json")]
+  let reqHdrs := #[(":method", "POST"), (":scheme", "https"), (":path", "/v1/responses"), (":status", "400"), ("content-type", "application/json")]
   let hpackBytes := encodeHeadersBlock reqHdrs
   let decHpack := decodeHeadersBlock? (ByteSource.ofByteArray hpackBytes)
+  -- Dynamic-table incremental indexing (`0x40`) or mid-block table-size update (`0x20`) MUST be rejected in static-only HPACK
+  let badHpackDyn := decodeHeadersBlock? (ByteSource.ofByteArray (ByteArray.mk #[0x40, 0x01, 0x61, 0x01, 0x62]))
+  let badHpackMidUpd := decodeHeadersBlock? (ByteSource.ofByteArray (hpackBytes ++ ByteArray.mk #[0x20]))
   let some h2HdrWire := LeanSys.H2.encodeFrame? { frameType := .headers, flags := 0x04, streamId := 1, payload := hpackBytes }
     | do IO.eprintln "[lean-sys-core] FAIL: H2 HEADERS encodeFrame?"; return 1
   let some h2DataWire := LeanSys.H2.encodeFrame? { frameType := .data, flags := 0x01, streamId := 1, payload := "{\"ok\":true}".toUTF8 }
     | do IO.eprintln "[lean-sys-core] FAIL: H2 DATA encodeFrame?"; return 1
+  -- Malformed PRIORITY (`len != 5`), RST_STREAM (`len != 4`), zero-increment WINDOW_UPDATE, or over-padded DATA MUST fail closed!
+  let badPrioLen := LeanSys.H2.encodeFrame? { frameType := .priority, flags := 0, streamId := 1, payload := ByteArray.mk #[1, 2, 3] }
+  let badRstLen := LeanSys.H2.encodeFrame? { frameType := .rstStream, flags := 0, streamId := 1, payload := ByteArray.mk #[1, 2] }
+  let badWinZero := LeanSys.H2.encodeFrame? { frameType := .windowUpdate, flags := 0, streamId := 0, payload := ByteArray.mk #[0, 0, 0, 0] }
+  let badPadData := LeanSys.H2.encodeFrame? { frameType := .data, flags := 0x08, streamId := 1, payload := ByteArray.mk #[5, 1, 2] }
   let (h2Res1, h2St1) := stepInboundFrame {} (ByteSource.ofByteArray h2HdrWire)
   let (h2Res2, h2St2) := stepInboundFrame h2St1 (ByteSource.ofByteArray h2DataWire)
   let (h2OverflowRes, _) := stepInboundFrame { connRecvWindow := 4 } (ByteSource.ofByteArray h2DataWire)
   if decHpack != some reqHdrs ||
+     badHpackDyn.isSome || badHpackMidUpd.isSome ||
+     badPrioLen.isSome || badRstLen.isSome || badWinZero.isSome || badPadData.isSome ||
      h2St2.connRecvWindow != 65535 - 11 ||
      (LeanSys.H2.buildSettingsFrame? #[(1, 4096)] true).isSome ||
      !(match h2Res1, h2Res2, h2OverflowRes with
@@ -757,28 +767,42 @@ def selfTestWave1Features (testDir : String) : IO UInt32 := do
     IO.eprintln "[lean-sys-core] FAIL: Sans-I/O HTTP/2 HPACK or flow-control check failed"
     return 1
 
-  -- QUIC varints (`1`, `2`, `4`, `8` byte boundaries), RFC 6479 out-of-order + replay rejection, roaming peerAddrTag, GSO segmentation
+  -- QUIC varints (`1`, `2`, `4`, `8` byte boundaries), RFC 6479 out-of-order + replay rejection, per-stream high-water conservation,
+  -- 62-bit packet-number truncation/reconstruction across `2^32`, reserved-bit rejection & KeyPhase preservation, GSO segmentation
   for v in ([0, 37, 15293, 494878333, 151288809941952652] : List UInt64) do
     let some vb := encodeVarInt? v | do IO.eprintln s!"[lean-sys-core] FAIL: encodeVarInt? {v}"; return 1
     if decodeVarInt? (ByteSource.ofByteArray vb) 0 != some (v, vb.size) then
       IO.eprintln s!"[lean-sys-core] FAIL: decodeVarInt? roundtrip {v}"
       return 1
-  let some q1 := admitPacket? {} 100 512 512 0x0A000001 | return 1
-  -- Out-of-order packet 97 admitted once, then immediate replay of 97 or 100 rejected, then forward packet 105 roams peerAddrTag!
-  let some q2 := admitPacket? q1 97 768 256 0x0A000001 | return 1
-  let replay97 := admitPacket? q2 97 768 0 0x0A000001
-  let replay100 := admitPacket? q2 100 768 0 0x0A000001
-  let stale30 := admitPacket? q2 30 768 0 0x0A000001
-  let some q3 := admitPacket? q2 105 1024 256 0x0A000002 | return 1
-  let gsoSegs := segmentDatagramsGso 0x1122334455667788 1 (ByteSource.ofByteArray (ByteArray.mk (Array.replicate 2500 0x42))) 1200
+  let some q1 := admitStreamPacket? {} 100 4 512 0x0A000001 | return 1
+  -- Out-of-order packet 97 on stream 4 with lower offset `256` consumes `0` extra connection bytes; stream 8 at `256` advances conn to `768`!
+  let some q2a := admitStreamPacket? q1 97 4 256 0x0A000001 | return 1
+  let some q2 := admitStreamPacket? q2a 98 8 256 0x0A000001 | return 1
+  let replay97 := admitStreamPacket? q2 97 4 256 0x0A000001
+  let replay100 := admitStreamPacket? q2 100 4 512 0x0A000001
+  let stale30 := admitStreamPacket? q2 30 4 512 0x0A000001
+  let some q3 := admitStreamPacket? q2 105 4 768 0x0A000002 | return 1
+  let hiPn : UInt64 := ((1 : UInt64) <<< 33) + 5
+  let some (gsoSegs, nextPn) := segmentDatagramsGso? 0x1122334455667788 hiPn (ByteSource.ofByteArray (ByteArray.mk (Array.replicate 2500 0x42))) 1200 true
+    | do IO.eprintln "[lean-sys-core] FAIL: segmentDatagramsGso?"; return 1
+  let gsoOverflow := segmentDatagramsGso? 0x1122334455667788 (((1 : UInt64) <<< 62) - 1) (ByteSource.ofByteArray (ByteArray.mk (Array.replicate 2500 0x42))) 1200
+  let badReservedHdr := gsoSegs[0]!.set! 0 (gsoSegs[0]!.get! 0 ||| 0x10)
+  let decLastSeg := decodeShortPacket? (ByteSource.ofByteArray gsoSegs[2]!) (hiPn + 1)
   if replay97.isSome || replay100.isSome || stale30.isSome ||
+     q2a.connRxBytes != 512 || q2.connRxBytes != 768 ||
      q3.peerAddrTag != 0x0A000002 || q3.connRxBytes != 1024 ||
-     gsoSegs.size != 3 ||
-     (decodeShortPacket? (ByteSource.ofByteArray gsoSegs[2]!)).map (·.pktNum) != some 3 then
-    IO.eprintln "[lean-sys-core] FAIL: Sans-I/O QUIC anti-replay, roaming, or GSO segmentation failed"
+     gsoSegs.size != 3 || nextPn != hiPn + 3 || gsoOverflow.isSome ||
+     (decodeShortPacket? (ByteSource.ofByteArray badReservedHdr) hiPn).isSome ||
+     decLastSeg.map (fun p => (p.pktNum, p.keyPhase)) != some (hiPn + 2, true) then
+    IO.eprintln "[lean-sys-core] FAIL: Sans-I/O QUIC anti-replay, stream conservation, 62-bit PN reconstruction, or GSO segmentation failed"
     return 1
 
-  -- HTTP/3 capsule + QPACK static field section + forbidden HTTP/2 frame type (`0x02`) & wrong-role (`SETTINGS` on request stream) rejection
+  -- HTTP/3 capsule + RFC 9204 QPACK static field section (`:status 400` -> static index `67 = 0xFF, 0x04`) +
+  -- forbidden HTTP/2 frame (`0x02`), wrong-role (`SETTINGS`/`CANCEL_PUSH`/`MAX_PUSH_ID` on request stream, `PUSH_PROMISE` on control stream, any capsule on `.uniQpack`) rejection!
+  let qpackStatusHdrs := #[(":status", "100"), (":status", "204"), (":status", "400")]
+  let qpackStatusWire := encodeQpackHeaders qpackStatusHdrs
+  -- Prefix `0x00, 0x00`, then index 63 (`0xFF, 0x00`), index 64 (`0xFF, 0x01`), index 67 (`0xFF, 0x04`)
+  let expectedQpackStatusWire := ByteArray.mk #[0x00, 0x00, 0xFF, 0x00, 0xFF, 0x01, 0xFF, 0x04]
   let qpackBytes := encodeQpackHeaders reqHdrs
   let decQpack := decodeQpackHeaders? (ByteSource.ofByteArray qpackBytes)
   let some h3Msg := encodeH3Message? reqHdrs "{\"h3\":1}".toUTF8
@@ -786,11 +810,16 @@ def selfTestWave1Features (testDir : String) : IO UInt32 := do
   let h3Dec1 := decodeCapsulePrefix (ByteSource.ofByteArray h3Msg) .bidiRequest
   let some h3CtrlSettings := encodeCapsule? { frameType := 0x04, payload := ByteArray.mk #[0x06, 0x40, 0x40] } .uniControl
     | do IO.eprintln "[lean-sys-core] FAIL: H3 control SETTINGS capsule"; return 1
-  -- Decoding control SETTINGS on a bidirectional request stream MUST fail closed!
   let h3WrongRole := decodeCapsulePrefix (ByteSource.ofByteArray h3CtrlSettings) .bidiRequest
-  -- Reserved HTTP/2 frame `0x02` (`PRIORITY`) MUST fail closed on encode and decode!
+  let h3CancelOnReq := encodeCapsule? { frameType := 0x03, payload := ByteArray.mk #[0x00] } .bidiRequest
+  let h3MaxPushOnReq := encodeCapsule? { frameType := 0x0D, payload := ByteArray.mk #[0x00] } .bidiRequest
+  let h3PushOnCtrl := encodeCapsule? { frameType := 0x05, payload := ByteArray.mk #[0x00] } .uniControl
+  let h3CapsuleOnQpack := encodeCapsule? { frameType := 0x21, payload := ByteArray.mk #[0x01] } .uniQpack
   let h3Reserved := encodeCapsule? { frameType := 0x02, payload := ByteArray.mk #[1, 2, 3, 4, 5] } .bidiRequest
-  if decQpack != some reqHdrs || h3Reserved.isSome ||
+  if qpackStatusWire != expectedQpackStatusWire ||
+     decodeQpackHeaders? (ByteSource.ofByteArray qpackStatusWire) != some qpackStatusHdrs ||
+     decQpack != some reqHdrs || h3Reserved.isSome ||
+     h3CancelOnReq.isSome || h3MaxPushOnReq.isSome || h3PushOnCtrl.isSome || h3CapsuleOnQpack.isSome ||
      !(match h3Dec1, h3WrongRole with
        | .ok f1 used1, .frameError _ =>
          f1.frameType == 0x01 &&
