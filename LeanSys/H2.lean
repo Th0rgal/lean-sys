@@ -79,43 +79,54 @@ inductive H2DecodeResult where
   | protocolError (reason : String)
   deriving Repr, DecidableEq
 
-/-- Validate frame-specific payload invariants after `verifyH2FrameHeader` passes:
-    - `PADDED` (`0x08`) on `DATA` / `HEADERS` / `PUSH_PROMISE`: `padLength` byte + mandatory header fields MUST NOT reach or exceed `payload.size` (RFC 9113 §6.1, §6.2, §6.6)
+/-- Validate frame-specific payload invariants after `verifyH2FrameHeader` passes (all slice extents routed through
+    `ByteSource.subSource?` -> `leansys_verify_slice_bounds`):
+    - `PADDED` (`0x08`) on `DATA` / `HEADERS` / `PUSH_PROMISE`: `padLength` byte + mandatory header fields MUST NOT reach or exceed `payload.size`
     - `WINDOW_UPDATE` (`0x08`): 31-bit increment MUST be nonzero (`1..0x7FFFFFFF`, RFC 9113 §6.9)
     - `PUSH_PROMISE` (`0x05`): 31-bit promised stream ID MUST be nonzero (`RFC 9113 §6.6`). -/
 def payloadStructurallyValid (ft : H2FrameType) (flags : UInt8) (payload : ByteSource) : Bool :=
-  let payLen := payload.size
   let padded := (flags &&& 0x08) != 0
   match ft with
   | .data =>
     if !padded then true
-    else payLen ≥ 1 && (payload.getByteD 0).toNat < payLen
+    else
+      match payload.subSource? 0 1 with
+      | none => false
+      | some p0 => (payload.subSource? 1 (p0.getByteD 0).toNat).isSome
   | .headers =>
     let prioBytes := if (flags &&& 0x20) != 0 then 5 else 0
-    if !padded then payLen ≥ prioBytes
-    else payLen ≥ 1 + prioBytes && (payload.getByteD 0).toNat + 1 + prioBytes ≤ payLen
+    if !padded then (payload.subSource? 0 prioBytes).isSome
+    else
+      match payload.subSource? 0 (1 + prioBytes) with
+      | none => false
+      | some hdr => (payload.subSource? (1 + prioBytes) (hdr.getByteD 0).toNat).isSome
   | .pushPromise =>
     let padOff := if padded then 1 else 0
-    if payLen < padOff + 4 then false
-    else
-      let padLen := if padded then (payload.getByteD 0).toNat else 0
-      let p0 := (payload.getByteD padOff).toUInt32 &&& 0x7F
-      let p1 := (payload.getByteD (padOff + 1)).toUInt32
-      let p2 := (payload.getByteD (padOff + 2)).toUInt32
-      let p3 := (payload.getByteD (padOff + 3)).toUInt32
+    match payload.subSource? 0 (padOff + 4) with
+    | none => false
+    | some hdr =>
+      let padLen := if padded then (hdr.getByteD 0).toNat else 0
+      let p0 := (hdr.getByteD padOff).toUInt32 &&& 0x7F
+      let p1 := (hdr.getByteD (padOff + 1)).toUInt32
+      let p2 := (hdr.getByteD (padOff + 2)).toUInt32
+      let p3 := (hdr.getByteD (padOff + 3)).toUInt32
       let promisedSid := (p0 <<< 24) ||| (p1 <<< 16) ||| (p2 <<< 8) ||| p3
-      promisedSid > 0 && padOff + 4 + padLen ≤ payLen
+      promisedSid > 0 && (payload.subSource? (padOff + 4) padLen).isSome
   | .windowUpdate =>
-    if payLen != 4 then false
+    if payload.size != 4 then false
     else
-      let w0 := (payload.getByteD 0).toUInt32 &&& 0x7F
-      let w1 := (payload.getByteD 1).toUInt32
-      let w2 := (payload.getByteD 2).toUInt32
-      let w3 := (payload.getByteD 3).toUInt32
-      ((w0 <<< 24) ||| (w1 <<< 16) ||| (w2 <<< 8) ||| w3) > 0
+      match payload.subSource? 0 4 with
+      | none => false
+      | some hdr =>
+        let w0 := (hdr.getByteD 0).toUInt32 &&& 0x7F
+        let w1 := (hdr.getByteD 1).toUInt32
+        let w2 := (hdr.getByteD 2).toUInt32
+        let w3 := (hdr.getByteD 3).toUInt32
+        ((w0 <<< 24) ||| (w1 <<< 16) ||| (w2 <<< 8) ||| w3) > 0
   | _ => true
 
-/-- Encode an RFC 9113 9-byte frame header + payload gated by `verifyH2FrameHeader` and `payloadStructurallyValid`. -/
+/-- Encode an RFC 9113 9-byte frame header + payload gated by `verifyH2FrameHeader` and `payloadStructurallyValid`
+    (canonicalizing `H2FrameType.ofByte tyByte` so `.unknown` wrapping a known frame code cannot bypass payload checks). -/
 def encodeFrame? (f : H2Frame) (maxFrameSize : UInt32 := 16384)
     (recvWindow : UInt64 := 65535) : Option ByteArray :=
   let payLen := f.payload.size
@@ -125,8 +136,9 @@ def encodeFrame? (f : H2Frame) (maxFrameSize : UInt32 := 16384)
     let pay32 := payLen.toUInt32
     let total := (9 + payLen).toUInt64
     let tyByte := f.frameType.toByte
+    let canonFt := H2FrameType.ofByte tyByte
     if verifyH2FrameHeader pay32 maxFrameSize tyByte f.flags f.streamId recvWindow total != 1 ||
-       !payloadStructurallyValid f.frameType f.flags (ByteSource.ofByteArray f.payload) then
+       !payloadStructurallyValid canonFt f.flags (ByteSource.ofByteArray f.payload) then
       none
     else Id.run do
       let mut out := ByteArray.emptyWithCapacity (9 + payLen)
@@ -144,28 +156,29 @@ def encodeFrame? (f : H2Frame) (maxFrameSize : UInt32 := 16384)
         out := out.push (f.payload.get! i)
       return some out
 
-/-- Decode one RFC 9113 HTTP/2 frame from `src` gated by `verifyH2FrameHeader` and `payloadStructurallyValid`. -/
+/-- Decode one RFC 9113 HTTP/2 frame from `src` gated by `subSource?` (`leansys_verify_slice_bounds`),
+    `verifyH2FrameHeader`, and `payloadStructurallyValid`. -/
 def decodeFramePrefix (src : ByteSource) (maxFrameSize : UInt32 := 16384)
     (recvWindow : UInt64 := 65535) : H2DecodeResult :=
-  let total := src.size
-  if total < 9 then
-    .needMoreBytes
-  else
-    let b0 := (src.getByteD 0).toUInt32
-    let b1 := (src.getByteD 1).toUInt32
-    let b2 := (src.getByteD 2).toUInt32
+  match src.subSource? 0 9 with
+  | none => .needMoreBytes
+  | some hdr =>
+    let total := src.size
+    let b0 := (hdr.getByteD 0).toUInt32
+    let b1 := (hdr.getByteD 1).toUInt32
+    let b2 := (hdr.getByteD 2).toUInt32
     let pay32 := (b0 <<< 16) ||| (b1 <<< 8) ||| b2
-    let tyByte := src.getByteD 3
-    let flags := src.getByteD 4
-    let s0 := (src.getByteD 5).toUInt32 &&& 0x7F
-    let s1 := (src.getByteD 6).toUInt32
-    let s2 := (src.getByteD 7).toUInt32
-    let s3 := (src.getByteD 8).toUInt32
+    let tyByte := hdr.getByteD 3
+    let flags := hdr.getByteD 4
+    let s0 := (hdr.getByteD 5).toUInt32 &&& 0x7F
+    let s1 := (hdr.getByteD 6).toUInt32
+    let s2 := (hdr.getByteD 7).toUInt32
+    let s3 := (hdr.getByteD 8).toUInt32
     let streamId := (s0 <<< 24) ||| (s1 <<< 16) ||| (s2 <<< 8) ||| s3
     let ft := H2FrameType.ofByte tyByte
     if pay32 > maxFrameSize then
       .protocolError "FRAME_SIZE_ERROR"
-    else if total < 9 + pay32.toNat then
+    else if (src.subSource? 0 (9 + pay32.toNat)).isNone then
       .needMoreBytes
     else if verifyH2FrameHeader pay32 maxFrameSize tyByte flags streamId recvWindow total.toUInt64 != 1 then
       .protocolError "PROTOCOL_OR_FLOW_CONTROL_ERROR"
@@ -233,29 +246,31 @@ def encodeHpackInt (val : Nat) (prefixBits : Nat) (prefixMask : UInt8) : ByteArr
   out := out.push rem.toUInt8
   return out
 
-/-- Decode an RFC 7541 §5.1 integer starting at `off` in `src` (bounded to `≤ 5` continuation bytes). -/
-def decodeHpackInt? (src : ByteSource) (off : Nat) (prefixBits : Nat) : Option (Nat × Nat) := Id.run do
-  if off >= src.size then
-    return none
+/-- Decode an RFC 7541 §5.1 integer starting at `off` in `src` (bounded to `≤ 5` continuation bytes,
+    routing every byte read through `ByteSource.subSource?` -> `leansys_verify_slice_bounds`). -/
+def decodeHpackInt? (src : ByteSource) (off : Nat) (prefixBits : Nat) : Option (Nat × Nat) := do
+  let head ← src.subSource? off 1
   let mask : Nat := (1 <<< prefixBits) - 1
-  let first := (src.getByteD off).toNat &&& mask
+  let first := (head.getByteD 0).toNat &&& mask
   if first < mask then
-    return some (first, off + 1)
-  let mut acc := first
-  let mut shift := 0
-  let mut idx := off + 1
-  let mut steps := 0
-  while steps < 5 do
-    if idx >= src.size then
-      return none
-    let b := (src.getByteD idx).toNat
-    acc := acc + ((b &&& 0x7F) <<< shift)
-    idx := idx + 1
-    if (b &&& 0x80) == 0 then
-      return some (acc, idx)
-    shift := shift + 7
-    steps := steps + 1
-  return none
+    some (first, off + 1)
+  else Id.run do
+    let mut acc := first
+    let mut shift := 0
+    let mut idx := off + 1
+    let mut steps := 0
+    while steps < 5 do
+      match src.subSource? idx 1 with
+      | none => return none
+      | some bSub =>
+        let b := (bSub.getByteD 0).toNat
+        acc := acc + ((b &&& 0x7F) <<< shift)
+        idx := idx + 1
+        if (b &&& 0x80) == 0 then
+          return some (acc, idx)
+        shift := shift + 7
+        steps := steps + 1
+    return none
 
 /-- Encode a raw non-Huffman RFC 7541 §5.2 string literal. -/
 def encodeHpackString (s : String) : ByteArray := Id.run do
@@ -268,17 +283,16 @@ def encodeHpackString (s : String) : ByteArray := Id.run do
     out := out.push (utf8.get! i)
   return out
 
-/-- Decode a non-Huffman RFC 7541 §5.2 string literal at `off` in `src`. -/
+/-- Decode a non-Huffman RFC 7541 §5.2 string literal at `off` in `src` (bounds routed via `subSource?`). -/
 def decodeHpackString? (src : ByteSource) (off : Nat) : Option (String × Nat) := do
-  if off >= src.size then none
+  let head ← src.subSource? off 1
+  let huff := (head.getByteD 0) &&& 0x80
+  if huff != 0 then
+    none
   else
-    let huff := (src.getByteD off) &&& 0x80
-    if huff != 0 then
-      none
-    else
-      let (strLen, nextOff) ← decodeHpackInt? src off 7
-      let sub ← src.subSource? nextOff strLen
-      some (String.fromUTF8! sub.toByteArray, nextOff + strLen)
+    let (strLen, nextOff) ← decodeHpackInt? src off 7
+    let sub ← src.subSource? nextOff strLen
+    some (String.fromUTF8! sub.toByteArray, nextOff + strLen)
 
 /-- Encode HTTP/2 headers using RFC 7541 indexed static entries (`0x80 | idx`) or literal-without-indexing (`0x00`). -/
 def encodeHeadersBlock (headers : Array (String × String)) : ByteArray := Id.run do
@@ -310,7 +324,9 @@ def decodeHeadersBlock? (src : ByteSource) (maxHeaders : Nat := 128) : Option (A
   while off < src.size do
     if out.size >= maxHeaders then
       return none
-    let b := src.getByteD off
+    let b ← match src.subSource? off 1 with
+      | some head => pure (head.getByteD 0)
+      | none => return none
     if (b &&& 0x80) != 0 then
       match decodeHpackInt? src off 7 with
       | none => return none

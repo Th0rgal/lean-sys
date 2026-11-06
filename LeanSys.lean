@@ -198,6 +198,9 @@ namespace Web
   abbrev QuicShortPacket := LeanSys.Quic.QuicShortPacket
   abbrev encodeQuicVarInt? := LeanSys.Quic.encodeVarInt?
   abbrev decodeQuicVarInt? := LeanSys.Quic.decodeVarInt?
+  abbrev admitQuicPacketNumber? := LeanSys.Quic.admitPacketNumber?
+  abbrev accountQuicStreamRange? := LeanSys.Quic.accountStreamRange?
+  abbrev admitQuicMultiStreamPacket? := LeanSys.Quic.admitMultiStreamPacket?
   abbrev admitQuicStreamPacket? := LeanSys.Quic.admitStreamPacket?
   abbrev admitQuicPacket? := LeanSys.Quic.admitPacket?
   abbrev segmentQuicDatagramsGso? := LeanSys.Quic.segmentDatagramsGso?

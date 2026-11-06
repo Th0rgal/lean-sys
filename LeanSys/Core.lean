@@ -752,13 +752,14 @@ def selfTestWave1Features (testDir : String) : IO UInt32 := do
   let badPrioLen := LeanSys.H2.encodeFrame? { frameType := .priority, flags := 0, streamId := 1, payload := ByteArray.mk #[1, 2, 3] }
   let badRstLen := LeanSys.H2.encodeFrame? { frameType := .rstStream, flags := 0, streamId := 1, payload := ByteArray.mk #[1, 2] }
   let badWinZero := LeanSys.H2.encodeFrame? { frameType := .windowUpdate, flags := 0, streamId := 0, payload := ByteArray.mk #[0, 0, 0, 0] }
+  let badUnknownWinZero := LeanSys.H2.encodeFrame? { frameType := .unknown 0x08, flags := 0, streamId := 0, payload := ByteArray.mk #[0, 0, 0, 0] }
   let badPadData := LeanSys.H2.encodeFrame? { frameType := .data, flags := 0x08, streamId := 1, payload := ByteArray.mk #[5, 1, 2] }
   let (h2Res1, h2St1) := stepInboundFrame {} (ByteSource.ofByteArray h2HdrWire)
   let (h2Res2, h2St2) := stepInboundFrame h2St1 (ByteSource.ofByteArray h2DataWire)
   let (h2OverflowRes, _) := stepInboundFrame { connRecvWindow := 4 } (ByteSource.ofByteArray h2DataWire)
   if decHpack != some reqHdrs ||
      badHpackDyn.isSome || badHpackMidUpd.isSome ||
-     badPrioLen.isSome || badRstLen.isSome || badWinZero.isSome || badPadData.isSome ||
+     badPrioLen.isSome || badRstLen.isSome || badWinZero.isSome || badUnknownWinZero.isSome || badPadData.isSome ||
      h2St2.connRecvWindow != 65535 - 11 ||
      (LeanSys.H2.buildSettingsFrame? #[(1, 4096)] true).isSome ||
      !(match h2Res1, h2Res2, h2OverflowRes with
@@ -774,6 +775,8 @@ def selfTestWave1Features (testDir : String) : IO UInt32 := do
     if decodeVarInt? (ByteSource.ofByteArray vb) 0 != some (v, vb.size) then
       IO.eprintln s!"[lean-sys-core] FAIL: decodeVarInt? roundtrip {v}"
       return 1
+  let truncVar2 := decodeVarInt? (ByteSource.ofByteArray (ByteArray.mk #[0x40])) 0
+  let truncVar4 := decodeVarInt? (ByteSource.ofByteArray (ByteArray.mk #[0x80, 0x01, 0x02])) 0
   let some q1 := admitStreamPacket? {} 100 4 512 0x0A000001 | return 1
   -- Out-of-order packet 97 on stream 4 with lower offset `256` consumes `0` extra connection bytes; stream 8 at `256` advances conn to `768`!
   let some q2a := admitStreamPacket? q1 97 4 256 0x0A000001 | return 1
@@ -781,16 +784,18 @@ def selfTestWave1Features (testDir : String) : IO UInt32 := do
   let replay97 := admitStreamPacket? q2 97 4 256 0x0A000001
   let replay100 := admitStreamPacket? q2 100 4 512 0x0A000001
   let stale30 := admitStreamPacket? q2 30 4 512 0x0A000001
-  let some q3 := admitStreamPacket? q2 105 4 768 0x0A000002 | return 1
+  -- Multi-STREAM packet `105` carrying both `(4, 768)` (+256) and `(12, 128)` (+128) in one packet!
+  let some q3 := admitMultiStreamPacket? q2 105 #[(4, 768), (12, 128)] 0x0A000002 | return 1
   let hiPn : UInt64 := ((1 : UInt64) <<< 33) + 5
   let some (gsoSegs, nextPn) := segmentDatagramsGso? 0x1122334455667788 hiPn (ByteSource.ofByteArray (ByteArray.mk (Array.replicate 2500 0x42))) 1200 true
     | do IO.eprintln "[lean-sys-core] FAIL: segmentDatagramsGso?"; return 1
   let gsoOverflow := segmentDatagramsGso? 0x1122334455667788 (((1 : UInt64) <<< 62) - 1) (ByteSource.ofByteArray (ByteArray.mk (Array.replicate 2500 0x42))) 1200
   let badReservedHdr := gsoSegs[0]!.set! 0 (gsoSegs[0]!.get! 0 ||| 0x10)
   let decLastSeg := decodeShortPacket? (ByteSource.ofByteArray gsoSegs[2]!) (hiPn + 1)
-  if replay97.isSome || replay100.isSome || stale30.isSome ||
+  if truncVar2.isSome || truncVar4.isSome ||
+     replay97.isSome || replay100.isSome || stale30.isSome ||
      q2a.connRxBytes != 512 || q2.connRxBytes != 768 ||
-     q3.peerAddrTag != 0x0A000002 || q3.connRxBytes != 1024 ||
+     q3.peerAddrTag != 0x0A000002 || q3.connRxBytes != 1152 ||
      gsoSegs.size != 3 || nextPn != hiPn + 3 || gsoOverflow.isSome ||
      (decodeShortPacket? (ByteSource.ofByteArray badReservedHdr) hiPn).isSome ||
      decLastSeg.map (fun p => (p.pktNum, p.keyPhase)) != some (hiPn + 2, true) then

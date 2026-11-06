@@ -63,9 +63,10 @@ def encodeCapsule? (f : H3Frame) (role : H3StreamRole) : Option ByteArray := do
     for i in [0:f.payload.size] do out := out.push (f.payload.get! i)
     return some out
 
-/-- Decode one RFC 9114 HTTP/3 frame capsule from `src` on `role`, gated by `verifyH3FrameCapsule`. -/
+/-- Decode one RFC 9114 HTTP/3 frame capsule from `src` on `role`, gated by `subSource?` (`leansys_verify_slice_bounds`)
+    and `verifyH3FrameCapsule`. -/
 def decodeCapsulePrefix (src : ByteSource) (role : H3StreamRole) : H3DecodeResult :=
-  if src.size < 2 then
+  if (src.subSource? 0 2).isNone then
     .needMoreBytes
   else
     match decodeVarInt? src 0 with
@@ -77,7 +78,7 @@ def decodeCapsulePrefix (src : ByteSource) (role : H3StreamRole) : H3DecodeResul
         let hdrBytes := hdrEnd
         if payLen > 67108864 then
           .frameError "H3_EXCESSIVE_LOAD"
-        else if src.size < hdrBytes + payLen.toNat then
+        else if (src.subSource? 0 (hdrBytes + payLen.toNat)).isNone then
           .needMoreBytes
         else if verifyH3FrameCapsule fType payLen hdrBytes.toUInt8 role.toByte src.size.toUInt64 != 1 then
           .frameError "H3_FRAME_UNEXPECTED_OR_RESERVED"
@@ -151,19 +152,23 @@ def encodeQpackHeaders (headers : Array (String × String)) : ByteArray := Id.ru
       for i in [0:vb.size] do out := out.push (vb.get! i)
   return out
 
-/-- Decode an RFC 9204 §4.5 static-only QPACK field section (`Required Insert Count == 0`). -/
+/-- Decode an RFC 9204 §4.5 static-only QPACK field section (`Required Insert Count == 0`),
+    routing prefix and field tag bounds through `ByteSource.subSource?` (`leansys_verify_slice_bounds`). -/
 def decodeQpackHeaders? (src : ByteSource) (maxHeaders : Nat := 128) : Option (Array (String × String)) := Id.run do
-  if src.size < 2 then
-    return none
+  let pfx ← match src.subSource? 0 2 with
+    | some p => pure p
+    | none => return none
   -- Enforce Required Insert Count == 0 & Delta Base == 0 for zero-blocking static QPACK
-  if src.getByteD 0 != 0 || src.getByteD 1 != 0 then
+  if pfx.getByteD 0 != 0 || pfx.getByteD 1 != 0 then
     return none
   let mut out : Array (String × String) := #[]
   let mut off := 2
   while off < src.size do
     if out.size >= maxHeaders then
       return none
-    let b := src.getByteD off
+    let b ← match src.subSource? off 1 with
+      | some head => pure (head.getByteD 0)
+      | none => return none
     if (b &&& 0xC0) == 0xC0 then
       match LeanSys.H2.decodeHpackInt? src off 6 with
       | none => return none

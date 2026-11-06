@@ -41,21 +41,20 @@ def encodeVarInt? (v : UInt64) : Option ByteArray :=
       out := out.push (v &&& 0xFF).toUInt8
     return some out
 
-/-- Decode an RFC 9000 §16 variable-length integer at `off` in `src`, returning `(value, nextOff)`. -/
-def decodeVarInt? (src : ByteSource) (off : Nat) : Option (UInt64 × Nat) :=
-  if off >= src.size then
-    none
-  else
-    let first := src.getByteD off
-    let tag := first >>> 6
-    let len : Nat := 1 <<< tag.toNat
-    if off + len > src.size then
-      none
-    else Id.run do
-      let mut acc : UInt64 := (first &&& 0x3F).toUInt64
-      for i in [1:len] do
-        acc := (acc <<< 8) ||| (src.getByteD (off + i)).toUInt64
-      return some (acc, off + len)
+/-- Decode an RFC 9000 §16 variable-length integer at `off` in `src`, returning `(value, nextOff)`.
+    Every buffer-extent check (`1` tag byte and `1|2|4|8` varint bytes) is routed through `ByteSource.subSource?`,
+    which invokes the exported specification gate `leansys_verify_slice_bounds` (`LeanSys.Spec.verifySliceBounds`). -/
+def decodeVarInt? (src : ByteSource) (off : Nat) : Option (UInt64 × Nat) := do
+  let head ← src.subSource? off 1
+  let first := head.getByteD 0
+  let tag := first >>> 6
+  let len : Nat := 1 <<< tag.toNat
+  let varSub ← src.subSource? off len
+  Id.run do
+    let mut acc : UInt64 := (first &&& 0x3F).toUInt64
+    for i in [1:len] do
+      acc := (acc <<< 8) ||| (varSub.getByteD i).toUInt64
+    return some (acc, off + len)
 
 /-- Pure Sans-I/O RFC 9000 + RFC 6479 QUIC connection anti-replay & per-stream offset flow-control state. -/
 structure QuicConnState where
@@ -82,13 +81,46 @@ private def upsertStreamHighOffset (offs : Array (UInt64 × UInt64)) (streamId n
   | some idx => offs.set! idx (streamId, newHi)
   | none => offs.push (streamId, newHi)
 
-/-- Advance the RFC 6479 64-packet anti-replay bitmap and per-stream/connection flow-control state for a STREAM range
-    ending at `streamEndOffset` on `streamId` (deriving `newDeltaBytes = max(0, streamEndOffset - prevHighOffset)`
-    so retransmissions consume `0` extra connection credit and connection credit equals the sum of stream high-water marks),
-    gated by `leansys_verify_quic_packet_window`. -/
-def admitStreamPacket? (st : QuicConnState) (pktNum : UInt64)
-    (streamId : UInt64) (streamEndOffset : UInt64)
+/-- Admit a QUIC packet number `pktNum` against the RFC 6479 64-packet anti-replay window (without coupling to a single
+    `STREAM` frame, so packets carrying `0` or multiple `STREAM` frames admit the packet number once and then apply
+    `accountStreamRange?` for each `STREAM` frame), gated by `leansys_verify_quic_packet_window`. -/
+def admitPacketNumber? (st : QuicConnState) (pktNum : UInt64)
     (sourceAddrTag : UInt64 := st.peerAddrTag) : Option QuicConnState :=
+  if !st.hasRxPacket then
+    if verifyQuicPacketWindow pktNum 0 0 0 st.maxStreamData st.connRxBytes st.maxConnData != 1 then
+      none
+    else
+      some {
+        st with
+        hasRxPacket := true
+        maxRxPktNum := pktNum
+        windowMask  := 1
+        peerAddrTag := sourceAddrTag
+      }
+  else if verifyQuicPacketWindow pktNum st.maxRxPktNum st.windowMask
+            0 st.maxStreamData st.connRxBytes st.maxConnData != 1 then
+    none
+  else if pktNum > st.maxRxPktNum then
+    let shift := pktNum - st.maxRxPktNum
+    let shiftedMask : UInt64 :=
+      if shift >= 64 then 1 else (st.windowMask <<< shift) ||| 1
+    some {
+      st with
+      maxRxPktNum := pktNum
+      windowMask  := shiftedMask
+      peerAddrTag := sourceAddrTag
+    }
+  else
+    let diff := st.maxRxPktNum - pktNum
+    some {
+      st with
+      windowMask := st.windowMask ||| ((1 : UInt64) <<< diff)
+    }
+
+/-- Account a single `STREAM` frame's byte range ending at `streamEndOffset` on `streamId` after packet admission
+    (advancing connection credit strictly by `max(0, streamEndOffset - prevHighOffset)` with subtraction-safe overflow guard),
+    gated by `leansys_verify_quic_packet_window`. Multiple `STREAM` frames in the same packet call this sequentially. -/
+def accountStreamRange? (st : QuicConnState) (streamId streamEndOffset : UInt64) : Option QuicConnState :=
   let prevHi := lookupStreamHighOffset st streamId
   let nextHi := if streamEndOffset > prevHi then streamEndOffset else prevHi
   let newDeltaBytes := nextHi - prevHi
@@ -96,43 +128,31 @@ def admitStreamPacket? (st : QuicConnState) (pktNum : UInt64)
     none
   else
     let connAfter := st.connRxBytes + newDeltaBytes
-    let nextStreams := if streamEndOffset > prevHi then upsertStreamHighOffset st.streamHighOffs streamId nextHi else st.streamHighOffs
-    if !st.hasRxPacket then
-      if verifyQuicPacketWindow pktNum 0 0 nextHi st.maxStreamData connAfter st.maxConnData != 1 then
-        none
-      else
-        some {
-          st with
-          hasRxPacket    := true
-          maxRxPktNum    := pktNum
-          windowMask     := 1
-          connRxBytes    := connAfter
-          peerAddrTag    := sourceAddrTag
-          streamHighOffs := nextStreams
-        }
-    else if verifyQuicPacketWindow pktNum st.maxRxPktNum st.windowMask
-              nextHi st.maxStreamData connAfter st.maxConnData != 1 then
+    if verifyQuicPacketWindow 0 0 0 nextHi st.maxStreamData connAfter st.maxConnData != 1 then
       none
-    else if pktNum > st.maxRxPktNum then
-      let shift := pktNum - st.maxRxPktNum
-      let shiftedMask : UInt64 :=
-        if shift >= 64 then 1 else (st.windowMask <<< shift) ||| 1
-      some {
-        st with
-        maxRxPktNum    := pktNum
-        windowMask     := shiftedMask
-        connRxBytes    := connAfter
-        peerAddrTag    := sourceAddrTag
-        streamHighOffs := nextStreams
-      }
     else
-      let diff := st.maxRxPktNum - pktNum
+      let nextStreams := if streamEndOffset > prevHi then upsertStreamHighOffset st.streamHighOffs streamId nextHi else st.streamHighOffs
       some {
         st with
-        windowMask     := st.windowMask ||| ((1 : UInt64) <<< diff)
         connRxBytes    := connAfter
         streamHighOffs := nextStreams
       }
+
+/-- Atomically admit packet `pktNum` once and account `0..N` `(streamId, streamEndOffset)` `STREAM` frames carried in that packet. -/
+def admitMultiStreamPacket? (st : QuicConnState) (pktNum : UInt64)
+    (streamRanges : Array (UInt64 × UInt64))
+    (sourceAddrTag : UInt64 := st.peerAddrTag) : Option QuicConnState := do
+  let mut cur ← admitPacketNumber? st pktNum sourceAddrTag
+  for (sid, endOff) in streamRanges do
+    cur ← accountStreamRange? cur sid endOff
+  pure cur
+
+/-- Advance the RFC 6479 64-packet anti-replay bitmap and per-stream/connection flow-control state for a single-`STREAM` packet
+    ending at `streamEndOffset` on `streamId`, gated by `leansys_verify_quic_packet_window`. -/
+def admitStreamPacket? (st : QuicConnState) (pktNum : UInt64)
+    (streamId : UInt64) (streamEndOffset : UInt64)
+    (sourceAddrTag : UInt64 := st.peerAddrTag) : Option QuicConnState :=
+  admitMultiStreamPacket? st pktNum #[(streamId, streamEndOffset)] sourceAddrTag
 
 /-- Single-stream convenience wrapper around `admitStreamPacket?` on `streamId = 0` at `streamEndOffset`. -/
 def admitPacket? (st : QuicConnState) (pktNum : UInt64)
@@ -182,30 +202,29 @@ def encodeShortPacket? (p : QuicShortPacket) : Option ByteArray :=
       out := out.push (p.payload.get! i)
     return some out
 
-/-- Decode an unprotected 1-RTT short-header QUIC envelope (`13+` bytes), rejecting nonzero reserved bits (`0x18 != 0`,
-    RFC 9000 §17.3 `PROTOCOL_VIOLATION`), preserving `keyPhase`, and reconstructing the 62-bit packet number via RFC 9000 Appendix A.3. -/
-def decodeShortPacket? (src : ByteSource) (largestRxPktNum : UInt64 := 0) : Option QuicShortPacket :=
-  if src.size < 13 then
+/-- Decode an unprotected 1-RTT short-header QUIC envelope (`13+` bytes), routing header/payload bounds through
+    `ByteSource.subSource?` (`leansys_verify_slice_bounds`), rejecting nonzero reserved bits (`0x18 != 0`),
+    preserving `keyPhase`, and reconstructing the 62-bit packet number via RFC 9000 Appendix A.3. -/
+def decodeShortPacket? (src : ByteSource) (largestRxPktNum : UInt64 := 0) : Option QuicShortPacket := do
+  let hdrSub ← src.subSource? 0 13
+  let hdr := hdrSub.getByteD 0
+  -- Mask `0xDB = 1101_1011`: Form=0 (`0x80`), Fixed=1 (`0x40`), Reserved=00 (`0x18`), PNLen=4B (`0x03`); Spin (`0x20`) & KeyPhase (`0x04`) allowed
+  if (hdr &&& 0xDB) != 0x43 then
     none
-  else
-    let hdr := src.getByteD 0
-    -- Mask `0xDB = 1101_1011`: Form=0 (`0x80`), Fixed=1 (`0x40`), Reserved=00 (`0x18`), PNLen=4B (`0x03`); Spin (`0x20`) & KeyPhase (`0x04`) allowed
-    if (hdr &&& 0xDB) != 0x43 then
-      none
-    else Id.run do
-      let keyPhase := (hdr &&& 0x04) != 0
-      let mut dcid : UInt64 := 0
-      for i in [1:9] do
-        dcid := (dcid <<< 8) ||| (src.getByteD i).toUInt64
-      let mut pn32 : UInt32 := 0
-      for i in [9:13] do
-        pn32 := (pn32 <<< 8) ||| (src.getByteD i).toUInt32
-      let fullPn := reconstructPacketNumber32 largestRxPktNum pn32
-      if fullPn > maxVarInt then
-        return none
-      match src.subSource? 13 (src.size - 13) with
-      | none => return none
-      | some sub => return some { dcid := dcid, pktNum := fullPn, keyPhase := keyPhase, payload := sub.toByteArray }
+  else Id.run do
+    let keyPhase := (hdr &&& 0x04) != 0
+    let mut dcid : UInt64 := 0
+    for i in [1:9] do
+      dcid := (dcid <<< 8) ||| (hdrSub.getByteD i).toUInt64
+    let mut pn32 : UInt32 := 0
+    for i in [9:13] do
+      pn32 := (pn32 <<< 8) ||| (hdrSub.getByteD i).toUInt32
+    let fullPn := reconstructPacketNumber32 largestRxPktNum pn32
+    if fullPn > maxVarInt then
+      return none
+    match src.subSource? 13 (src.size - 13) with
+    | none => return none
+    | some sub => return some { dcid := dcid, pktNum := fullPn, keyPhase := keyPhase, payload := sub.toByteArray }
 
 /-- Batch-segment a byte stream into GSO-sized UDP QUIC datagrams (`maxSegmentPayload ≤ 1350`) with monotonic 62-bit packet numbers,
     failing closed (`none`) if packet numbers would reach or exceed RFC 9000 `2^62`. -/
