@@ -777,6 +777,12 @@ def selfTestWave1Features (testDir : String) : IO UInt32 := do
       return 1
   let truncVar2 := decodeVarInt? (ByteSource.ofByteArray (ByteArray.mk #[0x40])) 0
   let truncVar4 := decodeVarInt? (ByteSource.ofByteArray (ByteArray.mk #[0x80, 0x01, 0x02])) 0
+  -- Bounded heap sub-slice views over larger backing `ByteArray`s MUST enforce `slice.len` rather than `ba.size`!
+  let backingVar4 := ByteArray.mk #[0xAA, 0x80, 0x01, 0x02, 0x03, 0xBB]
+  let some boundedTruncVar := (ByteSlice.ofByteArray backingVar4).subSlice? 1 2 | return 1
+  let truncBoundedHeapVar := decodeVarInt? (ByteSource.ofByteSlice boundedTruncVar) 0
+  let some boundedTruncH2 := (ByteSlice.ofByteArray h2DataWire).subSlice? 0 12 | return 1
+  let (h2TruncHeapRes, _) := stepInboundFrame {} (ByteSource.ofByteSlice boundedTruncH2)
   let some q1 := admitStreamPacket? {} 100 4 512 0x0A000001 | return 1
   -- Out-of-order packet 97 on stream 4 with lower offset `256` consumes `0` extra connection bytes; stream 8 at `256` advances conn to `768`!
   let some q2a := admitStreamPacket? q1 97 4 256 0x0A000001 | return 1
@@ -792,7 +798,8 @@ def selfTestWave1Features (testDir : String) : IO UInt32 := do
   let gsoOverflow := segmentDatagramsGso? 0x1122334455667788 (((1 : UInt64) <<< 62) - 1) (ByteSource.ofByteArray (ByteArray.mk (Array.replicate 2500 0x42))) 1200
   let badReservedHdr := gsoSegs[0]!.set! 0 (gsoSegs[0]!.get! 0 ||| 0x10)
   let decLastSeg := decodeShortPacket? (ByteSource.ofByteArray gsoSegs[2]!) (hiPn + 1)
-  if truncVar2.isSome || truncVar4.isSome ||
+  if truncVar2.isSome || truncVar4.isSome || truncBoundedHeapVar.isSome ||
+     h2TruncHeapRes != .needMoreBytes ||
      replay97.isSome || replay100.isSome || stale30.isSome ||
      q2a.connRxBytes != 512 || q2.connRxBytes != 768 ||
      q3.peerAddrTag != 0x0A000002 || q3.connRxBytes != 1152 ||
@@ -813,6 +820,8 @@ def selfTestWave1Features (testDir : String) : IO UInt32 := do
   let some h3Msg := encodeH3Message? reqHdrs "{\"h3\":1}".toUTF8
     | do IO.eprintln "[lean-sys-core] FAIL: encodeH3Message?"; return 1
   let h3Dec1 := decodeCapsulePrefix (ByteSource.ofByteArray h3Msg) .bidiRequest
+  let some boundedTruncH3 := (ByteSlice.ofByteArray h3Msg).subSlice? 0 3 | return 1
+  let h3TruncHeapRes := decodeCapsulePrefix (ByteSource.ofByteSlice boundedTruncH3) .bidiRequest
   let some h3CtrlSettings := encodeCapsule? { frameType := 0x04, payload := ByteArray.mk #[0x06, 0x40, 0x40] } .uniControl
     | do IO.eprintln "[lean-sys-core] FAIL: H3 control SETTINGS capsule"; return 1
   let h3WrongRole := decodeCapsulePrefix (ByteSource.ofByteArray h3CtrlSettings) .bidiRequest
@@ -822,6 +831,7 @@ def selfTestWave1Features (testDir : String) : IO UInt32 := do
   let h3CapsuleOnQpack := encodeCapsule? { frameType := 0x21, payload := ByteArray.mk #[0x01] } .uniQpack
   let h3Reserved := encodeCapsule? { frameType := 0x02, payload := ByteArray.mk #[1, 2, 3, 4, 5] } .bidiRequest
   if qpackStatusWire != expectedQpackStatusWire ||
+     h3TruncHeapRes != .needMoreBytes ||
      decodeQpackHeaders? (ByteSource.ofByteArray qpackStatusWire) != some qpackStatusHdrs ||
      decQpack != some reqHdrs || h3Reserved.isSome ||
      h3CancelOnReq.isSome || h3MaxPushOnReq.isSome || h3PushOnCtrl.isSome || h3CapsuleOnQpack.isSome ||

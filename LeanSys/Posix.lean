@@ -152,11 +152,18 @@ def ofByteArray (ba : ByteArray) : ByteSlice :=
 def ofString (s : String) : ByteSlice :=
   ofByteArray s.toUTF8
 
-/-- Verified sub-slice constructor gated by `LeanSys.Spec.verifySliceBounds`. -/
+/-- Verified sub-slice constructor gated by `LeanSys.Spec.verifySliceBounds` against both the parent
+    view length `s.len` and the backing buffer extent `s.ba.size`, with lossless `UInt64` conversion checks. -/
 @[inline]
 def subSlice? (s : ByteSlice) (relOff subLen : Nat) : Option ByteSlice :=
   let absOff := s.off + relOff
-  if Spec.verifySliceBounds absOff.toUInt64 subLen.toUInt64 s.ba.size.toUInt64 == 1 then
+  if relOff.toUInt64.toNat == relOff &&
+     subLen.toUInt64.toNat == subLen &&
+     s.len.toUInt64.toNat == s.len &&
+     absOff.toUInt64.toNat == absOff &&
+     s.ba.size.toUInt64.toNat == s.ba.size &&
+     Spec.verifySliceBounds relOff.toUInt64 subLen.toUInt64 s.len.toUInt64 == 1 &&
+     Spec.verifySliceBounds absOff.toUInt64 subLen.toUInt64 s.ba.size.toUInt64 == 1 then
     some { ba := s.ba, off := absOff, len := subLen }
   else
     none
@@ -232,10 +239,11 @@ unsafe def unsafeFromRawParts? (ptr : USize) (len : USize) : Option BorrowedSlic
 def rawAddr (v : BorrowedSlice) : USize :=
   v.ptr
 
-/-- Sub-slice `[relOff, relOff + subLen)` gated by `leansys_verify_borrowed_view`. -/
+/-- Sub-slice `[relOff, relOff + subLen)` gated by `leansys_verify_slice_bounds` and `leansys_verify_borrowed_view`. -/
 @[inline]
 def subView? (v : BorrowedSlice) (relOff subLen : Nat) : Option BorrowedSlice :=
   if relOff.toUSize.toNat == relOff && subLen.toUSize.toNat == subLen &&
+     Spec.verifySliceBounds relOff.toUInt64 subLen.toUInt64 v.len.toUInt64 == 1 &&
      Spec.verifyBorrowedView v.ptr.toUInt64 v.len.toUInt64 relOff.toUInt64 subLen.toUInt64 == 1 then
     some { ptr := v.ptr + relOff.toUSize, len := subLen.toUSize }
   else
