@@ -6,6 +6,7 @@
 -/
 import LeanSys.Contracts.MetaGate
 import LeanSys.Contracts.SpeculativeGate
+import LeanSys.Contracts.MetaSpec
 
 namespace LeanSys.Contracts
 
