@@ -136,10 +136,6 @@ fn build_lean_sys_cabi(root: &Path, out_dir: &Path) {
     );
     println!(
         "cargo:rerun-if-changed={}",
-        root.join("LeanSys/Contracts/MetaSpec.lean").display()
-    );
-    println!(
-        "cargo:rerun-if-changed={}",
         root.join("lean-toolchain").display()
     );
 
@@ -162,7 +158,6 @@ fn build_lean_sys_cabi(root: &Path, out_dir: &Path) {
 
     let metagate_olean = out_contracts_dir.join("MetaGate.olean");
     let specgate_olean = out_contracts_dir.join("SpeculativeGate.olean");
-    let metaspec_olean = out_contracts_dir.join("MetaSpec.olean");
     let gate_olean = out_leansys_dir.join("Gate.olean");
     let spec_olean = out_leansys_dir.join("Spec.olean");
     let spec_c_path = out_dir.join("LeanSys_Spec.c");
@@ -177,7 +172,6 @@ fn build_lean_sys_cabi(root: &Path, out_dir: &Path) {
     for (src, olean) in [
         ("LeanSys/Contracts/MetaGate.lean", &metagate_olean),
         ("LeanSys/Contracts/SpeculativeGate.lean", &specgate_olean),
-        ("LeanSys/Contracts/MetaSpec.lean", &metaspec_olean),
         ("LeanSys/Gate.lean", &gate_olean),
     ] {
         let st = Command::new(&lean_bin)
