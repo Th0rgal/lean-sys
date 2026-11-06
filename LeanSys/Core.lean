@@ -18,6 +18,9 @@ import LeanSys.JsonRpc
 import LeanSys.Sse
 import LeanSys.WebSocket
 import LeanSys.Http
+import LeanSys.H2
+import LeanSys.Quic
+import LeanSys.H3
 import LeanSys.Reactor
 import LeanSys.Sandbox
 import LeanSys.Par
@@ -39,6 +42,9 @@ open LeanSys.JsonRpc
 open LeanSys.Sse
 open LeanSys.WebSocket
 open LeanSys.Http
+open LeanSys.H2
+open LeanSys.Quic
+open LeanSys.H3
 open LeanSys.Reactor
 open LeanSys.Sandbox
 open LeanSys.Par
@@ -728,6 +734,71 @@ def selfTestWave1Features (testDir : String) : IO UInt32 := do
      decodeChunkedBody? chWire != some "chunk-one-chunk-two".toUTF8 ||
      !wsUpgOk || !wsRejectOk || (parseRequest patchRaw none).toOption.isNone then
     IO.eprintln "[lean-sys-core] FAIL: HTTP route/query/chunked/WS-upgrade/PATCH check failed"
+    return 1
+
+  -- 11. Wave 5.A: Pure-Lean Sans-I/O HTTP/2 (`LeanSys.H2`), QUIC RFC 6479 Anti-Replay & GSO (`LeanSys.Quic`),
+  --     and HTTP/3 Capsule + Static QPACK (`LeanSys.H3`) Conformance!
+  let reqHdrs := #[(":method", "POST"), (":scheme", "https"), (":path", "/v1/responses"), ("content-type", "application/json")]
+  let hpackBytes := encodeHeadersBlock reqHdrs
+  let decHpack := decodeHeadersBlock? (ByteSource.ofByteArray hpackBytes)
+  let some h2HdrWire := LeanSys.H2.encodeFrame? { frameType := .headers, flags := 0x04, streamId := 1, payload := hpackBytes }
+    | do IO.eprintln "[lean-sys-core] FAIL: H2 HEADERS encodeFrame?"; return 1
+  let some h2DataWire := LeanSys.H2.encodeFrame? { frameType := .data, flags := 0x01, streamId := 1, payload := "{\"ok\":true}".toUTF8 }
+    | do IO.eprintln "[lean-sys-core] FAIL: H2 DATA encodeFrame?"; return 1
+  let (h2Res1, h2St1) := stepInboundFrame {} (ByteSource.ofByteArray h2HdrWire)
+  let (h2Res2, h2St2) := stepInboundFrame h2St1 (ByteSource.ofByteArray h2DataWire)
+  let (h2OverflowRes, _) := stepInboundFrame { connRecvWindow := 4 } (ByteSource.ofByteArray h2DataWire)
+  if decHpack != some reqHdrs ||
+     h2St2.connRecvWindow != 65535 - 11 ||
+     (LeanSys.H2.buildSettingsFrame? #[(1, 4096)] true).isSome ||
+     !(match h2Res1, h2Res2, h2OverflowRes with
+       | .ok _ _, .ok _ _, .protocolError _ => true
+       | _, _, _ => false) then
+    IO.eprintln "[lean-sys-core] FAIL: Sans-I/O HTTP/2 HPACK or flow-control check failed"
+    return 1
+
+  -- QUIC varints (`1`, `2`, `4`, `8` byte boundaries), RFC 6479 out-of-order + replay rejection, roaming peerAddrTag, GSO segmentation
+  for v in ([0, 37, 15293, 494878333, 151288809941952652] : List UInt64) do
+    let some vb := encodeVarInt? v | do IO.eprintln s!"[lean-sys-core] FAIL: encodeVarInt? {v}"; return 1
+    if decodeVarInt? (ByteSource.ofByteArray vb) 0 != some (v, vb.size) then
+      IO.eprintln s!"[lean-sys-core] FAIL: decodeVarInt? roundtrip {v}"
+      return 1
+  let some q1 := admitPacket? {} 100 512 512 0x0A000001 | return 1
+  -- Out-of-order packet 97 admitted once, then immediate replay of 97 or 100 rejected, then forward packet 105 roams peerAddrTag!
+  let some q2 := admitPacket? q1 97 768 256 0x0A000001 | return 1
+  let replay97 := admitPacket? q2 97 768 0 0x0A000001
+  let replay100 := admitPacket? q2 100 768 0 0x0A000001
+  let stale30 := admitPacket? q2 30 768 0 0x0A000001
+  let some q3 := admitPacket? q2 105 1024 256 0x0A000002 | return 1
+  let gsoSegs := segmentDatagramsGso 0x1122334455667788 1 (ByteSource.ofByteArray (ByteArray.mk (Array.replicate 2500 0x42))) 1200
+  if replay97.isSome || replay100.isSome || stale30.isSome ||
+     q3.peerAddrTag != 0x0A000002 || q3.connRxBytes != 1024 ||
+     gsoSegs.size != 3 ||
+     (decodeShortPacket? (ByteSource.ofByteArray gsoSegs[2]!)).map (·.pktNum) != some 3 then
+    IO.eprintln "[lean-sys-core] FAIL: Sans-I/O QUIC anti-replay, roaming, or GSO segmentation failed"
+    return 1
+
+  -- HTTP/3 capsule + QPACK static field section + forbidden HTTP/2 frame type (`0x02`) & wrong-role (`SETTINGS` on request stream) rejection
+  let qpackBytes := encodeQpackHeaders reqHdrs
+  let decQpack := decodeQpackHeaders? (ByteSource.ofByteArray qpackBytes)
+  let some h3Msg := encodeH3Message? reqHdrs "{\"h3\":1}".toUTF8
+    | do IO.eprintln "[lean-sys-core] FAIL: encodeH3Message?"; return 1
+  let h3Dec1 := decodeCapsulePrefix (ByteSource.ofByteArray h3Msg) .bidiRequest
+  let some h3CtrlSettings := encodeCapsule? { frameType := 0x04, payload := ByteArray.mk #[0x06, 0x40, 0x40] } .uniControl
+    | do IO.eprintln "[lean-sys-core] FAIL: H3 control SETTINGS capsule"; return 1
+  -- Decoding control SETTINGS on a bidirectional request stream MUST fail closed!
+  let h3WrongRole := decodeCapsulePrefix (ByteSource.ofByteArray h3CtrlSettings) .bidiRequest
+  -- Reserved HTTP/2 frame `0x02` (`PRIORITY`) MUST fail closed on encode and decode!
+  let h3Reserved := encodeCapsule? { frameType := 0x02, payload := ByteArray.mk #[1, 2, 3, 4, 5] } .bidiRequest
+  if decQpack != some reqHdrs || h3Reserved.isSome ||
+     !(match h3Dec1, h3WrongRole with
+       | .ok f1 used1, .frameError _ =>
+         f1.frameType == 0x01 &&
+         match decodeCapsulePrefix (ByteSource.ofByteArray (h3Msg.extract used1 h3Msg.size)) .bidiRequest with
+         | .ok f2 _ => f2.frameType == 0x00 && f2.payload == "{\"h3\":1}".toUTF8
+         | _ => false
+       | _, _ => false) then
+    IO.eprintln "[lean-sys-core] FAIL: Sans-I/O HTTP/3 QPACK or stream-role/reserved-frame check failed"
     return 1
 
   return 0
@@ -1438,7 +1509,7 @@ def runSelfTest : IO UInt32 := do
       IO.eprintln s!"[lean-sys-core] FAIL: unexpected HTTP/pipelined response (served={servedCount}): {respBody} / {pipeRespStr}"
       return 1
 
-  IO.println s!"\{ \"ok\": true, \"binary\": \"lean-sys-core\", \"c_abi_gates\": 45, \"wave1_verified\": true, \"fd_32bit_high\": true, \"hmac_sha256_rfc4231\": true, \"par_scheduler\": true, \"wal_torn_recovery\": true, \"wal_68mib_streaming\": true, \"cas_immutable\": true, \"sst_bloom\": true, \"table_range_scan\": true, \"auth_rotation\": true, \"proc_log\": true, \"proc_stat_scanner\": true, \"jsonrpc_2_0\": true, \"shm_ring_mmap\": true, \"mmap_seqlock\": true, \"jsonl_tape\": true, \"reactor_keepalive\": true, \"stream_relay_sse\": true, \"sandbox_landlock\": true, \"pgid_reaper\": true, \"http_loopback_port\": {boundPort} }"
+  IO.println s!"\{ \"ok\": true, \"binary\": \"lean-sys-core\", \"c_abi_gates\": 48, \"wave1_verified\": true, \"fd_32bit_high\": true, \"hmac_sha256_rfc4231\": true, \"par_scheduler\": true, \"wal_torn_recovery\": true, \"wal_68mib_streaming\": true, \"cas_immutable\": true, \"sst_bloom\": true, \"table_range_scan\": true, \"auth_rotation\": true, \"proc_log\": true, \"proc_stat_scanner\": true, \"jsonrpc_2_0\": true, \"shm_ring_mmap\": true, \"mmap_seqlock\": true, \"jsonl_tape\": true, \"reactor_keepalive\": true, \"stream_relay_sse\": true, \"sandbox_landlock\": true, \"pgid_reaper\": true, \"sans_io_h2_quic_h3\": true, \"http_loopback_port\": {boundPort} }"
   return 0
 
 /-- Run deterministic micro-benchmarks for `lean-sys-core bench` and emit JSON metrics. -/
@@ -1509,7 +1580,7 @@ def main (args : List String) : IO UInt32 := do
   | ["bench"] | ["--bench"] => LeanSys.Core.runBench 4000
   | ["bench", nStr] | ["--bench", nStr] => LeanSys.Core.runBench (nStr.toNat?.getD 4000)
   | ["--c-abi"] =>
-    IO.println "{\"ok\":true,\"exports\":[\"leansys_verify_slice_bounds\",\"leansys_verify_wal_frame\",\"leansys_verify_cas_digest\",\"leansys_check_http_bounds\",\"leansys_verify_jsonl_tape\",\"leansys_verify_ring_cursor\",\"leansys_verify_sst_block\",\"leansys_verify_poll_interest\",\"leansys_verify_rlimit_budget\",\"leansys_mix64_word\",\"leansys_verify_composite_key_order\",\"leansys_verify_token_auth\",\"leansys_verify_log_window\",\"leansys_verify_jsonrpc_frame\",\"leansys_gate_admit\",\"leansys_verify_mmap_seqlock\",\"leansys_verify_proc_stat_fields\",\"leansys_sse_frame_scan\",\"leansys_gfm_pipe_scan\",\"leansys_tag_scan\",\"leansys_transcript_index\",\"leansys_verify_par_chunk\",\"leansys_verify_arena_disjoint\",\"leansys_verify_snapshot_visibility\",\"leansys_verify_http_route_match\",\"leansys_verify_counterexample_triage\",\"leansys_verify_dag_wave_step\",\"leansys_verify_ios_jetsam_budget\",\"leansys_verify_worker_budget\",\"leansys_verify_page_aligned_buffer\",\"leansys_select_isa\",\"leansys_verify_isa_selection\",\"leansys_verify_fd_bounds\",\"leansys_verify_unix_path_bounds\",\"leansys_verify_cas_digest256\",\"leansys_verify_sigv4_envelope\",\"leansys_verify_cgroup_v2_budget\",\"leansys_verify_io_uring_ring\",\"leansys_verify_borrowed_view\",\"leansys_verify_step_reactor\",\"leansys_verify_stream_relay\",\"leansys_verify_compaction_winner\",\"leansys_verify_trigram_candidate\",\"leansys_verify_ws_frame_header\",\"leansys_verify_sse_event_encode\"]}"
+    IO.println "{\"ok\":true,\"exports\":[\"leansys_verify_slice_bounds\",\"leansys_verify_wal_frame\",\"leansys_verify_cas_digest\",\"leansys_check_http_bounds\",\"leansys_verify_jsonl_tape\",\"leansys_verify_ring_cursor\",\"leansys_verify_sst_block\",\"leansys_verify_poll_interest\",\"leansys_verify_rlimit_budget\",\"leansys_mix64_word\",\"leansys_verify_composite_key_order\",\"leansys_verify_token_auth\",\"leansys_verify_log_window\",\"leansys_verify_jsonrpc_frame\",\"leansys_gate_admit\",\"leansys_verify_mmap_seqlock\",\"leansys_verify_proc_stat_fields\",\"leansys_sse_frame_scan\",\"leansys_gfm_pipe_scan\",\"leansys_tag_scan\",\"leansys_transcript_index\",\"leansys_verify_par_chunk\",\"leansys_verify_arena_disjoint\",\"leansys_verify_snapshot_visibility\",\"leansys_verify_http_route_match\",\"leansys_verify_counterexample_triage\",\"leansys_verify_dag_wave_step\",\"leansys_verify_ios_jetsam_budget\",\"leansys_verify_worker_budget\",\"leansys_verify_page_aligned_buffer\",\"leansys_select_isa\",\"leansys_verify_isa_selection\",\"leansys_verify_fd_bounds\",\"leansys_verify_unix_path_bounds\",\"leansys_verify_cas_digest256\",\"leansys_verify_sigv4_envelope\",\"leansys_verify_cgroup_v2_budget\",\"leansys_verify_io_uring_ring\",\"leansys_verify_borrowed_view\",\"leansys_verify_step_reactor\",\"leansys_verify_stream_relay\",\"leansys_verify_compaction_winner\",\"leansys_verify_trigram_candidate\",\"leansys_verify_ws_frame_header\",\"leansys_verify_sse_event_encode\",\"leansys_verify_h2_frame_header\",\"leansys_verify_quic_packet_window\",\"leansys_verify_h3_frame_capsule\"]}"
     return 0
   | _ =>
     IO.println "usage: lean-sys-core [self-test | bench | --c-abi]"

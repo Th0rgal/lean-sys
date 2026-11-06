@@ -98,6 +98,9 @@ const LEANSYS_EXPORTS: &[&str] = &[
     "leansys_verify_trigram_candidate",
     "leansys_verify_ws_frame_header",
     "leansys_verify_sse_event_encode",
+    "leansys_verify_h2_frame_header",
+    "leansys_verify_quic_packet_window",
+    "leansys_verify_h3_frame_capsule",
 ];
 
 fn extract_spec_exports(spec_src: &str) -> Vec<String> {

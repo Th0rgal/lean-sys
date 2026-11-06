@@ -19,6 +19,9 @@ import LeanSys.JsonRpc
 import LeanSys.Sse
 import LeanSys.WebSocket
 import LeanSys.Http
+import LeanSys.H2
+import LeanSys.Quic
+import LeanSys.H3
 import LeanSys.Reactor
 import LeanSys.Sandbox
 import LeanSys.Par
@@ -184,6 +187,26 @@ namespace Web
   abbrev matchRoutePattern? := LeanSys.Http.matchRoutePattern?
   abbrev parseQueryParams := LeanSys.Http.parseQueryParams
   abbrev buildWebSocketUpgradeResponse? := LeanSys.Http.buildWebSocketUpgradeResponse?
+  abbrev H2Frame := LeanSys.H2.H2Frame
+  abbrev H2FrameType := LeanSys.H2.H2FrameType
+  abbrev H2ConnState := LeanSys.H2.H2ConnState
+  abbrev encodeH2Frame? := LeanSys.H2.encodeFrame?
+  abbrev decodeH2FramePrefix := LeanSys.H2.decodeFramePrefix
+  abbrev encodeHpackHeaders := LeanSys.H2.encodeHeadersBlock
+  abbrev decodeHpackHeaders? := LeanSys.H2.decodeHeadersBlock?
+  abbrev QuicConnState := LeanSys.Quic.QuicConnState
+  abbrev QuicShortPacket := LeanSys.Quic.QuicShortPacket
+  abbrev encodeQuicVarInt? := LeanSys.Quic.encodeVarInt?
+  abbrev decodeQuicVarInt? := LeanSys.Quic.decodeVarInt?
+  abbrev admitQuicPacket? := LeanSys.Quic.admitPacket?
+  abbrev segmentQuicDatagramsGso := LeanSys.Quic.segmentDatagramsGso
+  abbrev H3StreamRole := LeanSys.H3.H3StreamRole
+  abbrev H3Frame := LeanSys.H3.H3Frame
+  abbrev encodeH3Capsule? := LeanSys.H3.encodeCapsule?
+  abbrev decodeH3CapsulePrefix := LeanSys.H3.decodeCapsulePrefix
+  abbrev encodeQpackHeaders := LeanSys.H3.encodeQpackHeaders
+  abbrev decodeQpackHeaders? := LeanSys.H3.decodeQpackHeaders?
+  abbrev encodeH3Message? := LeanSys.H3.encodeH3Message?
 end Web
 
 end LeanSys
