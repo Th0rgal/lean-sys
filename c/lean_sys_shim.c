@@ -1,6 +1,4 @@
-#ifndef __APPLE__
-#define _GNU_SOURCE
-#endif
+#define _GNU_SOURCE 1
 #include <lean/lean.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -21,11 +19,12 @@ static inline int64_t fail_close(int fd, int df, const char *u) { int e = errno;
 #ifdef __APPLE__
 #include <TargetConditionals.h>
 #include <sys/clonefile.h>
-#define SOCK_CLOEXEC 0
+#define LS_STREAM_FLAGS SOCK_STREAM
+#define LS_SOCKET_READY(fd) (fcntl((fd), F_SETFD, FD_CLOEXEC) == 0)
 #define LS_CLONE(s, d) (clonefile(s, d, 0) < 0 ? -1 : (chmod(d, 0644) < 0 ? (int)fail_close(-1, -1, d) : 0))
 #define LS_FSYNC(fd) (fcntl(fd, F_BARRIERFSYNC) < 0 && fsync(fd) < 0)
 #define LS_UR(op, a, b, c) ((void)(op), (void)(a), (void)(b), (void)(c), errno = ENOSYS, -1L)
-static inline int ls_accept(int lfd) { int c = accept(lfd, NULL, NULL); return c >= 0 ? (fcntl(c, F_SETFD, FD_CLOEXEC), c) : -1; } static inline int ls_ll(const char *ro, const char *rw) { return (void)ro, (void)rw, errno = EOPNOTSUPP, -1; }
+static inline int ls_accept(int lfd) { int c = accept(lfd, NULL, NULL); return c < 0 || LS_SOCKET_READY(c) ? c : (int)fail_close(c, -1, NULL); } static inline int ls_ll(const char *ro, const char *rw) { return (void)ro, (void)rw, errno = EOPNOTSUPP, -1; }
 #else
 #include <linux/fs.h>
 #include <linux/landlock.h>
@@ -34,13 +33,14 @@ static inline int ls_accept(int lfd) { int c = accept(lfd, NULL, NULL); return c
 static inline int ls_clone(const char *s, const char *d) { int sf = open(s, O_RDONLY | O_CLOEXEC), df = sf >= 0 ? open(d, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0644) : -1; return sf < 0 || df < 0 ? (sf >= 0 ? (int)fail_close(sf, -1, NULL) : -1) : (ioctl(df, FICLONE, sf) < 0 ? (int)fail_close(sf, df, d) : (close(sf), close(df))); }
 #define LS_CLONE(s, d) ls_clone(s, d)
 #define LS_FSYNC(fd) (fsync(fd) < 0)
+#define LS_STREAM_FLAGS (SOCK_STREAM | SOCK_CLOEXEC)
+#define LS_SOCKET_READY(fd) 1
 #define LS_UR(op, a, b, c) syscall((op) ? __NR_io_uring_enter : __NR_io_uring_setup, (int)(a), (b), (c), (op) >> 1, NULL, (size_t)0)
 #define ls_accept(lfd) accept4(lfd, NULL, NULL, SOCK_CLOEXEC)
 static inline int ls_rule(int rfd, const char *p, uint64_t acc, int opt) { int f = *p ? open(p, O_PATH | O_CLOEXEC) : -2; struct stat st; struct landlock_path_beneath_attr b = { .allowed_access = acc, .parent_fd = f }; return (f == -2 || (f < 0 && opt && errno == ENOENT)) ? 0 : (f < 0 ? -1 : ((fstat(f, &st) == 0 && !S_ISDIR(st.st_mode) ? (b.allowed_access &= 0x4007ULL) : 0), syscall(__NR_landlock_add_rule, rfd, LANDLOCK_RULE_PATH_BENEATH, &b, 0) ? (int)fail_close(f, -1, NULL) : (close(f), 0))); }
 static inline int ls_ll(const char *ro, const char *rw) { int v = (int)syscall(__NR_landlock_create_ruleset, NULL, 0, LANDLOCK_CREATE_RULESET_VERSION), r = -1; struct landlock_ruleset_attr a = { .handled_access_fs = v < 2 ? 0x1FFFULL : (v == 2 ? 0x3FFFULL : 0x7FFFULL) }; return (!ro || v <= 0) ? (v <= 0 && (errno == ENOSYS || errno == EOPNOTSUPP || !v) ? (errno = EOPNOTSUPP, -1) : v) : ((prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) < 0 || (r = (int)syscall(__NR_landlock_create_ruleset, &a, sizeof(uint64_t), 0)) < 0) ? -1 : ((ls_rule(r, "/usr", 13ULL, 1) || ls_rule(r, "/lib", 13ULL, 1) || ls_rule(r, "/lib64", 13ULL, 1) || ls_rule(r, "/bin", 13ULL, 1) || ls_rule(r, ro, 13ULL, 0) || ls_rule(r, rw, a.handled_access_fs, 0) || syscall(__NR_landlock_restrict_self, r, 0)) ? (int)fail_close(r, -1, NULL) : (close(r), 0))); }
 #endif
 extern char **environ; uint8_t leansys_verify_slice_bounds(uint64_t, uint64_t, uint64_t), leansys_verify_unix_path_bounds(uint64_t, uint8_t), leansys_verify_borrowed_view(uint64_t, uint64_t, uint64_t, uint64_t); static inline lean_obj_res R(int64_t rc) { return lean_io_result_mk_ok(lean_box_uint64(rc < 0 ? ((1ULL << 63) | ((uint64_t)(uint32_t)errno << 32)) : ((uint64_t)rc & 0x7FFFFFFFFFFFFFFFULL))); }
-#define SA (struct sockaddr*)
 static inline int ls_mok(int fd, uint64_t o, uint64_t n) { struct stat s; return fstat(fd, &s) < 0 ? 0 : (S_ISREG(s.st_mode) ? (s.st_size >= 0 && leansys_verify_slice_bounds(o, n, (uint64_t)s.st_size) && leansys_verify_slice_bounds(o, n, SIZE_MAX) ? 1 : (errno = EINVAL, 0)) : (n && leansys_verify_slice_bounds(o, n, SIZE_MAX) ? 1 : (errno = EINVAL, 0))); }
 LEAN_EXPORT uint64_t leansys_ptr_read(size_t p, size_t cap, size_t o, uint8_t w) { uint64_t v = 0; return leansys_verify_borrowed_view(p, cap, o, w == 1 ? 8 : (w ? (w & 12) : 1)) ? (w == 8 ? (!((p + o) & 7) ? __atomic_load_n((const uint64_t*)(p + o), __ATOMIC_ACQUIRE) : 0) : (w == 4 ? (!((p + o) & 3) ? __atomic_load_n((const uint32_t*)(p + o), __ATOMIC_ACQUIRE) : 0) : (w == 1 ? (memcpy(&v, (const uint8_t*)p + o, 8), v) : ((const uint8_t*)p)[o]))) : 0; }
 LEAN_EXPORT lean_obj_res leansys_ptr_load_io(size_t p, size_t cap, size_t o, uint8_t w) { return lean_io_result_mk_ok(lean_box_uint64(leansys_ptr_read(p, cap, o, w))); } LEAN_EXPORT lean_obj_res leansys_fs_clone_or_link(b_lean_obj_arg src, b_lean_obj_arg dst, uint8_t op) { const char *s = lean_string_cstr(src), *d = lean_string_cstr(dst); struct stat st; return R(op == 1 ? rename(s, d) : (op == 2 ? chmod(s, 0444) : (op == 3 ? (stat(s, &st) < 0 ? -1 : st.st_size) : (op == 4 ? ls_ll(s, d) : (op == 5 ? (unlink(d), LS_CLONE(s, d)) : (op == 6 ? unlink(s) : (unlink(d), link(s, d)))))))); }
@@ -61,5 +61,5 @@ LEAN_EXPORT lean_obj_res leansys_spawn_group(b_lean_obj_arg cmd, b_lean_obj_arg 
     pid_t pid = fork(); return pid == 0 ? _exit((setpgid(0, 0), (cg && ((i = (size_t)open(cg, O_WRONLY | O_CLOEXEC)) == SIZE_MAX || write((int)i, "0\n", 2) != 2 || close((int)i) < 0)) || ((confine & 1) && ls_ll(lean_string_cstr(ro), lean_string_cstr(rw)) < 0)) ? 126 : (execve(argv[0], argv, environ), 127)), R(0) : ((pid > 0 ? (void)setpgid(pid, pid) : (void)0), R(pid)); }
 #endif
 LEAN_EXPORT lean_obj_res leansys_kill_wait_group(uint32_t pid, uint32_t sig, uint8_t nohang) { int st = (sig > 0 && pid > 1 ? kill(-(pid_t)pid, (int)sig) : 0, 0); pid_t r = waitpid((pid_t)pid, &st, nohang ? WNOHANG : 0); return R(r <= 0 ? r : ((int64_t)r << 16) | (WIFEXITED(st) ? WEXITSTATUS(st) : 128 + WTERMSIG(st))); } LEAN_EXPORT lean_obj_res leansys_net_accept_poll(uint32_t lfd, uint32_t timeout_ms, uint8_t poll_only) { struct pollfd p = { .fd = (int)lfd, .events = POLLIN }; int r = poll(&p, 1, (int)timeout_ms); return R(r <= 0 ? (r == 0 ? (errno = EAGAIN, -1) : -1) : (poll_only ? (p.revents & POLLIN ? 1 : 0) : ls_accept((int)lfd))); }
-LEAN_EXPORT lean_obj_res leansys_net_listen(b_lean_obj_arg host, uint16_t port, uint32_t backlog) { const char *h = lean_string_cstr(host); size_t hl = lean_string_size(host) - 1; int ux = !port && *h == 47, fd = ux && !leansys_verify_unix_path_bounds(hl, strlen(h) == hl) ? (errno = EINVAL, -1) : socket(ux ? AF_UNIX : AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0), one = 1; struct sockaddr_in a = { .sin_family = AF_INET, .sin_port = htons(port) }; struct sockaddr_un u = { .sun_family = AF_UNIX }; socklen_t al = ux ? (memcpy(u.sun_path, h, hl < sizeof(u.sun_path) - 1 ? hl : 0), (socklen_t)sizeof(u)) : (socklen_t)sizeof(a);
-    return (fd < 0 || (!SOCK_CLOEXEC && fcntl(fd, F_SETFD, FD_CLOEXEC) < 0) || (!ux && (setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one)), inet_pton(AF_INET, h, &a.sin_addr) != 1 ? (errno = EINVAL, 1) : 0)) || (backlog == 0 ? connect(fd, ux ? SA &u : SA &a, al) : (bind(fd, ux ? SA &u : SA &a, al) < 0 || listen(fd, (int)backlog) < 0 ? -1 : 0)) < 0) ? R(fd < 0 ? -1 : fail_close(fd, -1, NULL)) : ((!ux && backlog ? getsockname(fd, SA &a, &al) : 0), R(backlog == 0 ? fd : (((int64_t)(ux ? 0 : ntohs(a.sin_port)) << 32) | (uint32_t)fd))); }
+LEAN_EXPORT lean_obj_res leansys_net_listen(b_lean_obj_arg host, uint16_t port, uint32_t backlog) { const char *h = lean_string_cstr(host); size_t hl = lean_string_size(host) - 1; int ux = !port && *h == 47, fd = ux && !leansys_verify_unix_path_bounds(hl, strlen(h) == hl) ? (errno = EINVAL, -1) : socket(ux ? AF_UNIX : AF_INET, LS_STREAM_FLAGS, 0), one = 1; struct sockaddr_in a = { .sin_family = AF_INET, .sin_port = htons(port) }; struct sockaddr_un u = { .sun_family = AF_UNIX }; socklen_t al = ux ? (memcpy(u.sun_path, h, hl < sizeof(u.sun_path) - 1 ? hl : 0), (socklen_t)sizeof(u)) : (socklen_t)sizeof(a);
+    return (fd < 0 || !LS_SOCKET_READY(fd) || (!ux && (setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one)), inet_pton(AF_INET, h, &a.sin_addr) != 1 ? (errno = EINVAL, 1) : 0)) || (backlog == 0 ? connect(fd, ux ? (struct sockaddr *)&u : (struct sockaddr *)&a, al) : (bind(fd, ux ? (struct sockaddr *)&u : (struct sockaddr *)&a, al) < 0 || listen(fd, (int)backlog) < 0 ? -1 : 0)) < 0) ? R(fd < 0 ? -1 : fail_close(fd, -1, NULL)) : ((!ux && backlog ? getsockname(fd, (struct sockaddr *)&a, &al) : 0), R(backlog == 0 ? fd : (((int64_t)(ux ? 0 : ntohs(a.sin_port)) << 32) | (uint32_t)fd))); }
